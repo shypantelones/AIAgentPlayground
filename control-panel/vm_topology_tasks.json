@@ -1,0 +1,65 @@
+{
+  "_comment": "Networking tasks for the topology templates in vm_topologies.json. 'check_node' names the node whose SSH connection runs 'check' (a bash script; exit code 0 = pass) after the agent's turn (or on demand, via 'Score now'). Every node's first network interface is NAT/setup-only and already has an address - never touch it; its other interfaces are the lab links, with no address until configured. ids must match ^[a-z][a-z0-9-]{1,40}$.",
+  "tasks": [
+    {
+      "id": "s1h2-connectivity",
+      "title": "Address two hosts on one switch",
+      "topology_id": "s1h2",
+      "difficulty": "easy",
+      "est_minutes": 5,
+      "prompt": "This lab has two hosts, h1 and h2, connected through one switch, sw1 (already working as a plain Ethernet switch - it needs no configuration). Addressing plan: h1 = 10.0.0.11/24, h2 = 10.0.0.12/24, same /24 network. On h1 and h2, find the lab-facing interface (run `ip link`; it is NOT the one that already has an address - leave that one alone), bring it up and assign the given address with `ip addr add <address>/24 dev <interface>`. When done, h1 must be able to ping h2.",
+      "check_node": "h1",
+      "check": "ping -c3 -W2 10.0.0.12"
+    },
+    {
+      "id": "r1s1h2-gateway",
+      "title": "Address a LAN with a switch and an idle router",
+      "topology_id": "r1s1h2",
+      "difficulty": "easy",
+      "est_minutes": 6,
+      "prompt": "h1, h2 and r1 all sit on one switch, sw1 (already working, no configuration needed). Addressing plan: h1 = 10.0.0.11/24, h2 = 10.0.0.12/24, r1's interface on this LAN = 10.0.0.1/24. On each of h1, h2 and r1, find the lab-facing interface (run `ip link`; leave the one that already has an address alone), bring it up and assign the given address with `ip addr add <address>/24 dev <interface>`. When done, h1 must be able to ping h2 directly (they're on the same LAN, so r1 isn't on the path yet - just get it addressed too).",
+      "check_node": "h1",
+      "check": "ping -c3 -W2 10.0.0.12"
+    },
+    {
+      "id": "r1s2h2-routing",
+      "title": "Route between two LANs through one router",
+      "topology_id": "r1s2h2",
+      "difficulty": "medium",
+      "est_minutes": 10,
+      "prompt": "Two LANs, each with its own switch (sw1, sw2 - already working, no configuration needed), joined by one router, r1. Addressing plan: h1 = 10.0.1.11/24 (gateway 10.0.1.1), on sw1's LAN; h2 = 10.0.2.11/24 (gateway 10.0.2.1), on sw2's LAN; r1 has one interface on each LAN - assign 10.0.1.1/24 to the one facing sw1 and 10.0.2.1/24 to the one facing sw2. Use `ip link`/`ip addr` on each node to find its lab-facing interface(s) (leave any interface that already has an address alone). On r1, enable IP forwarding: `sysctl -w net.ipv4.ip_forward=1`. On h1 and h2, set the given address and a default route via the given gateway: `ip route add default via <gateway>`. When done, h1 must be able to ping h2.",
+      "check_node": "h1",
+      "check": "ping -c3 -W2 10.0.2.11"
+    },
+    {
+      "id": "r2s2h2-basic-routing",
+      "title": "Route between two LANs through two routers",
+      "topology_id": "r2s2h2",
+      "difficulty": "medium",
+      "est_minutes": 15,
+      "prompt": "Two LANs, each with its own switch (sw1, sw2 - already working, no configuration needed), joined by two routers, r1 and r2, over a point-to-point link between them. Addressing plan: h1 = 10.0.1.11/24 (gateway 10.0.1.1), on sw1's LAN; h2 = 10.0.2.11/24 (gateway 10.0.2.1), on sw2's LAN; r1's LAN-facing interface = 10.0.1.1/24; the r1<->r2 transit link = 10.0.0.1/30 on r1's side, 10.0.0.2/30 on r2's side; r2's LAN-facing interface = 10.0.2.1/24. Use `ip link`/`ip addr` on each node to find its lab-facing interface(s) (leave any interface that already has an address alone; a router here has two lab interfaces). Assign exactly these addresses. Enable IP forwarding on r1 and r2 (`sysctl -w net.ipv4.ip_forward=1`). Add the static route each router needs for the OTHER router's LAN (e.g. on r1: `ip route add 10.0.2.0/24 via 10.0.0.2`). On h1 and h2, set the given address and default gateway. When done, h1 must be able to ping h2.",
+      "check_node": "h1",
+      "check": "ping -c3 -W2 10.0.2.11"
+    },
+    {
+      "id": "lb1s1h3-roundrobin",
+      "title": "Load-balance two backends behind nginx",
+      "topology_id": "lb1s1h3",
+      "difficulty": "medium",
+      "est_minutes": 10,
+      "prompt": "client, web1, web2 and lb1 all sit on one switch, sw1 (already working, no configuration needed), on 10.0.5.0/24. Addressing plan: client = 10.0.5.10/24, web1 = 10.0.5.11/24, web2 = 10.0.5.12/24, lb1 = 10.0.5.1/24. On each node, find its lab-facing interface with `ip link` (leave the one that already has an address alone) and assign the given address. On web1 and web2, write a small index.html identifying which host it is, then start a backend on port 8080, e.g. `cd /tmp && echo 'web1' > index.html && python3 -m http.server 8080 &` (use 'web2' on web2). On lb1 (nginx is already installed and running), add a `stream {}` block to /etc/nginx/nginx.conf with an `upstream` pointing at 10.0.5.11:8080 and 10.0.5.12:8080 and a `server { listen 80; proxy_pass <upstream>; }`, then `nginx -t && systemctl reload nginx`. When done, a request from client to lb1 on port 80 must succeed.",
+      "check_node": "client",
+      "check": "curl -fsS -m3 http://10.0.5.1:80 -o /dev/null && echo reached"
+    },
+    {
+      "id": "fw1s2h2-filtered-routing",
+      "title": "Route between two LANs through a default-drop firewall",
+      "topology_id": "fw1s2h2",
+      "difficulty": "medium",
+      "est_minutes": 12,
+      "prompt": "Two LANs, each with its own switch (sw1, sw2 - already working, no configuration needed), joined by one firewall appliance, fw1 (nftables is installed and enabled, but its ruleset is still at Ubuntu's permissive default - this is a real firewall you must lock down, not a router). Addressing plan: h1 = 10.0.3.11/24 (gateway 10.0.3.1), on sw1's LAN; h2 = 10.0.4.11/24 (gateway 10.0.4.1), on sw2's LAN; fw1 has one interface on each LAN - assign 10.0.3.1/24 to the one facing sw1 and 10.0.4.1/24 to the one facing sw2. Use `ip link`/`ip addr` on each node to find its lab-facing interface(s). On fw1, enable IP forwarding (`sysctl -w net.ipv4.ip_forward=1`), then configure nftables with a default-DROP forward policy and an explicit rule accepting only ICMP between the two LANs (e.g. a filter table with a forward chain, `policy drop`, and `ip protocol icmp accept`), then apply it (`nft -f` your ruleset file, or `nft add` the rules directly). On h1 and h2, set the given address and default gateway. When done, h1 must be able to ping h2 - which only works if forwarding is on AND the ICMP-accept rule is actually in place.",
+      "check_node": "h1",
+      "check": "ping -c3 -W2 10.0.4.11"
+    }
+  ]
+}

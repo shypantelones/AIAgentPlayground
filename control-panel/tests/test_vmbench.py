@@ -25,6 +25,7 @@ class VmBenchBase(unittest.TestCase):
         self.patches = [
             mock.patch.object(app, "DATA", self.tmp / "instances"),
             mock.patch.object(app, "VMR_DIR", self.tmp / "vm-runs"),
+            mock.patch.object(app, "TOPOR_DIR", self.tmp / "topo-runs"),  # defense in depth; see topo_log() in app.py
             mock.patch.object(app, "VMB_SETTINGS_FILE", self.tmp / "vmbench-settings.json"),
             mock.patch.object(app, "VM_RUNS", {}),
             mock.patch.object(app, "VM_STOP", {}),

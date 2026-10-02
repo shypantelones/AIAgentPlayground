@@ -17,8 +17,12 @@ const vbElapsed = r => { const end = r.ended || Date.now() / 1000; const s = Mat
 
 async function refreshVBBadge() {
   try {
-    if (!vbTimer) vbData = await api("/api/vmbench");
-    const busy = vbData.runs.filter(r => ["provisioning", "working", "scoring"].includes(r.state)).length;
+    if (!vbTimer) {
+      vbData = await api("/api/vmbench");
+      if (typeof vtData !== "undefined") vtData = await api("/api/vmtopo").catch(() => vtData);
+    }
+    const busy = vbData.runs.filter(r => ["provisioning", "working", "scoring"].includes(r.state)).length +
+      (typeof vtData !== "undefined" ? vtData.runs.filter(r => ["provisioning", "working", "scoring"].includes(r.state)).length : 0);
     vbBtn.textContent = busy ? `VM Labs (${busy} running)` : "VM Labs";
   } catch { /* panel may be restarting */ }
 }
@@ -27,7 +31,8 @@ function openVB() {
   buildVBDialog();
   vbDlg.showModal();
   loadVB();
-  vbTimer = setInterval(loadVB, 2000);
+  if (typeof vtLoad === "function") vtLoad();
+  vbTimer = setInterval(() => { loadVB(); if (typeof vtLoad === "function") vtLoad(); }, 2000);
 }
 vbDlg.addEventListener("close", () => { clearInterval(vbTimer); vbTimer = null; });
 
@@ -92,6 +97,7 @@ function buildVBDialog() {
     h("h4", {}, "Runs"), VB.runsBox, VB.detail);
   VB.newTask.dispatchEvent(new Event("change"));
   Object.keys(vbSig).forEach(k => delete vbSig[k]);
+  if (typeof vtBuildSection === "function") vbDlg.append(h("hr"), vtBuildSection());
 }
 
 async function loadVB() {

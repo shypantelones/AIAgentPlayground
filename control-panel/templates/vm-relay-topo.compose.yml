@@ -1,0 +1,28 @@
+# Overlay added to an AGENT's own project only while a network-topology lab is attached to it. One container,
+# one socat listener per node (the lab's node count, not a fixed number) - same narrow-forward pattern as the
+# single-VM vm-relay.compose.yml, just multiplexed: the agent can reach exactly this lab's own nodes' SSH ports
+# and nothing else. VM_RELAY_TOPO_CMD is a full shell command line (one "socat ... &" per node, built in Python
+# from vm_runner.relay_port_for_node(), then "; wait") supplied via the process environment when docker compose
+# is invoked - never written to any file.
+services:
+  vm-relay-topo:
+    image: alpine/socat:latest
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["${VM_RELAY_TOPO_CMD}"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      internal:
+        aliases: [vm-relay-topo]
+      vmhostnet: {}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+
+  gateway:
+    depends_on: [vm-relay-topo]
+
+networks:
+  vmhostnet: {}

@@ -1,0 +1,103 @@
+{
+  "_comment": "Named network-topology templates for the VM Labs 'network topologies' feature. Each node becomes its own throwaway VM (see vm_runner.render_topology_vagrantfile); each link becomes its own VirtualBox internal network scoped to the run. Node names must match ^[a-z][a-z0-9]{0,14}$ and be unique per topology; roles are router, switch, host, loadbalancer or firewall. All roles boot the same ubuntu/jammy64 box (see resources/README.md) - behavior comes entirely from the provisioning script for that role. Edit or add entries freely.",
+  "topologies": [
+    {
+      "id": "s1h2",
+      "title": "1 switch, 2 hosts",
+      "nodes": [
+        {"name": "h1", "role": "host"},
+        {"name": "sw1", "role": "switch"},
+        {"name": "h2", "role": "host"}
+      ],
+      "links": [
+        {"a": "h1", "b": "sw1"},
+        {"a": "sw1", "b": "h2"}
+      ]
+    },
+    {
+      "id": "r1s1h2",
+      "title": "1 router, 1 switch, 2 hosts",
+      "nodes": [
+        {"name": "h1", "role": "host"},
+        {"name": "h2", "role": "host"},
+        {"name": "r1", "role": "router"},
+        {"name": "sw1", "role": "switch"}
+      ],
+      "links": [
+        {"a": "h1", "b": "sw1"},
+        {"a": "h2", "b": "sw1"},
+        {"a": "r1", "b": "sw1"}
+      ]
+    },
+    {
+      "id": "r1s2h2",
+      "title": "1 router, 2 switches, 2 hosts",
+      "nodes": [
+        {"name": "h1", "role": "host"},
+        {"name": "sw1", "role": "switch"},
+        {"name": "r1", "role": "router"},
+        {"name": "sw2", "role": "switch"},
+        {"name": "h2", "role": "host"}
+      ],
+      "links": [
+        {"a": "h1", "b": "sw1"},
+        {"a": "sw1", "b": "r1"},
+        {"a": "r1", "b": "sw2"},
+        {"a": "sw2", "b": "h2"}
+      ]
+    },
+    {
+      "id": "r2s2h2",
+      "title": "2 routers, 2 switches, 2 hosts",
+      "nodes": [
+        {"name": "h1", "role": "host"},
+        {"name": "sw1", "role": "switch"},
+        {"name": "r1", "role": "router"},
+        {"name": "r2", "role": "router"},
+        {"name": "sw2", "role": "switch"},
+        {"name": "h2", "role": "host"}
+      ],
+      "links": [
+        {"a": "h1", "b": "sw1"},
+        {"a": "sw1", "b": "r1"},
+        {"a": "r1", "b": "r2"},
+        {"a": "r2", "b": "sw2"},
+        {"a": "sw2", "b": "h2"}
+      ]
+    },
+    {
+      "id": "lb1s1h3",
+      "title": "1 load balancer, 1 switch, 3 hosts",
+      "nodes": [
+        {"name": "client", "role": "host"},
+        {"name": "web1", "role": "host"},
+        {"name": "web2", "role": "host"},
+        {"name": "lb1", "role": "loadbalancer"},
+        {"name": "sw1", "role": "switch"}
+      ],
+      "links": [
+        {"a": "client", "b": "sw1"},
+        {"a": "web1", "b": "sw1"},
+        {"a": "web2", "b": "sw1"},
+        {"a": "lb1", "b": "sw1"}
+      ]
+    },
+    {
+      "id": "fw1s2h2",
+      "title": "1 firewall, 2 switches, 2 hosts",
+      "nodes": [
+        {"name": "h1", "role": "host"},
+        {"name": "sw1", "role": "switch"},
+        {"name": "fw1", "role": "firewall"},
+        {"name": "sw2", "role": "switch"},
+        {"name": "h2", "role": "host"}
+      ],
+      "links": [
+        {"a": "h1", "b": "sw1"},
+        {"a": "sw1", "b": "fw1"},
+        {"a": "fw1", "b": "sw2"},
+        {"a": "sw2", "b": "h2"}
+      ]
+    }
+  ]
+}
