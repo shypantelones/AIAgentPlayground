@@ -1,4 +1,4 @@
-# One isolated OpenClaw agent. Run with: -p openclaw-i-<name> --env-file <instance>/.env
+# One isolated OpenClaw agent. Run with: -p aiagentplayground-i-<name> --env-file <instance>/.env
 # Needs env: HOST_PORT, OPENCLAW_GATEWAY_TOKEN, OPENCLAW_IMAGE, INSTANCE_DIR
 
 services:
@@ -80,7 +80,7 @@ networks:
     internal: true
   egress: {}
   llm:
-    name: openclaw-llm
+    name: aiagentplayground-llm
     external: true
 
 volumes:

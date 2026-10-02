@@ -19,7 +19,7 @@ PANEL_PORT = int(os.environ.get("PANEL_PORT", "8765"))
 IMAGE = os.environ.get("OPENCLAW_IMAGE", "ghcr.io/openclaw/openclaw:latest")
 DEFAULT_MODEL = os.environ.get("OPENCLAW_MODEL", "qwen3:14b")
 BASE_PORT = 18801
-SHARED_PROJECT = "openclaw-shared"
+SHARED_PROJECT = "aiagentplayground-shared"
 MODELS_VOLUME = "openclaw-sandbox_ollama-models"
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,19}$")
 CHAT_RE = re.compile(r"^[a-z0-9-]{1,40}$")
@@ -56,7 +56,7 @@ def run(args, input=None, timeout=120, env=None, redact=None):
 
 
 def proj(name):
-    return f"openclaw-i-{name}"
+    return f"aiagentplayground-i-{name}"
 
 
 def dc(name, *args, input=None, timeout=120):
@@ -369,10 +369,10 @@ def ensure_image(log, image=None):
 
 
 def ensure_llm_network(log):
-    """Every agent's compose file joins the shared openclaw-llm network (external), even in cloud mode. Create it
+    """Every agent's compose file joins the shared aiagentplayground-llm network (external), even in cloud mode. Create it
     WITHOUT starting the model server, so a cloud-only agent needs no Ollama. It must come from the model server's own
     compose project (compose labels and hashes its networks and rejects a hand-made one)."""
-    if run([DOCKER, "network", "inspect", "openclaw-llm"], timeout=30)[0] == 0:
+    if run([DOCKER, "network", "inspect", "aiagentplayground-llm"], timeout=30)[0] == 0:
         return
     log("creating the shared model network (the local model server is not started)...")
     need(shared("up", "--no-start"), "creating the shared model network")
@@ -434,6 +434,7 @@ def delete_agent(name):
         log("removing containers, networks and volumes...")
         remove_links_for(name)
         stop_vm_runs_for(name)
+        stop_topo_runs_for(name)
         dc(name, "down", "-v", "--remove-orphans", timeout=300)
         shutil.rmtree(DATA / name, ignore_errors=True)
         log("deleted.")
@@ -785,7 +786,12 @@ def taken_ports(rng):
 
 
 def count_occupying_slots():
-    return sum(1 for r in VM_RUNS.values() if r["state"] in VM_OCCUPYING_STATES)
+    # Shared budget across both VM Lab kinds: a VirtualBox VM costs the same host RAM/CPU whether it's a lone
+    # benchmark VM or one node of a network-topology lab, so a topology run charges one slot per node, not one
+    # per run (TOPO_RUNS is defined further down this file; safe to reference here since this is only ever
+    # called after the whole module has finished loading, never during import).
+    return (sum(1 for r in VM_RUNS.values() if r["state"] in VM_OCCUPYING_STATES) +
+            sum(len(r["nodes"]) for r in TOPO_RUNS.values() if r["state"] in TOPO_OCCUPYING_STATES))
 
 
 def create_vm_run(form):
@@ -800,7 +806,7 @@ def create_vm_run(form):
             raise ValueError("pick a task for the agent to attempt")
     s = vmb_settings()
     rid = uuid.uuid4().hex[:8]
-    r = {"id": rid, "vm_name": f"openclaw-vmbench-{rid}", "state": "queued", "reason": "", "keep": bool(form.get("keep", s["keep_default"])),
+    r = {"id": rid, "vm_name": f"aiagentplayground-vmbench-{rid}", "state": "queued", "reason": "", "keep": bool(form.get("keep", s["keep_default"])),
          "memory_mb": int(form.get("memory_mb") or s["memory_mb"]), "cpus": int(form.get("cpus") or s["cpus"]),
          "created": time.time(), "started": None, "ended": None, "agent": agent, "task_id": task_id,
          "task_title": (task or {}).get("title"), "chat": f"vmbench-{rid}" if agent else None,
@@ -1042,7 +1048,7 @@ def start_terminal(rid):
     with VM_LOCK:
         term_port = vr.allocate_port(vr.TERM_PORT_RANGE, taken_ports(vr.TERM_PORT_RANGE))
     token = secrets.token_hex(16)
-    project = f"openclaw-vmterm-{rid}"
+    project = f"aiagentplayground-vmterm-{rid}"
     env = dict(os.environ, TERM_PROJECT=project, KEY_PATH=str(priv), VM_SSH_PORT=str(r["ssh_port"]),
                TERM_PORT=str(term_port), TERM_CRED=f"bench:{token}")
     rc, out, err = run([DOCKER, "compose", "-p", project, "-f", str(TPL / "vm-terminal.compose.yml"), "up", "-d"],
@@ -1061,7 +1067,7 @@ def stop_terminal(rid, quiet=False):
         if quiet:
             return
         raise KeyError("unknown run")
-    project = f"openclaw-vmterm-{rid}"
+    project = f"aiagentplayground-vmterm-{rid}"
     # `down` still parses the compose file's variable interpolation even when tearing down, so every variable it
     # references needs a syntactically valid value (the exact port/credential don't matter for a teardown - only
     # that no volume/port mapping ends up empty, which docker compose rejects outright before stopping anything).
@@ -1076,6 +1082,432 @@ def stop_terminal(rid, quiet=False):
     r["terminal"] = {"active": False, "port": None}
     VM_TERM_CREDS.pop(rid, None)
     save_vm_run(r)
+
+
+# ---------------------------------------------------------------- VM network-topology labs (routers/switches/hosts)
+# Same throwaway-VM philosophy as the VM benchmarks above, but one run is a small GROUP of VMs wired together:
+# each lab link is its own VirtualBox internal network, scoped to this run only (never bridged to the host LAN or
+# shared with any other run or agent - same invariant as a single benchmark VM, just applied to a group). A
+# "switch" node is a real VM too, not a bare intnet standing in for one (see vm_runner.render_topology_vagrantfile).
+# Agent attach mirrors the single-VM vm-relay pattern but with one relay container multiplexing N node ports
+# instead of one relay per node (templates/vm-relay-topo.compose.yml) - see .claude/skills/vm-lab-dev/SKILL.md.
+TOPOR_DIR = ROOT / "data" / "topo-runs"
+TOPOR_DIR.mkdir(parents=True, exist_ok=True)
+TOPO_RUNS = {}           # run id -> live record (also persisted to data/topo-runs/<id>.json)
+TOPO_LOCK = threading.RLock()
+TOPO_TERM_CREDS = {}     # "<run id>:<node>" -> current terminal credential; kept in memory only, never persisted
+TOPO_STOP = {}           # run id -> bool, polled by the runner thread at phase boundaries
+TOPO_RUN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+TOPO_LIVE_STATES = ("queued", "provisioning", "working", "scoring")
+TOPO_OCCUPYING_STATES = TOPO_LIVE_STATES + ("ready",)
+
+
+def stop_topo_runs_for(agent_name):
+    for r in list(TOPO_RUNS.values()):
+        if r.get("agent") == agent_name and r["state"] in TOPO_OCCUPYING_STATES:
+            TOPO_STOP[r["id"]] = True
+
+
+def topo_run_path(rid):
+    return TOPOR_DIR / f"{rid}.json"
+
+
+def topo_run_dir(rid):
+    return TOPOR_DIR / rid
+
+
+def save_topo_run(r):
+    with TOPO_LOCK:
+        tmp = topo_run_path(r["id"]).with_suffix(".tmp")
+        tmp.write_text(json.dumps(r, indent=1))
+        tmp.replace(topo_run_path(r["id"]))
+
+
+def topo_log(r, line):
+    # Deliberately its own function, not a reuse of vm_log() above: vm_log() hardcodes save_vm_run(), which would
+    # silently persist a topology run's record (shape: {..., "nodes": {...}}) into data/vm-runs/ instead of
+    # data/topo-runs/ - the in-memory TOPO_RUNS entry would still read back correctly within the same process (same
+    # dict object), masking the bug until a restart tries to load_vm_runs() a topology-shaped file and chokes on
+    # vm_run_view()'s assumption of a single top-level ssh_port/terminal.
+    r["vm_log"] = (r.get("vm_log", "") + line.rstrip("\n") + "\n")[-40000:]
+    save_topo_run(r)
+
+
+def load_topo_runs():
+    files = sorted(TOPOR_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    for f in files[:100]:
+        try:
+            r = json.loads(f.read_text())
+        except Exception:
+            continue
+        if r["state"] in TOPO_LIVE_STATES:
+            r.update(state="interrupted", reason=(r.get("reason") or "") or "the control panel was restarted")
+            f.write_text(json.dumps(r, indent=1))
+        TOPO_RUNS[r["id"]] = r
+    for f in files[100:]:
+        f.unlink()
+
+
+def topo_run_view(r, full=False):
+    v = {k: r[k] for k in ("id", "state", "reason", "keep", "memory_mb", "cpus", "created", "started", "ended",
+                           "agent", "topology_id", "topology_title", "task_id", "task_title", "custom_prompt",
+                           "chat", "score", "benchmark_id", "nodes")}
+    if full:
+        v["transcript"] = r.get("vm_log", "")[-20000:]
+    return v
+
+
+def topo_taken_ports(rng):
+    with TOPO_LOCK:
+        ports = set()
+        for r in TOPO_RUNS.values():
+            for node in r.get("nodes", {}).values():
+                if node.get("ssh_port"):
+                    ports.add(node["ssh_port"])
+                if node.get("terminal", {}).get("port"):
+                    ports.add(node["terminal"]["port"])
+        return ports
+
+
+def create_topo_run(form):
+    """topology_id selects a catalog template; `custom` ({"counts", "wiring", "links"}) builds an ad hoc one via
+    vr.build_custom_topology() instead - either way `topology` ends up the same {title, nodes, links} shape, and
+    everything below (and all of topo_run_runner) stays unaware of which path produced it. A custom topology has
+    no topology_id (nothing to look up later), so its full dict is embedded on the run record as r["topology"]."""
+    topology_id = form.get("topology_id") or None
+    custom = form.get("custom")
+    if topology_id:
+        topology = vr.get_topology(topology_id)          # raises KeyError if unknown
+    elif custom:
+        topology = vr.build_custom_topology(custom.get("counts") or {}, custom.get("wiring"), custom.get("links"))
+        topology_id = None                               # not a catalog member
+    else:
+        raise ValueError("pick a topology or build a custom one")
+    task_id = form.get("task_id") or None
+    task = vr.get_topology_task(task_id) if task_id else None
+    if task and task["topology_id"] != topology_id:
+        raise ValueError("that task is for a different topology")
+    custom_prompt = (form.get("custom_prompt") or "").strip() or None
+    agent = (form.get("agent") or "").strip().lower() or None
+    if agent:
+        load_meta(agent)                              # raises KeyError if unknown
+        if not agent_running(agent):
+            raise ValueError(f"{agent} is not running; start it first")
+        if not task and not custom_prompt:
+            # Covers both cases with one check: a custom topology can never have a matching catalog task (the
+            # check above already rejected task_id+custom topology together), so `task` is already None there -
+            # this just additionally requires custom_prompt for it, and requires either one for a catalog topology.
+            raise ValueError("pick a task or write a custom prompt for the agent to attempt")
+    s = vmb_settings()
+    rid = uuid.uuid4().hex[:8]
+    nodes = {n["name"]: {"role": n["role"], "ssh_port": None, "terminal": {"active": False, "port": None}}
+             for n in topology["nodes"]}
+    r = {"id": rid, "state": "queued", "reason": "", "keep": bool(form.get("keep", s["keep_default"])),
+         "memory_mb": int(form.get("memory_mb") or s["memory_mb"]), "cpus": int(form.get("cpus") or s["cpus"]),
+         "created": time.time(), "started": None, "ended": None, "agent": agent,
+         "topology_id": topology_id, "topology_title": topology["title"],
+         "topology": topology if topology_id is None else None, "task_id": task_id,
+         "task_title": (task or {}).get("title"), "custom_prompt": custom_prompt,
+         "chat": f"vmtopo-{rid}" if agent else None,
+         "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": ""}
+    TOPO_RUNS[rid] = r
+    save_topo_run(r)
+    threading.Thread(target=topo_run_runner, args=(rid,), daemon=True).start()
+    return rid
+
+
+def create_topo_benchmark(form):
+    """Same task across several agents at once, grouped so the UI can show them side by side."""
+    agents = [a.strip().lower() for a in (form.get("agents") or []) if a.strip()]
+    if len(agents) < 1:
+        raise ValueError("pick at least one agent")
+    bid = uuid.uuid4().hex[:8]
+    ids = []
+    for a in agents:
+        sub = dict(form, agent=a, benchmark_id=bid)
+        sub.pop("agents", None)
+        ids.append(create_topo_run(sub))
+    return bid, ids
+
+
+def topo_run_runner(rid):
+    r = TOPO_RUNS[rid]
+    d = topo_run_dir(rid)
+    topology = vr.get_topology(r["topology_id"]) if r["topology_id"] else r["topology"]
+
+    def stopped():
+        return TOPO_STOP.get(rid, False)
+
+    def finish(state, reason):
+        r.update(state=state, reason=reason, ended=time.time())
+        save_topo_run(r)
+
+    my_slots = len(r["nodes"])
+    try:
+        # Effective cap is never below this run's own node count: count_occupying_slots() counts this run's nodes
+        # too (same self-inclusive-counting as the single-VM runner), and a topology bigger than max_concurrent
+        # must still be allowed to run alone - otherwise a 6-node topology against the default max_concurrent=2
+        # would wait forever for a slot that can never free, since nothing OTHER is holding it back. It still
+        # queues normally behind any OTHER already-running work, exactly like the single-VM case.
+        while count_occupying_slots() > max(vmb_settings()["max_concurrent"], my_slots):
+            if stopped():
+                return finish("stopped", "stopped while queued")
+            time.sleep(1)
+        r["state"] = "provisioning"
+        r["started"] = time.time()
+        save_topo_run(r)
+        d.mkdir(parents=True, exist_ok=True)
+        topo_log(r, "generating an SSH keypair for this lab (one keypair for every node - they already trust each other by design)...")
+        priv, pub = vr.gen_keypair(d)
+        node_ports = {}
+        with TOPO_LOCK:
+            taken = topo_taken_ports(vr.TOPO_SSH_PORT_RANGE)
+            for name in r["nodes"]:
+                port = vr.allocate_port(vr.TOPO_SSH_PORT_RANGE, taken)
+                taken.add(port)
+                node_ports[name] = port
+        for name, port in node_ports.items():
+            r["nodes"][name]["ssh_port"] = port
+        save_topo_run(r)
+        vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"])
+        timeout = 900 + 300 * (len(topology["nodes"]) - 1)
+        topo_log(r, f"starting {len(topology['nodes'])} VMs for '{r['topology_title']}' (first run also downloads the {vr.BOX} image)...")
+        # --no-parallel: the VirtualBox provider parallelizes multi-machine `up` by default, which on real
+        # hardware testing made N VMs apt-get/boot simultaneously contend hard enough for host CPU/disk that one
+        # of them routinely missed the (single-VM-sized) SSH-readiness window below, even with ample VM memory -
+        # confirmed by reproducing the same node in isolation, where it came up fine every time. Sequential
+        # provisioning costs wall-clock time, not reliability; this is a correctness fix, not a speed one.
+        def on_vagrant_line(line):
+            # Vagrant's own curated phase markers ("==> h1: Booting VM...", "==> h1: Running provisioner:
+            # shell...") are what make the build-out legible live - everything else on this stream is raw
+            # apt/dpkg output, which is useful for post-failure diagnosis (kept in `out` below) but would drown
+            # out the signal if streamed wholesale. A box-import progress bar can prefix "==>" with leftover
+            # \r-redraw/escape-code junk on the same physical line, so this finds "==>" anywhere, not just at
+            # the start.
+            idx = line.find("==>")
+            if idx != -1:
+                topo_log(r, line[idx:])
+        rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
+                                         on_line=on_vagrant_line)
+        if rc != 0:
+            topo_log(r, (out or err)[-2000:])
+            vr.vagrant(d, "destroy", "-f", timeout=180)
+            return finish("error", "failed to start the lab (see transcript)")
+        if stopped():
+            vr.vagrant(d, "destroy", "-f", timeout=180)
+            return finish("stopped", "stopped during setup")
+        topo_log(r, "waiting for every node to accept SSH...")
+        for name, port in node_ports.items():
+            def log_attempt(i, rc, err, name=name):     # default arg: capture this loop iteration's `name`
+                if rc != 0 and (i == 0 or i % 15 == 14):
+                    topo_log(r, f"  {name}: ssh attempt {i+1} failed (rc={rc}): {err.strip()[-300:]}")
+            if not vr.ssh_wait(port, priv, tries=90, delay=2, on_attempt=log_attempt):
+                return finish("error", f"node '{name}' booted but never accepted SSH")
+        r["state"] = "ready"
+        save_topo_run(r)
+        task = vr.get_topology_task(r["task_id"]) if r["task_id"] else None
+        topo_log(r, "ready." + (f" Task: {task['title']}" if task else " No task attached: open a terminal on any node to use this lab directly."))
+
+        if not r["agent"]:
+            # No agent attached: this lab is for YOU - open terminals, do the task (if any), then use "Score now"
+            # whenever you like. Stay in "ready" and return without tearing anything down; Stop/Delete handle that.
+            return
+        if stopped():
+            return finish("stopped", "stopped before the agent's turn")
+        r["state"] = "working"
+        save_topo_run(r)
+        topo_log(r, f"attaching {r['agent']} to this lab...")
+        key_text = priv.read_text()
+        dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
+           "mkdir -p /home/node/.openclaw/workspace/.vmkey-topo && "
+           "cat > /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519 && "
+           "chmod 600 /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", input=key_text, timeout=20)
+        for name in r["nodes"]:
+            relay_port = vr.relay_port_for_node(topology, name)
+            wrapper = ("#!/bin/sh\n"
+                      "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
+                      "echo \"=== $ts \\$ $*\" >> /home/node/.openclaw/workspace/vm-session-topo.log\n"
+                      f"ssh -i /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519 -p {relay_port} "
+                      "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "
+                      "bench@vm-relay-topo \"$@\" 2>&1 | tee -a /home/node/.openclaw/workspace/vm-session-topo.log\n")
+            dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
+               f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
+               input=wrapper, timeout=20)
+        relay_cmd = vr.relay_command(topology, node_ports)
+        env = dict(os.environ, VM_RELAY_TOPO_CMD=relay_cmd)
+        files = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay-topo.compose.yml")]
+        rc, out, err = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
+                           *files, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
+        if rc != 0:
+            return finish("error", "could not attach the agent's lab relay (see transcript)")
+        node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} \"<command>\"" for name in r["nodes"])
+        prompt = (
+            f"{task['prompt'] if task else r['custom_prompt']}\n\n"
+            "This lab has these nodes, each reachable with its own command run from your current working "
+            f"directory (e.g. ./vmrun-h1 \"ip addr\"):\n{node_lines}\n\n"
+            "Every node's first network interface is for setup only (already configured - leave it alone); its "
+            "other interfaces are the lab links, with no address until you (or the task) configure them. A "
+            "'switch' node is already working as a plain Ethernet switch and needs no configuration."
+        )
+        t0 = time.time()
+        res = run_turn(r["agent"], r["chat"], prompt, {"via": "vmtopo", "run": rid}, lambda s: topo_log(r, s), timeout=1200)
+        topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']})")
+        run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
+            *files, "rm", "-sf", "vm-relay-topo"], timeout=30)
+        dc(r["agent"], "exec", "-T", "gateway", "rm", "-rf", "/home/node/.openclaw/workspace/.vmkey-topo", timeout=20)
+
+        if task and task.get("check") and not stopped():
+            r["state"] = "scoring"
+            save_topo_run(r)
+            topo_log(r, "scoring...")
+            r["score"] = score_run(node_ports[task["check_node"]], priv, task)
+            save_topo_run(r)
+            topo_log(r, f"score: {'PASS' if r['score']['passed'] else 'FAIL'}\n{r['score']['output']}")
+        finish("stopped" if stopped() else "done", r.get("reason", ""))
+    except Exception as e:  # noqa
+        finish("error", str(e))
+    finally:
+        try:
+            for name, node in r.get("nodes", {}).items():
+                if node.get("terminal", {}).get("active"):
+                    stop_topo_terminal(rid, name, quiet=True)
+        except Exception:
+            pass
+        # Only tear down automatically once this thread actually finished the run. A no-agent run returns early
+        # while still "ready" (waiting for you to use terminals / Score now) and must NOT be destroyed here.
+        if r["state"] in ("done", "error", "stopped") and not r.get("keep"):
+            try:
+                vr.vagrant(d, "destroy", "-f", timeout=180)
+            except Exception:
+                pass
+            shutil.rmtree(d, ignore_errors=True)
+        TOPO_STOP.pop(rid, None)
+
+
+def topo_score_now(rid):
+    """On-demand scoring - lets a PERSON who did the task themselves via the terminals get scored too."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] not in ("ready", "done", "working"):
+        raise ValueError("the lab isn't ready yet")
+    if not r.get("task_id"):
+        raise ValueError("this run has no task attached, so there is nothing to score")
+    task = vr.get_topology_task(r["task_id"])
+    d = topo_run_dir(rid)
+    priv = d / "id_ed25519"
+    if not priv.exists():
+        raise ValueError("this run's lab is gone")
+    check_port = r["nodes"][task["check_node"]]["ssh_port"]
+
+    def job(log):
+        log("scoring...")
+        r["score"] = score_run(check_port, priv, task)
+        if r["state"] != "working":
+            r["state"] = "done"
+        save_topo_run(r)
+        log(f"score: {'PASS' if r['score']['passed'] else 'FAIL'}")
+        return r["score"]
+    return start_job(f"Score {rid}", job)
+
+
+def stop_topo_run(rid):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] == "ready":
+        # Idle, waiting for you: no background thread to notice a flag, so tear down (or not, if "keep") right here.
+        for name, node in r["nodes"].items():
+            if node.get("terminal", {}).get("active"):
+                stop_topo_terminal(rid, name, quiet=True)
+        if not r.get("keep"):
+            d = topo_run_dir(rid)
+            if d.exists():
+                vr.vagrant(d, "destroy", "-f", timeout=180)
+                shutil.rmtree(d, ignore_errors=True)
+        r.update(state="stopped", reason="stopped by you", ended=time.time())
+        save_topo_run(r)
+        return
+    if r["state"] not in TOPO_LIVE_STATES:
+        raise ValueError("this run isn't live")
+    TOPO_STOP[rid] = True
+
+
+def delete_topo_run(rid):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] in TOPO_LIVE_STATES:
+        raise ValueError("stop the run first")
+    for name, node in r["nodes"].items():
+        if node.get("terminal", {}).get("active"):
+            stop_topo_terminal(rid, name, quiet=True)
+    d = topo_run_dir(rid)
+    if d.exists():
+        vr.vagrant(d, "destroy", "-f", timeout=180)
+        shutil.rmtree(d, ignore_errors=True)
+    TOPO_RUNS.pop(rid, None)
+    try:
+        topo_run_path(rid).unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------- per-node web terminal for a topology run (ttyd)
+def start_topo_terminal(rid, node):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if node not in r["nodes"]:
+        raise KeyError("unknown node")
+    if r["state"] not in ("ready", "working", "scoring", "done"):
+        raise ValueError("the lab isn't up yet")
+    n = r["nodes"][node]
+    if n.get("terminal", {}).get("active"):
+        return n["terminal"]["port"], TOPO_TERM_CREDS.get(f"{rid}:{node}", "")
+    d = topo_run_dir(rid)
+    priv = d / "id_ed25519"
+    if not priv.exists():
+        raise ValueError("this run's lab is gone")
+    with TOPO_LOCK:
+        term_port = vr.allocate_port(vr.TOPO_TERM_PORT_RANGE, topo_taken_ports(vr.TOPO_TERM_PORT_RANGE))
+    token = secrets.token_hex(16)
+    project = f"aiagentplayground-vmterm-{rid}-{node}"
+    env = dict(os.environ, TERM_PROJECT=project, KEY_PATH=str(priv), VM_SSH_PORT=str(n["ssh_port"]),
+               TERM_PORT=str(term_port), TERM_CRED=f"bench:{token}")
+    rc, out, err = run([DOCKER, "compose", "-p", project, "-f", str(TPL / "vm-terminal.compose.yml"), "up", "-d"],
+                       timeout=60, env=env, redact=token)
+    if rc != 0:
+        raise RuntimeError("could not start the terminal: " + (err or out).strip()[-300:])
+    n["terminal"] = {"active": True, "port": term_port}
+    TOPO_TERM_CREDS[f"{rid}:{node}"] = token
+    save_topo_run(r)
+    return term_port, token
+
+
+def stop_topo_terminal(rid, node, quiet=False):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        if quiet:
+            return
+        raise KeyError("unknown run")
+    if node not in r["nodes"]:
+        if quiet:
+            return
+        raise KeyError("unknown node")
+    n = r["nodes"][node]
+    project = f"aiagentplayground-vmterm-{rid}-{node}"
+    priv = topo_run_dir(rid) / "id_ed25519"
+    env = dict(os.environ, TERM_PROJECT=project, KEY_PATH=str(priv if priv.exists() else (ROOT / "app.py")),
+               VM_SSH_PORT=str(n.get("ssh_port") or 0), TERM_PORT=str(n.get("terminal", {}).get("port") or 0),
+               TERM_CRED="bench:unused")
+    rc, out, err = run([DOCKER, "compose", "-p", project, "-f", str(TPL / "vm-terminal.compose.yml"), "down", "--remove-orphans"],
+                       timeout=30, env=env)
+    if rc != 0 and not quiet:
+        raise RuntimeError("could not stop the terminal: " + (err or out).strip()[-300:])
+    n["terminal"] = {"active": False, "port": None}
+    TOPO_TERM_CREDS.pop(f"{rid}:{node}", None)
+    save_topo_run(r)
 
 
 # ---------------------------------------------------------------- isolation self-check
@@ -1100,7 +1532,7 @@ def verify(name):
         check("Host drives not visible", rc("test -e /mnt/c || test -e /c || test -e /host_mnt")[0] != 0)
         check("Not running as root", rc("id -u")[1].strip() not in ("", "0"))
         net = run([DOCKER, "inspect", "-f", "{{json .NetworkSettings.Networks}}", f"{proj(name)}-gateway-1"], timeout=20)[1]
-        check("Gateway is on its private network only (not the shared model net)", "openclaw-llm" not in net and "egress" not in net)
+        check("Gateway is on its private network only (not the shared model net)", "aiagentplayground-llm" not in net and "egress" not in net)
         port = dc(name, "port", "ui-forward", "18789")[1]
         check("Dashboard bound to loopback only", port.strip().startswith("127.0.0.1:"))
         if load_meta(name).get("backend") == "cloud":
@@ -1649,6 +2081,13 @@ class Handler(BaseHTTPRequestHandler):
             if parts[:3] == ["api", "vmbench", "runs"] and len(parts) == 4 and VM_RUN_ID_RE.match(parts[3]):
                 r = VM_RUNS.get(parts[3])
                 return self.send_json(vm_run_view(r, full=True)) if r else self.fail(404, "no such run")
+            if parts == ["api", "vmtopo"]:
+                return self.send_json({"topologies": vr.load_topologies(), "tasks": vr.load_topology_tasks(),
+                                       "settings": vmb_settings(),
+                                       "runs": [topo_run_view(r) for r in sorted(TOPO_RUNS.values(), key=lambda x: x["created"], reverse=True)[:40]]})
+            if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 4 and TOPO_RUN_ID_RE.match(parts[3]):
+                r = TOPO_RUNS.get(parts[3])
+                return self.send_json(topo_run_view(r, full=True)) if r else self.fail(404, "no such run")
             if parts == ["api", "peers"]:
                 links = [dict(l, risks=peer_risks(l["a"], l["b"])) for l in load_links()["links"]
                          if (DATA / l["a"] / "meta.json").exists() and (DATA / l["b"] / "meta.json").exists()]
@@ -1771,6 +2210,29 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[4] == "terminal-stop":
                     stop_terminal(parts[3])
                     return self.send_json({"ok": True})
+            if parts == ["api", "vmtopo", "runs"]:
+                return self.send_json({"run": create_topo_run(b)})
+            if parts == ["api", "vmtopo", "benchmarks"]:
+                bid, ids = create_topo_benchmark(b)
+                return self.send_json({"benchmark": bid, "runs": ids})
+            if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 5 and TOPO_RUN_ID_RE.match(parts[3]):
+                if parts[4] == "stop":
+                    stop_topo_run(parts[3])
+                    return self.send_json({"ok": True})
+                if parts[4] == "delete":
+                    delete_topo_run(parts[3])
+                    return self.send_json({"ok": True})
+                if parts[4] == "score":
+                    return self.send_json({"job": topo_score_now(parts[3])})
+            if (parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 7 and TOPO_RUN_ID_RE.match(parts[3])
+                    and parts[4] == "nodes"):
+                node = parts[5]
+                if parts[6] == "terminal-start":
+                    port, token = start_topo_terminal(parts[3], node)
+                    return self.send_json({"port": port, "cred": token})
+                if parts[6] == "terminal-stop":
+                    stop_topo_terminal(parts[3], node)
+                    return self.send_json({"ok": True})
             if parts[:2] == ["api", "peers"]:
                 if parts == ["api", "peers", "links"]:
                     link = create_link(b)
@@ -1874,6 +2336,7 @@ def main():
     migrate_instances()
     load_sessions()
     load_vm_runs()
+    load_topo_runs()
     srv = ThreadingHTTPServer(("127.0.0.1", PANEL_PORT), Handler)
     print(f"AI Agent control panel: http://127.0.0.1:{PANEL_PORT}  (Ctrl+C to stop)")
     try:

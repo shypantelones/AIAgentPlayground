@@ -37,7 +37,7 @@ class AgentEnvTests(unittest.TestCase):
 
     def test_env_from_another_machine_is_rebuilt(self):
         (self.d / ".env").write_text("HOST_PORT=18801\nOPENCLAW_GATEWAY_TOKEN=old\nOPENCLAW_IMAGE=x\n"
-                                     "INSTANCE_DIR=C:/Users/someone/openclaw-playground/control-panel/data/instances/alpha\n")
+                                     "INSTANCE_DIR=C:/Users/someone/aiagentplayground/control-panel/data/instances/alpha\n")
         app.env_file("alpha")
         self.assertIn(f"INSTANCE_DIR={self.d.as_posix()}", self.env_lines())
         self.assertIn("OPENCLAW_GATEWAY_TOKEN=t0ken", self.env_lines())

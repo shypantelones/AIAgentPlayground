@@ -1,8 +1,9 @@
 # macOS
 
-**Status: NOT tested on a Mac.** Built and tested on Windows. The macOS-specific pieces were checked only indirectly:
-the Keychain code against a fake `security` command, the launcher under bash on Linux, and the host-Ollama bridge
-end to end on Windows with a stand-in Ollama. Expect to fix small things on a real Mac, and please report them.
+**Status: tested on a Mac** (Intel/x86_64). The control panel, agent creation, and VM Labs (both single-VM
+benchmarks and multi-VM network-topology labs) have been run for real on macOS, including installing
+Vagrant + VirtualBox from scratch and boot-testing real multi-VM topologies end to end. Apple Silicon is still
+untested (see below).
 
 ## How the Mac differs
 Docker on a Mac cannot use the Mac GPU. So instead of running the model in a container (CPU-only, slow), the Mac uses
@@ -31,7 +32,7 @@ more (approximate; check the model's size on ollama.com). Then create an agent, 
 `OLLAMA_MODE` (`host` recommended; `cpu` runs a slow CPU-only container instead), `OLLAMA_NUM_PARALLEL`, `PANEL_PORT`.
 
 ## macOS specifics
-- **API keys** go in the macOS Keychain (service `openclaw-panel`). macOS may show a Keychain permission prompt the first
+- **API keys** go in the macOS Keychain (service `aiagentplayground-panel`). macOS may show a Keychain permission prompt the first
   time; allow it. The key is passed to the `security` tool over stdin so it does not appear in a process list.
 - **Docker file sharing:** the project folder must be somewhere Docker Desktop can mount. Your home folder is shared by
   default (Settings > Resources > File sharing).
@@ -41,8 +42,15 @@ more (approximate; check the model's size on ollama.com). Then create an agent, 
   smaller models (the panel's fit labels account for this). `host` mode is still the right choice.
 - **VM tier (`vm-sandbox`)** uses VirtualBox with an x86 Ubuntu box: Intel Macs only. On Apple Silicon use another VM
   tool; this project does not provide that.
+- **VM Labs** (inside the control panel) also needs Vagrant + VirtualBox, same x86-only caveat as above. Neither
+  needs Homebrew: both ship official `.dmg`/`.pkg` installers from [virtualbox.org](https://www.virtualbox.org/wiki/Downloads)
+  and [releases.hashicorp.com/vagrant](https://releases.hashicorp.com/vagrant/) if you don't already have them.
+  Current VirtualBox (7.2.x) runs VMs via Apple's own Hypervisor.framework on this machine, not a kernel
+  extension, so there is no System Settings approval step to find after installing — if `vagrant up` ever
+  reports a boot/SSH problem, check `VBoxManage list vms`/`runningvms` directly before assuming it's VM Labs
+  itself.
 - **Agent workspaces are Docker volumes**, not folders. To copy files out:
-  `docker cp openclaw-i-<name>-gateway-1:/home/node/.openclaw/workspace .`
+  `docker cp aiagentplayground-i-<name>-gateway-1:/home/node/.openclaw/workspace .`
 
 ## Troubleshooting
 | Symptom | Fix |

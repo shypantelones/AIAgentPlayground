@@ -1,12 +1,12 @@
 # Shared pieces of the local model server, common to every OS and mode.
 # The control panel combines this file with exactly one mode file (see mode-*.yml).
-# Whatever the mode, agents reach the model only as llm-backend:11434 on the internal openclaw-llm network,
+# Whatever the mode, agents reach the model only as llm-backend:11434 on the internal aiagentplayground-llm network,
 # and only through their own relay container.
-name: openclaw-shared
+name: aiagentplayground-shared
 
 networks:
   llm:
-    name: openclaw-llm
+    name: aiagentplayground-llm
     internal: true            # no internet for the model server
 
 volumes:

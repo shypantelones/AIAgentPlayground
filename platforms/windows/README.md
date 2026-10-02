@@ -36,10 +36,10 @@ Then in the page: **Download model** (for a 16 GB GPU, `qwen3:14b` fits), create
 ## Windows specifics
 - **API keys** are encrypted with DPAPI, tied to your Windows login (useless on another account or PC). If you reinstall
   Windows or move PCs, re-enter them.
-- **Keep the project under your user folder** (for example `C:\Users\<you>\openclaw-playground`). Docker Desktop failed to
+- **Keep the project under your user folder** (for example `C:\Users\<you>\aiagentplayground`). Docker Desktop failed to
   bind-mount files from a temporary `AppData\Roaming` location during development.
 - **Agent workspaces are Docker volumes**, not folders on disk. Windows bind mounts do not support the atomic file renames
-  OpenClaw uses, which broke it. To get files out: `docker cp openclaw-i-<name>-gateway-1:/home/node/.openclaw/workspace .`
+  OpenClaw uses, which broke it. To get files out: `docker cp aiagentplayground-i-<name>-gateway-1:/home/node/.openclaw/workspace .`
 - **Windows 11 Home** has no Hyper-V and no Windows Sandbox; that is fine for Docker Desktop (WSL2). The optional VM tier
   uses VirtualBox + Vagrant (`winget install Oracle.VirtualBox Hashicorp.Vagrant`); VirtualBox runs slower alongside WSL2.
 
