@@ -1,0 +1,24 @@
+# Overlay added to an AGENT's own project only while a benchmark VM is attached to it. Narrow one-port forward,
+# same pattern as the Ollama/cloud relays: the agent can reach exactly its own VM's SSH port and nothing else.
+# VM_SSH_PORT is supplied via the process environment when docker compose is invoked (not written to any file).
+services:
+  vm-relay:
+    image: alpine/socat:latest
+    restart: "no"
+    command: ["TCP-LISTEN:22,fork,reuseaddr", "TCP:host.docker.internal:${VM_SSH_PORT}"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      internal:
+        aliases: [vm-relay]
+      vmhostnet: {}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+
+  gateway:
+    depends_on: [vm-relay]
+
+networks:
+  vmhostnet: {}

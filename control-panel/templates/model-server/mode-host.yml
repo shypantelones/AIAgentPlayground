@@ -1,0 +1,22 @@
+# MODE: host. Used on macOS by default (Docker cannot reach the Mac GPU, native Ollama can).
+# No Ollama container: a tiny bridge forwards ONE TCP port (11434) from the internal agent network to the
+# Ollama installed and running on this computer. Nothing else on the host is reachable through it.
+# On Linux the host Ollama must listen beyond 127.0.0.1 for this to work (see platforms/linux/README.md).
+services:
+  ollama-host-bridge:
+    image: alpine/socat:latest
+    restart: "no"
+    command: ["TCP-LISTEN:11434,fork,reuseaddr", "TCP:host.docker.internal:11434"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      llm:
+        aliases: [llm-backend]
+      hostnet: {}               # a normal network, only so the bridge can reach host.docker.internal
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+
+networks:
+  hostnet: {}

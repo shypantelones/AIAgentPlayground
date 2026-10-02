@@ -1,0 +1,21 @@
+# Overlay added ONLY when an agent is in cloud mode. The relay holds the API key; the agent never does.
+# RELAY_KEY is supplied by the control panel through the process environment (not stored in any file).
+services:
+  cloud-relay:
+    image: nginxinc/nginx-unprivileged:alpine
+    restart: "no"
+    environment:
+      RELAY_KEY: ${RELAY_KEY}
+    volumes:
+      - ${INSTANCE_DIR}/relay/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    networks:
+      internal:
+        aliases: [cloud-relay]
+      egress: {}
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    pids_limit: 64
+
+  gateway:
+    depends_on: [cloud-relay]

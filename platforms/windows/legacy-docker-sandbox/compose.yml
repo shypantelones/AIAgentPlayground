@@ -1,0 +1,105 @@
+# OpenClaw sandbox: hardened container + egress allowlist proxy.
+#
+#   host 127.0.0.1:18789 -> ui-forward (socat) -> gateway   [internal network, NO internet]
+#   gateway -> egress-proxy (squid, domain allowlist) -> internet
+#
+# The gateway has no route to the internet except through the proxy, and the proxy
+# only lets through domains listed in proxy/allowlist.txt.
+
+name: openclaw-sandbox
+
+services:
+  gateway:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789", "--allow-unconfigured"]
+    user: "node"
+    init: true
+    restart: "no"
+    env_file: .env
+    environment:
+      HOME: /home/node
+      OLLAMA_API_KEY: ollama-local   # placeholder; local Ollama ignores it
+      # Route outbound traffic through the allowlist proxy (Node 24+ honours these)
+      NODE_USE_ENV_PROXY: "1"
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      NO_PROXY: localhost,127.0.0.1,egress-proxy,ollama
+    networks: [internal]
+    # --- hardening ---
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+      - /home/node/.cache:rw,noexec,nosuid,size=128m,uid=1000,gid=1000
+    volumes:
+      # Only these two mounts touch disk. No docker.sock, no host home, no host drives.
+      - openclaw-state:/home/node/.openclaw
+      - openclaw-workspace:/home/node/.openclaw/workspace
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on: [egress-proxy]
+
+  # Local model server on the isolated network: no internet, no published ports.
+  # Models are loaded once with scripts\pull-model.ps1 (a separate one-off container).
+  ollama:
+    image: ollama/ollama:latest
+    restart: "no"
+    networks: [internal]
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "32768"   # agents need a large context window
+      OLLAMA_KEEP_ALIVE: "30m"
+    volumes:
+      - ollama-models:/root/.ollama
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 24g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  egress-proxy:
+    image: ubuntu/squid:latest
+    restart: "no"
+    networks: [internal, egress]
+    volumes:
+      - ./proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./proxy/allowlist.txt:/etc/squid/allowlist.txt:ro
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+
+  # Publishes the dashboard to the host loopback only. (Docker can't publish ports
+  # from an `internal: true` network directly, so this tiny relay bridges it.)
+  ui-forward:
+    image: alpine/socat:latest
+    command: ["TCP-LISTEN:18789,fork,reuseaddr", "TCP:gateway:18789"]
+    ports:
+      - "127.0.0.1:18789:18789"
+    networks: [internal, egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    depends_on: [gateway]
+
+networks:
+  internal:
+    internal: true # no external connectivity
+  egress: {}
+
+volumes:
+  openclaw-state:
+  openclaw-workspace:
+  ollama-models:

@@ -1,0 +1,2 @@
+# Generated from the Network tab. IPv4 addresses, ranges (a-b) and CIDR blocks.
+192.0.2.255

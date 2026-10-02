@@ -1,0 +1,5 @@
+# One domain per line. Leading dot = domain + all subdomains.
+# Start minimal: only your LLM provider. Add more deliberately (watch the proxy log to see what it tried).
+.anthropic.com
+# .openai.com
+# .telegram.org

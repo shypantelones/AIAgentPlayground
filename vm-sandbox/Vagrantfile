@@ -1,0 +1,43 @@
+# NOTE: uses an x86-64 Ubuntu box under VirtualBox: Windows, Linux and Intel Macs only.
+# Apple Silicon Macs need a different VM tool. Untested on every OS.
+# Tier 2: full VM isolation (own kernel). Needs VirtualBox + Vagrant on the host.
+# Windows 11 Home has no Hyper-V, so VirtualBox is the practical choice.
+#
+#   vagrant up          # build VM and install OpenClaw
+#   vagrant ssh         # get a shell inside it
+#   vagrant destroy -f  # throw the whole machine away
+#
+# Isolation choices: NAT only (no bridged LAN access), no synced folders, no clipboard/drag-drop.
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.hostname = "openclaw-lab"
+
+  config.vm.synced_folder ".", "/vagrant", disabled: true   # nothing from the host is shared
+
+  # Dashboard reachable from host loopback only
+  config.vm.network "forwarded_port", guest: 18789, host: 18789, host_ip: "127.0.0.1"
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.name = "openclaw-lab"
+    vb.memory = 4096
+    vb.cpus = 2
+    vb.gui = false
+    vb.customize ["modifyvm", :id, "--clipboard-mode", "disabled"]
+    vb.customize ["modifyvm", :id, "--draganddrop", "disabled"]
+    vb.customize ["modifyvm", :id, "--audio-enabled", "off"]
+    vb.check_guest_additions = false
+  end
+
+  config.vm.provision "shell", inline: <<-SHELL
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y && apt-get install -y curl ca-certificates git
+    # Node 24 + OpenClaw (check https://docs.openclaw.ai for the current install command)
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+    apt-get install -y nodejs
+    sudo -u vagrant npm config set prefix /home/vagrant/.npm-global
+    sudo -u vagrant npm install -g openclaw@latest
+    echo 'export PATH=$HOME/.npm-global/bin:$PATH' >> /home/vagrant/.profile
+  SHELL
+end

@@ -1,0 +1,56 @@
+# Runs the control-panel test suite on every pull request and on pushes to main.
+# The tests are stdlib-only (unittest) and mock Docker/Vagrant/SSH, so no services are needed.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 3.9 = stock macOS python3 (oldest we see in practice), 3.11 = what the project is developed on, 3.13 = newest
+        python: ["3.9", "3.11", "3.13"]
+    defaults:
+      run:
+        working-directory: control-panel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Byte-compile (catches syntax this Python version can't parse)
+        run: python -m compileall -q app.py platform_support.py vm_runner.py model_info.py tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  launcher-smoke:
+    name: launcher smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Start each launcher and check the panel answers
+        run: bash control-panel/tests/launcher_smoke.sh

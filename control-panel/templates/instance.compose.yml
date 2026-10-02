@@ -1,0 +1,88 @@
+# One isolated OpenClaw agent. Run with: -p openclaw-i-<name> --env-file <instance>/.env
+# Needs env: HOST_PORT, OPENCLAW_GATEWAY_TOKEN, OPENCLAW_IMAGE, INSTANCE_DIR
+
+services:
+  gateway:
+    image: ${OPENCLAW_IMAGE}
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789", "--allow-unconfigured"]
+    user: "node"
+    init: true
+    restart: "no"
+    environment:
+      HOME: /home/node
+      OLLAMA_API_KEY: ollama-local   # placeholder; local Ollama ignores it
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      NODE_USE_ENV_PROXY: "1"
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      NO_PROXY: localhost,127.0.0.1,egress-proxy,ollama,ollama.internal,cloud-relay
+    networks: [internal]          # no internet, no other agents
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+      - /home/node/.cache:rw,noexec,nosuid,size=128m,uid=1000,gid=1000
+    volumes:
+      - state:/home/node/.openclaw
+      - workspace:/home/node/.openclaw/workspace
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on: [egress-proxy, llm-relay]
+
+  egress-proxy:
+    image: ubuntu/squid:latest
+    restart: "no"
+    networks: [internal, egress]
+    volumes:
+      - ${INSTANCE_DIR}/proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ${INSTANCE_DIR}/proxy/allowlist.txt:/etc/squid/allowlist.txt:ro
+      - ${INSTANCE_DIR}/proxy/allowlist-ips.txt:/etc/squid/allowlist-ips.txt:ro
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+
+  # The only bridge to the shared model server. Forwards one TCP port and nothing else.
+  llm-relay:
+    image: alpine/socat:latest
+    command: ["TCP-LISTEN:11434,fork,reuseaddr", "TCP:llm-backend:11434"]
+    networks:
+      internal:
+        # ollama.internal: a host-mode Ollama (macOS) answers 403 to a bare "ollama" Host header (DNS-rebinding guard)
+        aliases: [ollama, ollama.internal]
+      llm: {}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+
+  ui-forward:
+    image: alpine/socat:latest
+    command: ["TCP-LISTEN:18789,fork,reuseaddr", "TCP:gateway:18789"]
+    ports:
+      - "127.0.0.1:${HOST_PORT}:18789"
+    networks: [internal, egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    depends_on: [gateway]
+
+networks:
+  internal:
+    internal: true
+  egress: {}
+  llm:
+    name: openclaw-llm
+    external: true
+
+volumes:
+  state:
+  workspace:

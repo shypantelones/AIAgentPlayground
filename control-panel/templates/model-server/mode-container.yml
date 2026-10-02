@@ -1,0 +1,21 @@
+# MODE: container (CPU). Ollama runs in a container. Used on Linux/Windows without an NVIDIA GPU runtime.
+# Add mode-nvidia.yml on top of this for GPU.
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: "no"
+    networks:
+      llm:
+        aliases: [llm-backend]
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      OLLAMA_KEEP_ALIVE: "30m"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      # 1 keeps a 14B model fully in a 16 GB card; each extra parallel slot adds a full context of memory.
+      # Raise it (set OLLAMA_NUM_PARALLEL=2 before starting the panel) if you have VRAM to spare.
+      OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-1}"
+    volumes:
+      - ollama-models:/root/.ollama
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 24g

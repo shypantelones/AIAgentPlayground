@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenClaw Control Panel</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>OpenClaw <span>Control Panel</span></h1>
+  <div id="shared"></div>
+</header>
+<div id="banner" hidden></div>
+<div class="layout">
+  <aside>
+    <h2>Agents</h2>
+    <ul id="agents"></ul>
+    <form id="newForm">
+      <input id="newName" placeholder="new-agent-name" maxlength="20" autocomplete="off">
+      <button class="primary">Create</button>
+    </form>
+    <p class="hint">Each agent gets its own containers, network, storage, allowlist and port. Tick agents to open their windows side by side.</p>
+  </aside>
+  <main id="panes"><p class="empty">Create an agent, then tick it in the sidebar to open its window.</p></main>
+</div>
+<div id="jobs"></div>
+<script src="/static/app.js"></script>
+<script src="/static/models.js"></script>
+<script src="/static/peers.js"></script>
+<script src="/static/vmbench.js"></script>
+</body>
+</html>

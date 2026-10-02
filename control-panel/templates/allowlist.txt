@@ -1,0 +1,3 @@
+# Default-deny: nothing is reachable except what you add here (one domain per line, leading dot = subdomains too).
+# Local Ollama needs no internet, so a fresh agent starts fully offline.
+.invalid

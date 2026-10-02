@@ -1,0 +1,11 @@
+# MODE: nvidia. Overlay on mode-container.yml that gives the Ollama container the NVIDIA GPU.
+# Windows: Docker Desktop with WSL2 and a recent NVIDIA driver. Linux: NVIDIA Container Toolkit.
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

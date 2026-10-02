@@ -1,0 +1,26 @@
+# A standalone, per-run, on-demand web terminal into ONE benchmark VM's SSH port. Not part of any agent's project;
+# started only when the user clicks "Open terminal" for that run, stopped when they close it. Its own destination
+# (host:VM_SSH_PORT) is fixed in its command line, so whoever is typing in the browser can run commands inside the
+# VM, but can never redirect this container anywhere else - same safety argument as the other narrow relays.
+# Loopback-only published port; HTTP basic-auth token is generated fresh per session and never logged.
+name: ${TERM_PROJECT}
+
+services:
+  terminal:
+    image: tsl0922/ttyd:latest
+    restart: "no"
+    command: ["ttyd", "-p", "7681", "-W", "-c", "${TERM_CRED}",
+              "ssh", "-i", "/keys/id_ed25519", "-p", "${VM_SSH_PORT}",
+              "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+              "bench@vm-host"]
+    extra_hosts:
+      - "vm-host:host-gateway"
+    volumes:
+      - ${KEY_PATH}:/keys/id_ed25519:ro
+    ports:
+      - "127.0.0.1:${TERM_PORT}:7681"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    pids_limit: 32

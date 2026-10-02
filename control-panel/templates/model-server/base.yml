@@ -1,0 +1,15 @@
+# Shared pieces of the local model server, common to every OS and mode.
+# The control panel combines this file with exactly one mode file (see mode-*.yml).
+# Whatever the mode, agents reach the model only as llm-backend:11434 on the internal openclaw-llm network,
+# and only through their own relay container.
+name: openclaw-shared
+
+networks:
+  llm:
+    name: openclaw-llm
+    internal: true            # no internet for the model server
+
+volumes:
+  ollama-models:
+    name: openclaw-sandbox_ollama-models
+    external: true            # created by the panel on first start; holds the downloaded models

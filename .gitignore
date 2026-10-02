@@ -1,0 +1,15 @@
+# Runtime data: agent settings, dashboard tokens, chats, key markers, VM run keys (see README "Rules of thumb")
+control-panel/data/
+.env
+
+# Logs (panel logs, model download logs - they can contain local usernames and paths)
+*.log
+control-panel/panel.err
+
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+Thumbs.db
