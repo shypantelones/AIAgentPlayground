@@ -1,4 +1,4 @@
-# OpenClaw Control Panel
+# AI Agent Control Panel
 
 Local web UI to create, control and chat with multiple isolated OpenClaw agents. The same code runs on Windows, macOS
 and Linux. **Start it from your OS's folder in [`../platforms/`](../platforms/README.md)**, which has the launcher,

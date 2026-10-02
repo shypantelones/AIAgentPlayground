@@ -1,4 +1,4 @@
-# Windows launcher for the OpenClaw control panel.
+# Windows launcher for the AI Agent control panel.
 #   .\run.ps1                 start the panel and open http://127.0.0.1:8765
 #   .\run.ps1 -NoBrowser      start without opening a browser
 # If PowerShell refuses to run scripts:  powershell -ExecutionPolicy Bypass -File .\run.ps1
