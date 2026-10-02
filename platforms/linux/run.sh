@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux launcher for the OpenClaw control panel.
+# Linux launcher for the AI Agent control panel.
 #   bash run.sh               start the panel and open http://127.0.0.1:8765 (if a desktop is available)
 #   OPENCLAW_NO_BROWSER=1 bash run.sh    start without opening a browser
 set -e

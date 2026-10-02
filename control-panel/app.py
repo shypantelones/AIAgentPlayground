@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenClaw control panel: local-only web UI for managing isolated OpenClaw agents.
+"""AI Agent control panel: local-only web UI for managing isolated OpenClaw agents.
 
 Runs on the HOST (never inside a sandbox). Binds to 127.0.0.1 only. Every action maps to a fixed,
 validated docker command; there is no free-form shell. Standard library only.
@@ -1589,7 +1589,7 @@ ALLOWED_HOSTS = {f"127.0.0.1:{PANEL_PORT}", f"localhost:{PANEL_PORT}"}
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpenClawPanel/1.0"
+    server_version = "AIAgentPanel/1.0"
 
     def log_message(self, *a):  # quiet
         pass
@@ -1875,7 +1875,7 @@ def main():
     load_sessions()
     load_vm_runs()
     srv = ThreadingHTTPServer(("127.0.0.1", PANEL_PORT), Handler)
-    print(f"OpenClaw control panel: http://127.0.0.1:{PANEL_PORT}  (Ctrl+C to stop)")
+    print(f"AI Agent control panel: http://127.0.0.1:{PANEL_PORT}  (Ctrl+C to stop)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
