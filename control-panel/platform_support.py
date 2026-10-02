@@ -125,8 +125,8 @@ def machine_info(path="."):
 # ---------------------------------------------------------------- secret store
 # Windows: DPAPI-encrypted file. macOS: Keychain. Linux: Secret Service (libsecret). Otherwise a 0600 file
 # (clearly NOT encrypted). In all cases the panel never returns a key to the browser or writes it to a log.
-SERVICE = "openclaw-panel"
-_ENTROPY = b"openclaw-control-panel/v1"
+SERVICE = "aiagentplayground-panel"
+_ENTROPY = b"aiagentplayground-control-panel/v1"
 
 
 def _dpapi(data, protect):
@@ -145,7 +145,7 @@ def _dpapi(data, protect):
     ent, k2 = mk(_ENTROPY)
     out = BLOB()
     fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
-    args = (ctypes.byref(inb), "openclaw-panel", ctypes.byref(ent), None, None, 0, ctypes.byref(out)) if protect else \
+    args = (ctypes.byref(inb), "aiagentplayground-panel", ctypes.byref(ent), None, None, 0, ctypes.byref(out)) if protect else \
            (ctypes.byref(inb), None, ctypes.byref(ent), None, None, 0, ctypes.byref(out))
     if not fn(*args):
         raise ctypes.WinError()

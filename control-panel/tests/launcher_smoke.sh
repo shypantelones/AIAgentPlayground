@@ -9,7 +9,7 @@ for os in linux macos; do
   port=$((8790 + RANDOM % 50))
   # PANEL_PORT is set in the environment on purpose: it must win over config.env (which says 8765)
   log="$(mktemp)"
-  PANEL_PORT=$port OPENCLAW_NO_BROWSER=1 bash "$ROOT/platforms/$os/run.sh" >"$log" 2>&1 &
+  PANEL_PORT=$port AIAGENTPLAYGROUND_NO_BROWSER=1 bash "$ROOT/platforms/$os/run.sh" >"$log" 2>&1 &
   pid=$!
   ok=""
   for i in 1 2 3 4 5 6 7 8 9 10; do

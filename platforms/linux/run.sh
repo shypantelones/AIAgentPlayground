@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Linux launcher for the AI Agent control panel.
 #   bash run.sh               start the panel and open http://127.0.0.1:8765 (if a desktop is available)
-#   OPENCLAW_NO_BROWSER=1 bash run.sh    start without opening a browser
+#   AIAGENTPLAYGROUND_NO_BROWSER=1 bash run.sh    start without opening a browser
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="$HERE/../../control-panel"
@@ -18,7 +18,7 @@ command -v docker  >/dev/null 2>&1 || echo "Warning: 'docker' not found. Install
 docker info >/dev/null 2>&1 || echo "Warning: cannot talk to Docker. Is the daemon running, and is your user in the 'docker' group?"
 
 URL="http://127.0.0.1:${PANEL_PORT:-8765}"
-if [ -z "$OPENCLAW_NO_BROWSER" ] && command -v xdg-open >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+if [ -z "$AIAGENTPLAYGROUND_NO_BROWSER" ] && command -v xdg-open >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
   ( sleep 1.5; xdg-open "$URL" >/dev/null 2>&1 ) &
 fi
 cd "$APP"

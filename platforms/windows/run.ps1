@@ -23,6 +23,6 @@ if (-not $py) { throw "Python 3 not found. Install it from https://www.python.or
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Write-Warning "docker not found on PATH. Install and start Docker Desktop." }
 
 $port = if ($env:PANEL_PORT) { $env:PANEL_PORT } else { '8765' }
-if (-not $NoBrowser -and -not $env:OPENCLAW_NO_BROWSER) { Start-Process "http://127.0.0.1:$port" }
+if (-not $NoBrowser -and -not $env:AIAGENTPLAYGROUND_NO_BROWSER) { Start-Process "http://127.0.0.1:$port" }
 Set-Location $app
 & $py.Source app.py

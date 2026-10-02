@@ -42,7 +42,7 @@ prefer small models.
   them, SELinux labelling is the likely cause. Not tested.
 - **Rootless Docker / Podman:** not tested.
 - **Agent workspaces are Docker volumes**, not folders. To copy files out:
-  `docker cp openclaw-i-<name>-gateway-1:/home/node/.openclaw/workspace .`
+  `docker cp aiagentplayground-i-<name>-gateway-1:/home/node/.openclaw/workspace .`
 - **VM tier (`vm-sandbox`):** VirtualBox + Vagrant on x86 (untested).
 
 ## Troubleshooting

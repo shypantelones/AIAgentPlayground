@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # macOS launcher for the AI Agent control panel.
 #   bash run.sh               start the panel and open http://127.0.0.1:8765
-#   OPENCLAW_NO_BROWSER=1 bash run.sh    start without opening a browser
+#   AIAGENTPLAYGROUND_NO_BROWSER=1 bash run.sh    start without opening a browser
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="$HERE/../../control-panel"
@@ -23,6 +23,6 @@ if [ "${OLLAMA_MODE:-host}" = "host" ] && ! curl -fsS --max-time 2 http://127.0.
 fi
 
 URL="http://127.0.0.1:${PANEL_PORT:-8765}"
-if [ -z "$OPENCLAW_NO_BROWSER" ]; then ( sleep 1.5; open "$URL" ) & fi
+if [ -z "$AIAGENTPLAYGROUND_NO_BROWSER" ]; then ( sleep 1.5; open "$URL" ) & fi
 cd "$APP"
 exec python3 app.py

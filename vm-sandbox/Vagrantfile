@@ -11,7 +11,7 @@
 
 Vagrant.configure("2") do |config|
   config.vm.box = "ubuntu/jammy64"
-  config.vm.hostname = "openclaw-lab"
+  config.vm.hostname = "aiagentplayground-lab"
 
   config.vm.synced_folder ".", "/vagrant", disabled: true   # nothing from the host is shared
 
@@ -19,7 +19,7 @@ Vagrant.configure("2") do |config|
   config.vm.network "forwarded_port", guest: 18789, host: 18789, host_ip: "127.0.0.1"
 
   config.vm.provider "virtualbox" do |vb|
-    vb.name = "openclaw-lab"
+    vb.name = "aiagentplayground-lab"
     vb.memory = 4096
     vb.cpus = 2
     vb.gui = false
