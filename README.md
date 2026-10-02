@@ -1,4 +1,4 @@
-# OpenClaw Playground
+# AI Agent Playground
 
 Run OpenClaw in isolated environments so it only gets the access you give it. Works on Windows, macOS and Linux.
 
@@ -6,24 +6,31 @@ Run OpenClaw in isolated environments so it only gets the access you give it. Wo
 | OS | Setup guide | Start the control panel | Status |
 |---|---|---|---|
 | **Windows** | [platforms/windows](platforms/windows/README.md) | `platforms\windows\run.ps1` | tested |
-| **macOS** | [platforms/macos](platforms/macos/README.md) | `bash platforms/macos/run.sh` | not tested on a Mac |
+| **macOS** | [platforms/macos](platforms/macos/README.md) | `bash platforms/macos/run.sh` | tested |
 | **Linux** | [platforms/linux](platforms/linux/README.md) | `bash platforms/linux/run.sh` | partly tested |
 
 Each opens http://127.0.0.1:8765. The OS comparison table is in [platforms/README.md](platforms/README.md).
 
-## Let Claude help: the `openclaw-playground` skill
-`.claude/skills/openclaw-playground/` is a Claude skill that walks you (or anyone) through installing, running, monitoring and
+## Let Claude help: the `aiagentplayground` skill
+`.claude/skills/aiagentplayground/` is a Claude skill that walks you (or anyone) through installing, running, monitoring and
 troubleshooting this project, and knows where everything is stored. Open this folder in Claude Code and just ask
 ("set this up", "is it running?", "where are my models stored?"). It includes a health check you can also run yourself:
 
 ```
-python .claude/skills/openclaw-playground/scripts/doctor.py        # add --sizes / --blocked / --json
+python .claude/skills/aiagentplayground/scripts/doctor.py        # add --sizes / --blocked / --json
 ```
-`dist/openclaw-playground.skill` is the same skill as a single file for installing in Claude.ai or sharing.
+`dist/aiagentplayground.skill` is the same skill as a single file for installing in Claude.ai or sharing.
+
+## VM Labs
+The control panel also has **VM Labs**: real, throwaway VMs (Vagrant/VirtualBox) for two kinds of exercises —
+single-VM coding benchmarks, and multi-VM network-topology labs (routers, switches, hosts, load balancers,
+firewalls, wired together and left unconfigured so an agent or a person has to actually do the networking). See
+[control-panel/README.md](control-panel/README.md#vm-labs) for the full writeup, including the built-in topology
+templates, the custom-topology builder, and how to add your own template.
 
 ## Layout
 ```
-openclaw-playground/
+aiagentplayground/
 ├── README.md                    this file
 ├── control-panel/               the app: identical on every OS (web UI, compose templates, tests)
 │   ├── app.py
@@ -35,13 +42,14 @@ openclaw-playground/
 │   ├── windows/   run.ps1  config.env  README.md  legacy-docker-sandbox/
 │   ├── macos/     run.sh   config.env  README.md
 │   └── linux/     run.sh   config.env  README.md
-└── vm-sandbox/                  optional stronger isolation: a VirtualBox VM via Vagrant (x86 only)
+├── vm-sandbox/                  optional stronger isolation: a VirtualBox VM via Vagrant (x86 only)
+└── resources/                   what VM images VM Labs uses and why they aren't vendored in the repo
 ```
 
 ## Where things live
 - Per-agent settings, proxy allowlists and chat history: `control-panel/data/instances/<name>/`.
 - API keys: your OS secret store (Windows DPAPI / macOS Keychain / Linux keyring), with a marker file in `control-panel/data/secrets/`.
-- Agent memory/workspaces and the downloaded model: Docker volumes (`openclaw-i-<name>_state`, `openclaw-sandbox_ollama-models`).
+- Agent memory/workspaces and the downloaded model: Docker volumes (`aiagentplayground-i-<name>_state`, `openclaw-sandbox_ollama-models`).
 
 ## Rules of thumb
 1. Use throwaway, spend-capped API keys; set a spend limit with your provider.

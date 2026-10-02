@@ -26,9 +26,9 @@ developed and tested on 3.11). Running `python app.py` here directly also works;
 | `data/` | created at runtime: per-agent settings, allowlists, chats, key markers, peer links and conversation records (do not share; see below) |
 
 ## How isolation works
-- Every agent is its own Docker Compose project `openclaw-i-<name>`: own gateway, state volume, workspace volume, private
+- Every agent is its own Docker Compose project `aiagentplayground-i-<name>`: own gateway, state volume, workspace volume, private
   no-internet network, egress allowlist proxy and dashboard port (18801+).
-- One shared Ollama (`openclaw-shared`) serves all agents. It has no internet. Each agent reaches it through its own
+- One shared Ollama (`aiagentplayground-shared`) serves all agents. It has no internet. Each agent reaches it through its own
   one-port relay container, so agents are never on a common network and cannot see each other.
 - New agents start with an EMPTY allowlist (fully offline). Add domains, IPv4 addresses, ranges or CIDR blocks in the
   Network tab.
@@ -83,6 +83,32 @@ Each agent has a Model tab: Local (Ollama) or Cloud (Anthropic, OpenAI, or an Op
 - Limits: the secret store protects against other users/machines, not other programs running as you. Anyone who can run
   `docker inspect` on the relay container (i.e. you) can see its key. A compromised agent can still spend through the
   relay while it is running, up to the rate limit.
+
+## VM Labs
+A header button, separate from the agent containers above: real, throwaway Vagrant/VirtualBox VMs for two kinds
+of exercise. Needs Vagrant + VirtualBox installed (see [`../resources/README.md`](../resources/README.md) for
+which VM image is used and why it isn't vendored in this repo).
+
+**Code-creation benchmarks**: one VM, one task (`vm_tasks.json`: write a script, fix a failing test, build a tiny
+API) with a pass/fail check script. Attach a running agent to attempt it, or open a web terminal and do it
+yourself; either way, **Score now** runs the check and reports PASS/FAIL.
+
+**Network topologies**: a small *group* of VMs wired together with virtual cabling, for networking tasks instead
+of coding ones. Every role (`host`, `router`, `switch`, `loadbalancer`, `firewall`) boots the same VM image -
+behavior comes entirely from what's installed and left unconfigured, so the task is genuinely configuring a
+switch (a real Linux bridge, not a simulated device), a firewall (`nftables`, nothing pre-applied), a router
+(IP forwarding off by default) or a load balancer (`nginx`, no backend pool wired up) yourself.
+- **Six built-in templates**: `s1h2`, `r1s1h2`, `r1s2h2`, `r2s2h2` (routing, increasing in difficulty), `lb1s1h3`
+  (load balancing) and `fw1s2h2` (a default-drop firewall), each with one scored task.
+- **Build your own** via role counts + a wiring pattern (star off one switch, a chain of subnets, or a manual
+  link list) instead of picking a template - no file changes, runs through the exact same validated pipeline.
+- **Free-form prompts**: write your own instructions for the agent instead of picking a canned task, on a
+  built-in or custom topology. There is deliberately no automated score for these - judge it yourself via a
+  per-node terminal, the same way a template with no task attached works.
+- **Add a permanent, scored template**: the `.claude/skills/vm-lab-template-author/` skill walks through adding
+  a real catalog entry (with a real check script) that then shows up in the dropdown like a built-in one.
+- Every node gets its own web terminal (same on-demand, credentialed-per-session pattern as the single-VM
+  benchmarks); the live build-out (which VM, which phase) streams into the run's transcript as it happens.
 
 ## Data
 `data/instances/<name>/` holds each agent's `.env` (dashboard token), proxy allowlist and chat history.
