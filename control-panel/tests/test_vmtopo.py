@@ -404,6 +404,18 @@ class PerNodeTerminalTests(VmTopoBase):
         self.assertFalse(app.TOPO_RUNS[rid]["nodes"]["h1"]["terminal"]["active"])
         self.assertTrue(app.TOPO_RUNS[rid]["nodes"]["h2"]["terminal"]["active"], "stopping h1's terminal must not touch h2's")
 
+    def test_running_terminal_whose_credential_was_lost_gets_a_fresh_one(self):
+        rid = app.create_topo_run({"topology_id": "s1h2"})
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))
+        (app.topo_run_dir(rid) / "id_ed25519").write_text("k")
+        app.start_topo_terminal(rid, "h1")
+        app.TOPO_TERM_CREDS.clear()                             # what a panel restart leaves behind
+        with mock.patch.object(app, "stop_topo_terminal", wraps=app.stop_topo_terminal) as stop:
+            _, cred = app.start_topo_terminal(rid, "h1")
+        stop.assert_called_once_with(rid, "h1", quiet=True)
+        self.assertEqual(len(cred), 32)
+        self.assertEqual(app.TOPO_TERM_CREDS[f"{rid}:h1"], cred)
+
     def test_credential_is_never_persisted_to_disk(self):
         rid = app.create_topo_run({"topology_id": "s1h2"})
         self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))

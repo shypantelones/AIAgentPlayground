@@ -172,7 +172,7 @@ async function loadVTDetail() {
     h("button", { disabled: !canTerminal, onclick: async () => {
       try {
         const t = await api(`/api/vmtopo/runs/${r.id}/nodes/${name}/terminal-start`, {});
-        window.open(`http://bench:${t.cred}@127.0.0.1:${t.port}/`, "_blank");
+        showTerminalLogin(`Node ${name} in lab ${r.id}`, t);
         vtSig.detail = ""; vtLoad();
       } catch (e) { alert(e.message); }
     } }, n.terminal.active ? "Open terminal (running)" : "Open terminal")));

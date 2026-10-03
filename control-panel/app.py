@@ -1118,7 +1118,11 @@ def start_terminal(rid):
     if r["state"] not in ("ready", "working", "scoring", "done"):
         raise ValueError("the VM isn't up yet")
     if r.get("terminal", {}).get("active"):
-        return r["terminal"]["port"], VM_TERM_CREDS.get(rid, "")
+        if rid in VM_TERM_CREDS:
+            return r["terminal"]["port"], VM_TERM_CREDS[rid]
+        # Still running from before a panel restart: its credential only ever lived in memory and is gone, so the
+        # user could never log in. Replace it with a fresh terminal (and credential) instead of handing back "".
+        stop_terminal(rid, quiet=True)
     d = vm_run_dir(rid)
     priv = d / "id_ed25519"
     if not priv.exists():
@@ -1545,7 +1549,9 @@ def start_topo_terminal(rid, node):
         raise ValueError("the lab isn't up yet")
     n = r["nodes"][node]
     if n.get("terminal", {}).get("active"):
-        return n["terminal"]["port"], TOPO_TERM_CREDS.get(f"{rid}:{node}", "")
+        if f"{rid}:{node}" in TOPO_TERM_CREDS:
+            return n["terminal"]["port"], TOPO_TERM_CREDS[f"{rid}:{node}"]
+        stop_topo_terminal(rid, node, quiet=True)      # credential lost in a panel restart; see start_terminal
     d = topo_run_dir(rid)
     priv = d / "id_ed25519"
     if not priv.exists():

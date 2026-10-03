@@ -7,6 +7,33 @@ document.body.append(vbDlg);
 const vbBtn = h("button", { id: "vbBtn", title: "Run code-creation tasks in isolated, throwaway Linux VMs", onclick: () => openVB() }, "VM Labs");
 $("header").append(vbBtn);
 
+/* Web terminal login, shared with vmtopo.js. The browser asks for it when the terminal page opens. It used to be put
+   in the URL (http://bench:token@...), which Chrome and Edge ignore, leaving a prompt nobody could answer - so it is
+   shown here to copy instead. It is fresh for every terminal session and never stored anywhere. */
+const termDlg = h("dialog", { class: "dlg" });
+document.body.append(termDlg);
+function showTerminalLogin(what, t) {
+  const url = `http://127.0.0.1:${t.port}/`;
+  const user = h("input", { value: "bench", readonly: true, spellcheck: "false" });
+  const pw = h("input", { type: "password", value: t.cred, readonly: true, spellcheck: "false", autocomplete: "off" });
+  const copyBtn = (field, text) => {
+    const b = h("button", { onclick: async () => {
+      try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; setTimeout(() => { b.textContent = "Copy"; }, 1500); }
+      catch { field.type = "text"; field.select(); }        // no clipboard access: select it for Ctrl+C instead
+    } }, "Copy");
+    return b;
+  };
+  const show = h("button", { onclick: () => { pw.type = pw.type === "password" ? "text" : "password"; show.textContent = pw.type === "password" ? "Show" : "Hide"; } }, "Show");
+  termDlg.onclose = () => { pw.value = ""; };                  // don't leave the credential sitting in the DOM
+  termDlg.replaceChildren(h("h3", {}, "Terminal login"),
+    h("p", { class: "hint" }, `${what}. Your browser asks for this login when the terminal opens. It is new for every terminal session and never saved.`),
+    h("div", { class: "row" }, "Username", user, copyBtn(user, "bench")),
+    h("div", { class: "row" }, "Password", pw, show, copyBtn(pw, t.cred)),
+    h("div", { class: "row" }, h("button", { class: "primary", onclick: () => window.open(url, "_blank", "noopener") }, "Open terminal"),
+      h("button", { onclick: () => termDlg.close() }, "Close")));
+  termDlg.showModal();
+}
+
 let vbData = { tasks: [], settings: {}, runs: [] }, vbSelRun = null, vbTimer = null;
 let VB = null;
 const vbSig = {};
@@ -145,7 +172,7 @@ async function loadVBDetail() {
   const termBtn = h("button", { disabled: !canTerminal, onclick: async () => {
     try {
       const t = await api(`/api/vmbench/runs/${r.id}/terminal-start`, {});
-      window.open(`http://bench:${t.cred}@127.0.0.1:${t.port}/`, "_blank");
+      showTerminalLogin(`VM for run ${r.id}`, t);
       vbSig.detail = ""; loadVB();
     } catch (e) { alert(e.message); }
   } }, r.terminal_active ? "Open terminal (running)" : "Open terminal");
