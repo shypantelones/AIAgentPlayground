@@ -324,6 +324,12 @@ class FrrTests(unittest.TestCase):
         self.assertIn("Full", task["check"])
         self.assertIn("proto ospf", task["check"])
 
+    def test_ospf_task_stays_clear_of_the_setup_network(self):
+        # regression: its first addressing plan put a LAN on 10.0.2.0/24, the VirtualBox NAT subnet on every node's
+        # setup NIC, so r1 preferred that connected route over the OSPF-learned one and the lab could never pass
+        task = vr.get_topology_task("r2s2h2-ospf")
+        self.assertNotIn("10.0.2.", task["prompt"] + task["check"])
+
 
 class PortCollisionParseTests(unittest.TestCase):
     def test_parses_vagrants_message(self):

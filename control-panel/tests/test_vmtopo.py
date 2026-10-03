@@ -954,6 +954,9 @@ class RouterPromptTests(VmTopoBase):
     def test_labs_with_routers_tell_the_agent_about_frr(self):
         self.assertIn("vtysh", self.prompt_for("r2s2h2"))
 
+    def test_every_lab_prompt_warns_about_the_setup_network(self):
+        self.assertIn("10.0.2.0/24", self.prompt_for("s1h2"))
+
     def test_labs_without_routers_do_not(self):
         self.assertNotIn("vtysh", self.prompt_for("s1h2"))
 
