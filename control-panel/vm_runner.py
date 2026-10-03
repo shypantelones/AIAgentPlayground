@@ -293,10 +293,16 @@ true
 """
 
 
+# Countdowns the kernel prints and decrements on its own, e.g. on IPv6 routes learned from router advertisements on
+# the setup NIC ("... proto ra metric 100 expires 86197sec"). Left in, every node would show a change in every diff.
+SNAPSHOT_VOLATILE = re.compile(r" expires \d+sec")
+
+
 def parse_snapshot(text):
-    """SNAPSHOT_SCRIPT output -> {section: text}. Anything before the first section header is ignored."""
+    """SNAPSHOT_SCRIPT output -> {section: text}. Anything before the first section header is ignored; volatile
+    countdowns (SNAPSHOT_VOLATILE) are removed so two snapshots of an unchanged node are identical."""
     sections, name, lines = {}, None, []
-    for line in text.splitlines():
+    for line in (SNAPSHOT_VOLATILE.sub("", l) for l in text.splitlines()):
         if line.startswith(SNAPSHOT_SECTION):
             if name is not None:
                 sections[name] = "\n".join(lines).strip() + "\n"
