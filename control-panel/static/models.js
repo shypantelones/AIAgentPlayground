@@ -5,19 +5,21 @@
 const GB = n => n == null ? "?" : (n >= 10 ? String(Math.round(n)) : n.toFixed(1));
 const FIT_ICON = { gpu: "✓", partial: "∼", cpu: "∼", tight: "∼", toobig: "✗", unknown: "?" };
 
-function modelOptionLabel(e, current) {
+function modelOptionLabel(e, current, recommended) {
   const need = e.need_gb == null ? "memory ?" : `needs ${e.exact ? "" : "≈"}${GB(e.need_gb)} GB ${e.memory_kind}`;
   const tail = !e.disk_ok ? "not enough disk" : e.embedding_only ? "embedding model (not for chat)" : `${FIT_ICON[e.fit]} ${e.label}`;
   const warn = e.openclaw_tool_calling === "verified_broken" ? "  ⚠ tool calling tested broken"
              : e.openclaw_tool_calling === "verified_working" ? "  ✓ tool calling verified" : "";
-  return `${e.name}${e.name === current ? " (in use)" : ""}  ·  ${GB(e.size_gb)} GB disk  ·  ${need}  ·  ${tail}${warn}`;
+  return `${e.name}${e.name === current ? " (in use)" : ""}${e.name === recommended ? " ★ recommended" : ""}  ·  ${GB(e.size_gb)} GB disk  ·  ${need}  ·  ${tail}${warn}`;
 }
 
-async function buildLocalPicker(container, inst, name, msg) {
+/* `opts.choose`: picker for the new-agent dialog - starts on "Choose a model...", has no action button of its own, and
+   resolves to {value(), entry()} so the dialog can require a choice. Otherwise it's the Model tab's picker for agent `name`. */
+async function buildLocalPicker(container, inst, name, msg, opts = {}) {
   container.replaceChildren(h("p", { class: "hint" }, "Looking at this computer and the model server..."));
   let d;
   try { d = await api("/api/models"); }
-  catch (e) { container.replaceChildren(h("p", { class: "fail" }, e.message)); return; }
+  catch (e) { container.replaceChildren(h("p", { class: "fail" }, e.message)); return null; }
   const m = d.machine;
   const mem = m.unified_memory ? `${GB(m.ram_gb)} GB unified memory`
     : `${m.vram_gb ? `${m.gpu_name}, ${GB(m.vram_gb)} GB VRAM, ` : ""}${GB(m.ram_gb)} GB RAM`;
@@ -30,17 +32,19 @@ async function buildLocalPicker(container, inst, name, msg) {
   const all = [...d.installed, ...d.catalog];
   const sel = h("select", {});
   const group = (label, list) => list.length ? h("optgroup", { label },
-    ...list.map(e => h("option", { value: e.name, disabled: e.embedding_only || (!e.installed && !e.disk_ok) }, modelOptionLabel(e, current)))) : null;
+    ...list.map(e => h("option", { value: e.name, disabled: e.embedding_only || (!e.installed && !e.disk_ok) }, modelOptionLabel(e, current, d.recommended)))) : null;
+  if (opts.choose) sel.append(h("option", { value: "", disabled: true }, "Choose a model..."));
   sel.append(group("Downloaded on this computer", d.installed), group("Available to download", d.catalog));
-  const pick = all.find(e => e.name === current) ? current : (all.find(e => !e.embedding_only) || {}).name;
-  if (pick) sel.value = pick;
+  const pick = opts.choose ? "" : all.find(e => e.name === current) ? current : (all.find(e => !e.embedding_only) || {}).name;
+  if (pick != null) sel.value = pick;
 
   const detail = h("div", { class: "mdetail" });
   const act = h("button", { class: "primary" }, "Use this model");
   const others = () => state.instances.filter(i => i.name !== name && i.backend === "local" && i.model && i.model !== sel.value);
 
   function showDetail() {
-    const e = all.find(x => x.name === sel.value); if (!e) { detail.replaceChildren(); return; }
+    const e = all.find(x => x.name === sel.value);
+    if (!e) { detail.replaceChildren(d.recommended ? h("div", { class: "hint" }, `★ Recommended for this computer: ${d.recommended}`) : ""); return; }
     const lines = [];
     lines.push(h("div", {}, h("b", {}, e.name), e.params ? ` · ${e.params}` : "", e.quant ? ` · ${e.quant}` : "", e.family ? ` · ${e.family}` : ""));
     lines.push(h("div", {}, `Disk: ${GB(e.size_gb)} GB (${e.installed ? "already downloaded" : "to download"}) · Memory: ${e.need_gb == null ? "unknown" : (e.exact ? "" : "≈") + GB(e.need_gb) + " GB " + e.memory_kind} · `,
@@ -59,6 +63,7 @@ async function buildLocalPicker(container, inst, name, msg) {
     const o = others();
     if (o.length) lines.push(h("div", { class: "hint" }, `Other agents use a different local model (${o.map(i => `${i.name}: ${i.model}`).join(", ")}). The shared server holds one model at a time, so it will reload models when agents take turns, which adds a pause to each switch.`));
     detail.replaceChildren(...lines);
+    if (opts.choose) return;
     const inUse = e.name === current && inst.backend === "local";
     act.disabled = inUse || e.embedding_only || (!e.installed && !e.disk_ok) || !d.server_running && !e.installed;
     act.textContent = inUse ? "In use" : e.installed ? "Use this model" : `Download (${GB(e.size_gb)} GB) and use`;
@@ -79,6 +84,7 @@ async function buildLocalPicker(container, inst, name, msg) {
     } catch (err) { msg.className = "fail"; msg.textContent = err.message; }
   });
 
-  container.replaceChildren(summary, h("div", { class: "row" }, "Model", sel), detail, h("div", { class: "row" }, act));
+  container.replaceChildren(summary, h("div", { class: "row" }, "Model", sel), detail, opts.choose ? "" : h("div", { class: "row" }, act));
   showDetail();
+  return { value: () => sel.value, entry: () => all.find(x => x.name === sel.value), focus: () => sel.focus(), freeDisk: m.free_disk_gb };
 }

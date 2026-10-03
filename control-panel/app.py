@@ -325,23 +325,89 @@ def free_port():
     return p
 
 
-def default_local_model():
-    """Model for a new agent: OPENCLAW_MODEL if set, else the most capable model this machine runs without swapping
-    (downloaded ones first) whose OpenClaw tool calling isn't known to be broken. Falls back to DEFAULT_MODEL."""
+def default_local_model(ov=None):
+    """Model the panel RECOMMENDS for a new agent (the user still has to choose one): OPENCLAW_MODEL if set, else the
+    most capable model this machine runs without swapping (downloaded ones first) whose OpenClaw tool calling isn't
+    known to be broken. Within each group a model that fits the GPU entirely beats a bigger one that would spill to the
+    CPU. Falls back to DEFAULT_MODEL. `ov` is a models_overview() result, fetched if not given."""
     if os.environ.get("OPENCLAW_MODEL"):
         return DEFAULT_MODEL
-    try:
-        ov = models_overview()
-    except Exception:  # noqa
-        return DEFAULT_MODEL
-    def usable(m):
-        return (m.get("fit") in ("gpu", "partial", "cpu") and m.get("tools") is not False and not m.get("embedding_only")
+    if ov is None:
+        try:
+            ov = models_overview()
+        except Exception:  # noqa
+            return DEFAULT_MODEL
+    def usable(m, fits):
+        return (m.get("fit") in fits and m.get("tools") is not False and not m.get("embedding_only")
                 and m.get("openclaw_tool_calling") != "verified_broken")
     for group in (ov["installed"], ov["catalog"]):
-        fits = [m for m in group if usable(m)]
-        if fits:
-            return max(fits, key=lambda m: m.get("need_gb") or 0)["name"]
+        for tier in (("gpu",), ("partial", "cpu")):
+            fits = [m for m in group if usable(m, tier)]
+            if fits:
+                return max(fits, key=lambda m: m.get("need_gb") or 0)["name"]
     return DEFAULT_MODEL
+
+
+def pull_model(model, log):
+    """Download `model` onto the shared model server's volume (or into the host's Ollama in host mode)."""
+    if not MODEL_RE.match(model):
+        raise ValueError(f"bad model name: {model!r}")
+    if OLLAMA_MODE == "host":
+        log(f"asking the Ollama on this computer to download {model}...")
+        req = urllib.request.Request(HOST_OLLAMA + "/api/pull", method="POST",
+                                     data=json.dumps({"model": model, "stream": True}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        last = ""
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            for raw in r:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                if ev.get("error"):
+                    raise RuntimeError(ev["error"])
+                msg = ev.get("status", "")
+                if ev.get("total"):
+                    msg += f" {ev.get('completed', 0) / 1e9:.1f}/{ev['total'] / 1e9:.1f} GB"
+                if msg != last:
+                    log(msg)
+                    last = msg
+        return
+    run([DOCKER, "volume", "create", MODELS_VOLUME], timeout=30)
+    log(f"downloading {model} (needs internet, runs in a throwaway container)...")
+    p = subprocess.Popen(
+        [DOCKER, "run", "--rm", "-v", f"{MODELS_VOLUME}:/root/.ollama", "--entrypoint", "sh",
+         "ollama/ollama:latest", "-c", f"ollama serve >/dev/null 2>&1 & sleep 6; ollama pull {model}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+        errors="replace", creationflags=NOWIN)
+    last = ""
+    buf = ""
+    while True:
+        ch = p.stdout.read(1)
+        if not ch:
+            break
+        if ch in "\r\n":
+            clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", buf)
+            clean = re.sub(r"(pulling manifest\s*)+$", "", clean).strip()   # stray redraw text from the progress bar
+            if clean and clean != last and ("pulling" in clean or "success" in clean or "error" in clean.lower()):
+                log(clean)
+                last = clean
+            buf = ""
+        else:
+            buf += ch
+    if p.wait() != 0:
+        raise RuntimeError("model download failed")
+
+
+def ensure_local_model(model, log):
+    """Download `model` if the (running) model server doesn't have it, so a new agent never points at a missing model."""
+    have = ollama_list()
+    if have is None:
+        log(f"model server not reachable; could not check that {model} is downloaded.")
+        return
+    if model not in {n for n, _ in have}:
+        log(f"{model} is not downloaded yet; downloading it now (one time).")
+        pull_model(model, log)
 
 
 def ensure_image(log, image=None):
@@ -379,8 +445,9 @@ def ensure_llm_network(log):
 
 
 def create_agent(name, form=None):
-    """`form`: {"backend": "local"} (default; best-fit local model) or {"backend": "cloud", "provider", "model",
-    "rate", "upstream", "token"} - cloud is configured before anything is created, so no local model is needed."""
+    """`form`: {"backend": "local", "model"} (default backend; the user must choose the model, which is downloaded if
+    missing) or {"backend": "cloud", "provider", "model", "rate", "upstream", "token"} - cloud is configured before
+    anything is created, so no local model is needed."""
     form = form or {}
     if not NAME_RE.match(name):
         raise ValueError("name must be lowercase letters/digits/dashes, start with a letter, max 20 chars")
@@ -390,6 +457,13 @@ def create_agent(name, form=None):
     if backend not in ("local", "cloud"):
         raise ValueError("backend must be local or cloud")
     cloud = parse_cloud(form) if backend == "cloud" else None
+    model = None
+    if not cloud:
+        model = str(form.get("model", "")).strip()
+        if not model:
+            raise ValueError("choose a local model for this agent")
+        if not MODEL_RE.match(model):
+            raise ValueError("bad model name")
     if cloud:
         token = str(form.get("token", "")).strip()
         if not token:
@@ -401,7 +475,7 @@ def create_agent(name, form=None):
         (d / "proxy").mkdir(parents=True)
         meta = {"name": name, "port": free_port(), "token": secrets.token_hex(24),
                 "created": time.strftime("%Y-%m-%d %H:%M:%S")}
-        meta.update(dict(backend="cloud", **cloud) if cloud else dict(backend="local", model=default_local_model()))
+        meta.update(dict(backend="cloud", **cloud) if cloud else dict(backend="local", model=model))
         meta_path(name).write_text(json.dumps(meta, indent=2))
         write_env(name, meta)
         shutil.copy(TPL / "squid.conf", d / "proxy" / "squid.conf")
@@ -412,6 +486,7 @@ def create_agent(name, form=None):
             ensure_llm_network(log)
         else:
             ensure_shared(log)
+            ensure_local_model(model, log)
         ensure_image(log)
         what = f"{meta['provider']}, {meta['cloud_model']}" if cloud else f"local, {meta['model']}"
         log(f"creating containers for '{name}' (dashboard port {meta['port']}, {what})...")
@@ -2074,7 +2149,9 @@ class Handler(BaseHTTPRequestHandler):
                 j = JOBS.get(parts[2])
                 return self.send_json(j) if j else self.fail(404, "no such job")
             if parts == ["api", "models"]:
-                return self.send_json(models_overview())
+                ov = models_overview()
+                ov["recommended"] = default_local_model(ov)
+                return self.send_json(ov)
             if parts == ["api", "vmbench"]:
                 return self.send_json({"tasks": vr.load_tasks(), "settings": vmb_settings(),
                                        "runs": [vm_run_view(r) for r in sorted(VM_RUNS.values(), key=lambda x: x["created"], reverse=True)[:40]]})
@@ -2138,56 +2215,7 @@ class Handler(BaseHTTPRequestHandler):
                     model = str(b.get("model", ""))
                     if not MODEL_RE.match(model):
                         return self.fail(400, "bad model name")
-
-                    def pull_host(log):
-                        log(f"asking the Ollama on this computer to download {model}...")
-                        req = urllib.request.Request(HOST_OLLAMA + "/api/pull", method="POST",
-                                                     data=json.dumps({"model": model, "stream": True}).encode(),
-                                                     headers={"Content-Type": "application/json"})
-                        last = ""
-                        with urllib.request.urlopen(req, timeout=3600) as r:
-                            for raw in r:
-                                try:
-                                    ev = json.loads(raw)
-                                except ValueError:
-                                    continue
-                                if ev.get("error"):
-                                    raise RuntimeError(ev["error"])
-                                msg = ev.get("status", "")
-                                if ev.get("total"):
-                                    msg += f" {ev.get('completed', 0) / 1e9:.1f}/{ev['total'] / 1e9:.1f} GB"
-                                if msg != last:
-                                    log(msg)
-                                    last = msg
-
-                    def pull(log):
-                        if OLLAMA_MODE == "host":
-                            return pull_host(log)
-                        run([DOCKER, "volume", "create", MODELS_VOLUME], timeout=30)
-                        log(f"downloading {model} (needs internet, runs in a throwaway container)...")
-                        p = subprocess.Popen(
-                            [DOCKER, "run", "--rm", "-v", f"{MODELS_VOLUME}:/root/.ollama", "--entrypoint", "sh",
-                             "ollama/ollama:latest", "-c", f"ollama serve >/dev/null 2>&1 & sleep 6; ollama pull {model}"],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                            errors="replace", creationflags=NOWIN)
-                        last = ""
-                        buf = ""
-                        while True:
-                            ch = p.stdout.read(1)
-                            if not ch:
-                                break
-                            if ch in "\r\n":
-                                clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", buf)
-                                clean = re.sub(r"(pulling manifest\s*)+$", "", clean).strip()   # stray redraw text from the progress bar
-                                if clean and clean != last and ("pulling" in clean or "success" in clean or "error" in clean.lower()):
-                                    log(clean)
-                                    last = clean
-                                buf = ""
-                            else:
-                                buf += ch
-                        if p.wait() != 0:
-                            raise RuntimeError("model download failed")
-                    return self.send_json({"job": start_job(f"Pull {model}", pull)})
+                    return self.send_json({"job": start_job(f"Pull {model}", lambda log: pull_model(model, log))})
             if parts == ["api", "vmbench", "settings"]:
                 return self.send_json(update_vmb_settings(b))
             if parts == ["api", "vmbench", "runs"]:

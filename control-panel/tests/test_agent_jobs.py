@@ -99,6 +99,17 @@ class DefaultModelTests(unittest.TestCase):
     def test_tight_or_too_big_models_are_skipped(self):
         self.assertEqual(self.pick(catalog=[entry("big", 12.8, "tight"), entry("small", 6.1, "cpu")]), "small")
 
+    def test_full_gpu_fit_beats_a_bigger_model_that_spills_to_cpu(self):
+        # regression: a 16 GB GPU got qwen3:32b (partial, ~29 GB) over qwen2.5:14b (fits the GPU)
+        cat = [entry("qwen2.5:14b", 15.7, "gpu"), entry("gpt-oss:20b", 15.9, "partial"), entry("qwen3:32b", 28.9, "partial")]
+        self.assertEqual(self.pick(catalog=cat), "qwen2.5:14b")
+
+    def test_partial_fit_is_used_when_nothing_fits_the_gpu(self):
+        self.assertEqual(self.pick(catalog=[entry("big", 28.9, "partial"), entry("small", 6.1, "cpu")]), "big")
+
+    def test_downloaded_model_still_beats_a_catalog_gpu_fit(self):
+        self.assertEqual(self.pick(installed=[entry("have", 20.0, "partial")], catalog=[entry("get", 9.5, "gpu")]), "have")
+
     def test_falls_back_when_nothing_fits_or_ollama_is_unreachable(self):
         with mock.patch.dict(os.environ, {"OPENCLAW_MODEL": ""}):
             self.assertEqual(self.pick(catalog=[entry("big", 99, "toobig")]), app.DEFAULT_MODEL)
