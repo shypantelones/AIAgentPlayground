@@ -1,6 +1,6 @@
 "use strict";
 /* VM Labs: network topologies (routers/switches/hosts, all real VMs wired together). Loaded after vmbench.js in
-   the same dialog: appends its own section via vtBuildSection(), and its own 2s poll tick via vtLoad(), called
+   the same dialog: vtBuildSection() is the "Network labs" tab, and its own 2s poll tick via vtLoad() is called
    from vmbench.js's existing loadVB(). Mirrors vmbench.js's structure throughout. */
 
 let vtData = { topologies: [], tasks: [], settings: {}, runs: [] }, vtSelRun = null;
@@ -141,6 +141,7 @@ async function vtLoad() {
   try { vtData = await api("/api/vmtopo"); } catch { return; }
   const rs = JSON.stringify(vtData.runs);
   if (rs !== vtSig.runs) { vtSig.runs = rs; renderVTRuns(); }
+  if (typeof renderBench === "function") renderBench();
   if (vtSelRun) loadVTDetail();
 }
 

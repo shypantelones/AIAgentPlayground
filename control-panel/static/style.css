@@ -83,3 +83,10 @@ dialog.dlg textarea.al{width:100%;min-height:110px}
 .mdetail{border:1px solid var(--line);border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:4px;background:var(--bg)}
 select{max-width:100%}
 .chip.attached{background:#fff1cf;color:#7a5200}
+.bench{border:1px solid var(--line);border-radius:8px;padding:8px;gap:6px}
+.bench-wrap{overflow-x:auto}
+.bench table{border-collapse:collapse;width:100%;font-size:13px}
+.bench th,.bench td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+.bench th{color:var(--mute);font-weight:600}
+.bench tbody tr{cursor:pointer}.bench tbody tr:hover,.bench tbody tr:focus{background:var(--agent);outline:none}
+.bench td.num{font-variant-numeric:tabular-nums}
