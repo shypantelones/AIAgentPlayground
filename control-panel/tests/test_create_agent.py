@@ -43,8 +43,11 @@ class CreateAgentTests(unittest.TestCase):
             mock.patch.object(app, "ensure_llm_network", lambda log=None: self.calls.append(("ensure_llm_network",))),
             mock.patch.object(app, "ensure_image", lambda log=None, image=None: None),
             mock.patch.object(app, "wait_gateway", lambda *a, **k: True),
-            mock.patch.object(app, "default_local_model", lambda: "llama3.1:8b"),
+            mock.patch.object(app, "default_local_model", side_effect=AssertionError("the user picks the model, not the panel")),
+            mock.patch.object(app, "ollama_list", lambda: self.installed),
+            mock.patch.object(app, "pull_model", lambda model, log: self.calls.append(("pull", model))),
         ]
+        self.installed = [("llama3.1:8b", 4.9)]
         for p in self.patches:
             p.start()
 
@@ -105,9 +108,9 @@ class CreateAgentTests(unittest.TestCase):
             app.create_agent("cloudy", {"backend": "cloud", "provider": "anthropic", "model": "claude-opus-5-5", "token": "short"})
         self.assertFalse((self.tmp / "cloudy").exists())
 
-    # ---- local (unchanged behaviour)
-    def test_local_is_still_the_default(self):
-        j = self.run_create("loco", None)
+    # ---- local: the user must choose the model
+    def test_local_is_still_the_default_backend(self):
+        j = self.run_create("loco", {"model": "llama3.1:8b"})
         self.assertTrue(j["ok"], j["lines"])
         m = self.meta("loco")
         self.assertEqual((m["backend"], m["model"]), ("local", "llama3.1:8b"))
@@ -115,6 +118,30 @@ class CreateAgentTests(unittest.TestCase):
         self.assertNotIn("ensure_llm_network", self.kinds())
         self.assertIn('primary: "ollama/llama3.1:8b"', self.patch_payload())
         self.assertEqual(self.store.d, {})
+
+    def test_local_without_a_model_is_refused_up_front(self):
+        # regression: the panel used to pick a model silently (qwen3:32b, never downloaded -> 404 on first chat)
+        for form in (None, {}, {"backend": "local"}, {"backend": "local", "model": "  "}):
+            with self.subTest(form=form), self.assertRaises(ValueError):
+                app.create_agent("loco", form)
+        self.assertFalse((self.tmp / "loco").exists())
+
+    def test_bad_model_name_is_refused(self):
+        with self.assertRaises(ValueError):
+            app.create_agent("loco", {"backend": "local", "model": "x; rm -rf /"})
+        self.assertFalse((self.tmp / "loco").exists())
+
+    def test_downloaded_model_is_not_pulled_again(self):
+        self.assertTrue(self.run_create("loco", {"model": "llama3.1:8b"})["ok"])
+        self.assertNotIn("pull", self.kinds())
+
+    def test_chosen_model_is_downloaded_before_the_agent_uses_it(self):
+        self.installed = [("qwen3:14b", 9.3)]
+        j = self.run_create("loco", {"model": "qwen2.5:14b"})
+        self.assertTrue(j["ok"], j["lines"])
+        self.assertLess(self.kinds().index("ensure_shared"), self.calls.index(("pull", "qwen2.5:14b")))
+        self.assertLess(self.calls.index(("pull", "qwen2.5:14b")),
+                        next(i for i, c in enumerate(self.calls) if c[0] == "dc" and "patch" in c[1]))
 
     def test_unknown_backend_is_refused(self):
         with self.assertRaises(ValueError):

@@ -99,8 +99,11 @@ function openCreateDialog(name0 = "") {
   const nameIn = h("input", { value: name0, maxlength: 20, placeholder: "new-agent-name", autocomplete: "off", spellcheck: "false" });
   const cf = cloudFields();
   const tok = h("input", { type: "password", placeholder: "paste API key", autocomplete: "new-password", spellcheck: "false" });
+  const localPick = h("div", { class: "col" });
+  let picker = null;                                                    // set once the model list has loaded
+  const pickerReady = buildLocalPicker(localPick, {}, nameIn.value, null, { choose: true }).then(p => picker = p);
   const localBox = h("div", { class: "col" }, h("p", { class: "hint" },
-    "Runs on this computer's Ollama with the most capable model it can run (downloaded on first use). Needs Ollama running and a fairly powerful computer: on slower machines replies can time out."));
+    "Runs on this computer's Ollama. Choose the model it uses (a model that isn't downloaded yet is downloaded when the agent is created). Needs a fairly powerful computer: on slower machines replies can time out."), localPick);
   const cloudBox = h("div", { class: "col" }, ...cf.rows, h("div", { class: "row" }, "API key", tok), h("p", { class: "hint" },
     `The key is ${(state.platform || {}).secretStore || "stored securely"} and held by a separate relay container; the agent only ever gets a dummy key. ` +
     "Cloud models cost money per use: use a spend-capped key. In cloud mode, prompts leave this computer. No local model is downloaded."));
@@ -112,7 +115,16 @@ function openCreateDialog(name0 = "") {
     msg.textContent = "";
     const name = nameIn.value.trim().toLowerCase();
     if (!name) { msg.textContent = "Give the agent a name."; return; }
-    const body = Object.assign({ name, backend: mode }, mode === "cloud" ? Object.assign(cf.read(), { token: tok.value.trim() }) : {});
+    let local = {};
+    if (mode === "local") {
+      await pickerReady;
+      const e = picker && picker.entry();
+      if (!e) { msg.textContent = picker ? "Choose a model for this agent." : "Could not load the model list (see above)."; if (picker) picker.focus(); return; }
+      if (e.fit === "toobig" && !confirm(`${e.name} is unlikely to run on this computer. Create the agent with it anyway?`)) return;
+      if (!e.installed && !confirm(`Download ${e.name}?\n\nSize: ${GB(e.size_gb)} GB (you have ${GB(picker.freeDisk)} GB free).\nIt is downloaded from ollama.com while the agent is created.`)) return;
+      local = { model: e.name };
+    }
+    const body = Object.assign({ name, backend: mode }, mode === "cloud" ? Object.assign(cf.read(), { token: tok.value.trim() }) : local);
     create.disabled = true;
     try {
       const r = await api("/api/agents", body);
