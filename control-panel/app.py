@@ -981,16 +981,19 @@ def vm_run_runner(rid):
         if task and task.get("seed"):
             vr.write_seed_files(d, task["seed"])
         vm_log(r, f"starting the VM (first run also downloads the {vr.BOX} image, a few hundred MB)...")
-        rc, out, err = vr.vagrant(d, "up", "--provider=virtualbox", timeout=900)
+        rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", timeout=900, cancel=stopped)
         vm_log(r, out[-2000:] or err[-500:])
+        if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
+            vm_log(r, "stopping: tearing down the half-built VM...")
+            vr.destroy_after_cancel(d, timeout=120)
+            return finish("stopped", "stopped during setup")
         if rc != 0:
             vr.vagrant(d, "destroy", "-f", timeout=120)
             return finish("error", "failed to start the VM (see transcript)")
-        if stopped():
-            vr.vagrant(d, "destroy", "-f", timeout=120)
-            return finish("stopped", "stopped during setup")
         vm_log(r, "waiting for the VM to accept SSH...")
-        if not vr.ssh_wait(port, priv, tries=60, delay=2):
+        if not vr.ssh_wait(port, priv, tries=60, delay=2, cancel=stopped):
+            if stopped():
+                return finish("stopped", "stopped during setup")
             return finish("error", "VM booted but never accepted SSH")
         if task and task.get("seed"):
             vr.ssh_run(port, priv, "mkdir -p /home/bench/work", timeout=20)
@@ -1523,20 +1526,23 @@ def topo_run_runner(rid):
             if idx != -1:
                 topo_log(r, line[idx:])
         rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
-                                         on_line=on_vagrant_line)
+                                         on_line=on_vagrant_line, cancel=stopped)
+        if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
+            topo_log(r, "stopping: tearing down the half-built lab...")
+            vr.destroy_after_cancel(d, timeout=180)
+            return finish("stopped", "stopped during setup")
         if rc != 0:
             topo_log(r, (out or err)[-2000:])
             vr.vagrant(d, "destroy", "-f", timeout=180)
             return finish("error", "failed to start the lab (see transcript)")
-        if stopped():
-            vr.vagrant(d, "destroy", "-f", timeout=180)
-            return finish("stopped", "stopped during setup")
         topo_log(r, "waiting for every node to accept SSH...")
         for name, port in node_ports.items():
             def log_attempt(i, rc, err, name=name):     # default arg: capture this loop iteration's `name`
                 if rc != 0 and (i == 0 or i % 15 == 14):
                     topo_log(r, f"  {name}: ssh attempt {i+1} failed (rc={rc}): {err.strip()[-300:]}")
-            if not vr.ssh_wait(port, priv, tries=90, delay=2, on_attempt=log_attempt):
+            if not vr.ssh_wait(port, priv, tries=90, delay=2, on_attempt=log_attempt, cancel=stopped):
+                if stopped():
+                    return finish("stopped", "stopped during setup")
                 return finish("error", f"node '{name}' booted but never accepted SSH")
         r["state"] = "ready"
         save_topo_run(r)
