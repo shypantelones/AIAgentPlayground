@@ -83,11 +83,13 @@ function vtBuildSection() {
 
   VT.newAgents = h("div", { class: "col" }, ...vbAgentCheckboxes());
   VT.newKeep = h("input", { type: "checkbox" });
+  VT.newInteractive = h("input", { type: "checkbox" });
   VT.newMsg = h("div", { class: "fail" });
   const create = h("button", { class: "primary", onclick: async () => {
     VT.newMsg.textContent = "";
     const agents = [...VT.newAgents.querySelectorAll("input:checked")].map(x => x.value);
-    const body = { keep: VT.newKeep.checked };
+    if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
+    const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked };
     if (VT.customOn.checked) {
       const counts = Object.fromEntries(Object.entries(VT.custCounts).map(([k, el]) => [k, +el.value || 0]));
       const wiring = VT.custWiring.value;
@@ -126,6 +128,7 @@ function vtBuildSection() {
       custBuilder,
       taskRow, VT.newTaskInfo, promptRow, VT.customPrompt,
       h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"), VT.newAgents,
+      h("label", { class: "row" }, VT.newInteractive, "interactive session: keep the agent attached to every node after its first reply so you can send it more guidance (ends when you press End session, or after 2 hours with no new message)"),
       h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection"),
       VT.newMsg, h("div", { class: "row" }, create)),
     h("h5", {}, "Topology runs"), VT.runsBox, VT.detail);
@@ -150,7 +153,7 @@ function renderVTRuns() {
       grp.length > 1 ? h("div", { class: "hint" }, `Benchmark: ${grp[0].task_title || "task"} across ${grp.length} agents`) : null,
       ...sorted.map(r => h("div", { class: "sess" + (r.id === vtSelRun ? " sel" : ""), onclick: () => { vtSelRun = r.id; vtSig.detail = ""; vtLoad(); } },
         h("span", { class: "chip " + r.state }, VB_STATE_LABEL[r.state] || r.state),
-        ` ${r.topology_title} — ${r.agent ? r.agent : "(no agent)"}${r.task_title ? " — " + r.task_title : " — scratch lab"} `,
+        ` ${r.topology_title} — ${r.agent ? r.agent : "(no agent)"}${r.task_title ? " — " + r.task_title : r.custom_prompt ? " — your prompt" : " — scratch lab"}${r.interactive ? " (session)" : ""} `,
         h("span", { class: "status" }, `${vtElapsed(r)}${r.score ? " · " + (r.score.passed ? "PASS" : "FAIL") : ""}`))));
   }));
 }
@@ -158,12 +161,12 @@ function renderVTRuns() {
 async function loadVTDetail() {
   let r; try { r = await api("/api/vmtopo/runs/" + vtSelRun); } catch { vtSelRun = null; return; }
   const key = [r.id, r.state, r.transcript.length, r.score && r.score.passed,
-              Object.values(r.nodes).map(n => n.terminal.active).join(",")].join("|");
+              Object.values(r.nodes).map(n => n.terminal.active).join(","), (r.conversation || []).length].join("|");
   if (key === vtSig.detail) return;
   vtSig.detail = key;
-  const live = ["queued", "provisioning", "working", "scoring"].includes(r.state);
-  const canTerminal = ["ready", "working", "scoring", "done"].includes(r.state);
-  const canScore = r.task_id && ["ready", "working", "done"].includes(r.state);
+  const live = ["queued", "provisioning", "working", "attached", "scoring"].includes(r.state);
+  const canTerminal = ["ready", "working", "attached", "scoring", "done"].includes(r.state);
+  const canScore = r.task_id && ["ready", "working", "attached", "done"].includes(r.state);
   const canStop = live || r.state === "ready";
   const canDelete = !live;
 
@@ -188,14 +191,17 @@ async function loadVTDetail() {
     h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), scoreBtn, stopBtn, delBtn)];
   const taskDesc = r.task_title ? " · task: " + r.task_title
     : r.custom_prompt ? " · custom prompt (no automated score)" : " · no task (scratch lab)";
-  parts.push(h("div", { class: "hint" }, `${r.topology_title}${taskDesc}${r.agent ? " · agent: " + r.agent : " · no agent attached"} · started ${vtFmtTime(r.started)} · elapsed ${vtElapsed(r)}`));
+  parts.push(h("div", { class: "hint" }, `${r.topology_title}${taskDesc}${r.agent ? " · agent: " + r.agent : " · no agent attached"}${r.interactive ? " · interactive session" : ""} · started ${vtFmtTime(r.started)} · elapsed ${vtElapsed(r)}`));
   if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
   parts.push(...nodeRows);
+  if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "lab"));
+  if (r.interactive && ["attached", "working"].includes(r.state))
+    parts.push(sessionBox(r, "/api/vmtopo/runs", "lab", () => { vtSig.detail = ""; vtLoad(); }));
   if (r.score) {
     parts.push(h("div", { class: r.score.passed ? "pass" : "fail" }, r.score.passed ? "PASS" : "FAIL", ` (${r.score.duration_s}s)`));
     parts.push(h("pre", {}, r.score.output));
   }
   parts.push(h("div", { class: "hint" }, "Live transcript:"));
   parts.push(h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)"));
-  VT.detail.replaceChildren(...parts);
+  replaceKeepingFocus(VT.detail, parts);
 }

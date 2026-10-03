@@ -37,6 +37,9 @@ class VmTopoBase(unittest.TestCase):
             mock.patch.object(app, "VM_RUNS", {}),
             mock.patch.object(app, "TOPO_RUNS", {}),
             mock.patch.object(app, "TOPO_STOP", {}),
+            mock.patch.object(app, "TOPO_FOLLOWUPS", {}),
+            mock.patch.object(app, "TOPO_END", {}),
+            mock.patch.object(app, "VM_SESSION_POLL_S", 0.02),
             mock.patch.object(app, "TOPO_TERM_CREDS", {}),
             mock.patch.object(app, "agent_running", lambda n: n not in self.down),
             mock.patch.object(vr, "allocate_port", lambda rng, taken: next(p for p in range(*rng) if p not in taken)),
@@ -263,6 +266,134 @@ class SlotAccountingTests(VmTopoBase):
         app.stop_vm_run(vm_rid)                                       # synchronous teardown: state was "ready"
         self.assertEqual(app.VM_RUNS[vm_rid]["state"], "stopped")
         self.assertTrue(wait_for(lambda: app.TOPO_RUNS[topo_rid]["state"] == "ready", timeout=6))
+
+
+class LabSessionTests(VmTopoBase):
+    """Interactive sessions for topology labs: the agent keeps its ./vmrun-<node> access to every node after its first
+    reply and you send it more guidance in the same conversation until you end the session (same as single VMs)."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_agent("alpha")
+        self.turns = []
+        self.detached = []
+        p1 = mock.patch.object(app, "run_turn", self.record_turn)
+        p2 = mock.patch.object(app, "detach_topo_agent", lambda agent: self.detached.append(agent))
+        for p in (p1, p2):
+            p.start()
+            self.patches.append(p)
+
+    def record_turn(self, name, chat_id, message, meta=None, log=lambda s: None, title=None, timeout=700):
+        self.turns.append((chat_id, message))
+        return {"reply": "ok", "ok": True}
+
+    def state(self, rid):
+        return app.TOPO_RUNS[rid]["state"]
+
+    def open_session(self, **form):
+        rid = app.create_topo_run(dict({"topology_id": "s1h2", "agent": "alpha", "interactive": True,
+                                         "custom_prompt": "Give h1 and h2 addresses so they can ping each other."}, **form))
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        return rid
+
+    def test_session_relays_follow_ups_then_ends_cleanly(self):
+        rid = self.open_session()
+        self.assertIn("more guidance", self.turns[0][1])
+        self.assertIn("./vmrun-h1", self.turns[0][1])
+        self.assertIn("ready. Your own prompt", app.TOPO_RUNS[rid]["vm_log"])
+        self.assertEqual(self.detached, [], "the agent keeps its lab access while the session is open")
+        self.assertIsNotNone(app.topo_run_view(app.TOPO_RUNS[rid])["idle_deadline"])
+
+        app.send_topo_followup(rid, "Use 192.168.50.0/24 instead.")
+        self.assertTrue(wait_for(lambda: len(self.turns) == 2))
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        self.assertEqual(self.turns[1], (f"vmtopo-{rid}", "Use 192.168.50.0/24 instead." + app.TOPO_FOLLOWUP_REMINDER))
+        self.assertIn("./vmrun-<node>", app.TOPO_FOLLOWUP_REMINDER)
+
+        app.end_topo_session(rid)
+        self.assertTrue(self.finished(rid))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)                # "done" is set before the runner's teardown (vagrant destroy) runs
+        self.assertEqual(self.state(rid), "done")
+        self.assertEqual(self.detached, ["alpha"])
+        destroys = [c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"]
+        self.assertEqual(len(destroys), 1, "not kept, so the lab is destroyed once the session ends")
+        with self.assertRaises(ValueError):
+            app.send_topo_followup(rid, "too late")
+
+    def test_session_on_a_catalog_task_is_scored_when_it_ends(self):
+        rid = self.open_session(task_id="s1h2-connectivity", custom_prompt=None)
+        self.assertFalse(any(c[0] == "ssh_run" for c in self.calls), "not scored while the session is open")
+        app.end_topo_session(rid)
+        self.assertTrue(self.finished(rid))
+        self.assertTrue(app.TOPO_RUNS[rid]["score"]["passed"])
+
+    def test_score_now_during_a_session_keeps_it_open(self):
+        rid = self.open_session(task_id="s1h2-connectivity", custom_prompt=None)
+        jid = app.topo_score_now(rid)
+        self.assertTrue(wait_for(lambda: app.JOBS[jid]["done"]))
+        self.assertEqual(self.state(rid), "attached")
+
+    def test_stop_during_a_session_detaches_without_scoring(self):
+        rid = self.open_session(task_id="s1h2-connectivity", custom_prompt=None)
+        app.stop_topo_run(rid)
+        self.assertTrue(self.finished(rid))
+        self.assertEqual(self.state(rid), "stopped")
+        self.assertEqual(self.detached, ["alpha"])
+        self.assertIsNone(app.TOPO_RUNS[rid]["score"])
+
+    def test_idle_session_ends_by_itself(self):
+        with mock.patch.object(app, "VM_SESSION_IDLE_S", 0.2):
+            rid = self.open_session()
+            self.assertTrue(self.finished(rid))
+        self.assertEqual(self.state(rid), "done")
+        self.assertIn("ending the session", app.TOPO_RUNS[rid]["vm_log"])
+
+    def test_terminals_work_during_a_session(self):
+        rid = self.open_session()
+        (app.topo_run_dir(rid) / "id_ed25519").write_text("k")
+        port, cred = app.start_topo_terminal(rid, "h1")
+        self.assertTrue(port and cred)
+
+    def test_an_agent_can_only_be_attached_to_one_lab_at_a_time(self):
+        rid = self.open_session()
+        with self.assertRaises(ValueError):
+            app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "second lab"})
+        app.end_topo_session(rid)
+        self.assertTrue(self.finished(rid))
+        rid2 = app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "second lab"})
+        self.assertTrue(self.finished(rid2))
+
+    def test_validation(self):
+        with self.assertRaises(ValueError):
+            app.create_topo_run({"topology_id": "s1h2", "interactive": True})               # no agent
+        with self.assertRaises(ValueError):
+            app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "x" * (app.VM_PROMPT_MAX + 1)})
+        rid = app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "x"})   # not interactive
+        self.assertTrue(self.finished(rid))
+        for call in (lambda: app.send_topo_followup(rid, "hi"), lambda: app.end_topo_session(rid)):
+            with self.assertRaises(ValueError):
+                call()
+        with self.assertRaises(KeyError):
+            app.send_topo_followup("deadbeef", "hi")
+
+    def test_run_view_includes_the_conversation(self):
+        rid = app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "x"})
+        self.assertTrue(self.finished(rid))
+        app.append_message("alpha", f"vmtopo-{rid}", "user", "x")
+        app.append_message("alpha", f"vmtopo-{rid}", "agent", "addressed both hosts")
+        conv = app.topo_run_view(app.TOPO_RUNS[rid], full=True)["conversation"]
+        self.assertEqual([m["role"] for m in conv], ["user", "agent"])
+
+    def test_restart_marks_open_sessions_interrupted_and_detaches_the_agent(self):
+        rec = {"id": "abcd1234", "state": "attached", "agent": "alpha", "reason": "", "created": 1.0, "nodes": {}}
+        app.topo_run_path("abcd1234").write_text(json.dumps(rec))
+        before = set(threading.enumerate())
+        app.load_topo_runs()
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=5)
+        self.assertEqual(app.TOPO_RUNS["abcd1234"]["state"], "interrupted")
+        self.assertEqual(self.detached, ["alpha"])
 
 
 class TaskWithAgentTests(VmTopoBase):
