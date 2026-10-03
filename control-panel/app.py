@@ -981,8 +981,14 @@ def vm_run_runner(rid):
         if task and task.get("seed"):
             vr.write_seed_files(d, task["seed"])
         vm_log(r, f"starting the VM (first run also downloads the {vr.BOX} image, a few hundred MB)...")
-        rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", timeout=900, cancel=stopped)
-        vm_log(r, out[-2000:] or err[-500:])
+        def on_vagrant_line(line):          # live progress: Vagrant's own "==>" phase markers (see topo_run_runner)
+            idx = line.find("==>")
+            if idx != -1:
+                vm_log(r, line[idx:])
+        rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", timeout=900, cancel=stopped,
+                                         on_line=on_vagrant_line)
+        if rc != 0 and not stopped():
+            vm_log(r, out[-2000:] or err[-500:])     # the full tail only when it failed, for diagnosis
         if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
             vm_log(r, "stopping: tearing down the half-built VM...")
             vr.destroy_after_cancel(d, timeout=120)

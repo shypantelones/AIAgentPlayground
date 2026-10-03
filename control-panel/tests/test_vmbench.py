@@ -99,6 +99,8 @@ class VmBenchBase(unittest.TestCase):
         return 0, "ok", ""
 
     def fake_vagrant_stream(self, run_dir, *args, on_line=None, timeout=120, cancel=None):
+        if on_line:
+            on_line("==> default: Booting VM...")
         if args[0] == "up" and getattr(self, "up_blocks", False):     # a long build, until Stop cancels it
             self.calls.append(("vagrant", args))
             while not (cancel and cancel()):
@@ -202,6 +204,11 @@ class InstantStopTests(VmBenchBase):
         for t in set(threading.enumerate()) - self._threads_before:
             t.join(timeout=8)
         self.assertIn(("destroy_after_cancel",), self.calls)
+
+    def test_build_progress_is_streamed_into_the_transcript(self):
+        rid = app.create_vm_run({})
+        self.assertTrue(wait_for(lambda: app.VM_RUNS[rid]["state"] == "ready"))
+        self.assertIn("==> default: Booting VM...", app.VM_RUNS[rid]["vm_log"])
 
     def test_stop_while_waiting_for_ssh_stops_instead_of_erroring(self):
         waits = []
