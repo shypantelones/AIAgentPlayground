@@ -219,6 +219,29 @@ class TaskWithAgentTests(VmBenchBase):
         # the vm-relay container is brought up and later removed via app.run(); just confirm run() was used at all
         self.assertTrue(any(c[0] == "run" for c in self.calls))
 
+    def test_agent_gets_the_stdin_capable_wrapper_and_is_told_how_to_keep_dollar_signs(self):
+        self.add_agent("alpha")
+        inputs, prompts = [], []
+        real_dc = self.fake_dc
+
+        def dc(name, *args, input=None, timeout=120):
+            inputs.append(input or "")
+            return real_dc(name, *args, input=input, timeout=timeout)
+
+        def run_turn(name, chat_id, message, *a, **k):
+            prompts.append(message)
+            return {"reply": "done", "ok": True}
+        with mock.patch.object(app, "dc", dc), mock.patch.object(app, "run_turn", run_turn):
+            rid = app.create_vm_run({"task_id": "fizzbuzz-cli", "agent": "alpha"})
+            self.assertTrue(self.finished(rid))
+        wrapper = next(i for i in inputs if i.startswith("#!/bin/sh"))
+        self.assertIn("'bash -s'", wrapper)
+        self.assertIn("bench@vm-relay", wrapper)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("./vmrun <<'EOF'", prompts[0])
+        self.assertIn("single quotes", prompts[0])
+        self.assertIn("run what you built", prompts[0])
+
     def test_failing_check_script_gives_a_failed_score_not_an_error(self):
         self.add_agent("alpha")
         self.ssh_check_passes = False

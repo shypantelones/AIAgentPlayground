@@ -264,6 +264,61 @@ class TopologyHelperTests(unittest.TestCase):
         self.assertTrue(cmd.rstrip().endswith("wait"))
 
 
+class VmrunScriptTests(unittest.TestCase):
+    """The vmrun wrapper an agent uses to run commands on a VM. Regression: agents were told to pass scripts as
+    ./vmrun "...", so their own shell expanded $i to nothing before the wrapper ran and a FizzBuzz script arrived
+    with `echo $i` turned into `echo ` (blank lines for every number). The stdin form must deliver $ untouched."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = self.tmp / "session.log"
+        self.script = self.tmp / "vmrun"
+        self.script.write_text(vr.vmrun_script("/k/id_ed25519", 2222, "bench@relay", str(self.log)))
+        self.script.chmod(0o755)
+        # a fake ssh that records its arguments and stdin instead of connecting anywhere
+        fake = self.tmp / "bin" / "ssh"
+        fake.parent.mkdir()
+        fake.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {self.tmp}/ssh-args\ncat > {self.tmp}/ssh-stdin\necho remote-output\n")
+        fake.chmod(0o755)
+        self.env = {"PATH": f"{fake.parent}:/usr/bin:/bin"}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def sh(self, command):
+        return subprocess.run(["sh", "-c", command], cwd=self.tmp, env=self.env, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=20)
+
+    def test_is_valid_shell_syntax(self):
+        result = subprocess.run(["sh", "-n", str(self.script)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "runs the wrapper with POSIX paths; the gateway it runs in is Linux")
+    def test_heredoc_script_reaches_the_vm_with_dollar_signs_intact(self):
+        res = self.sh("./vmrun <<'EOF'\nfor i in 1 2 3; do echo \"$i $((i * 2))\"; done\nEOF")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("remote-output", res.stdout)
+        self.assertEqual((self.tmp / "ssh-stdin").read_text(), 'for i in 1 2 3; do echo "$i $((i * 2))"; done\n')
+        self.assertEqual((self.tmp / "ssh-args").read_text().splitlines()[-2:], ["bench@relay", "bash -s"])
+        self.assertIn('echo "$i $((i * 2))"', self.log.read_text())        # logged as sent, for the transcript
+
+    @unittest.skipIf(sys.platform == "win32", "runs the wrapper with POSIX paths; the gateway it runs in is Linux")
+    def test_single_quoted_argument_keeps_dollar_signs_for_the_vm(self):
+        res = self.sh("./vmrun 'echo $HOME'")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        args = (self.tmp / "ssh-args").read_text().splitlines()
+        self.assertEqual(args[-2:], ["bench@relay", "echo $HOME"])
+        self.assertIn("-p", args)
+        self.assertEqual(args[args.index("-p") + 1], "2222")
+
+    @unittest.skipIf(sys.platform == "win32", "runs the wrapper with POSIX paths; the gateway it runs in is Linux")
+    def test_no_command_at_all_prints_usage_instead_of_hanging(self):
+        res = self.sh("./vmrun")
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("usage", res.stderr)
+        self.assertFalse((self.tmp / "ssh-args").exists())
+
+
 class CustomTopologyTests(unittest.TestCase):
     def test_star_wiring_hubs_everything_off_the_first_switch(self):
         t = vr.build_custom_topology({"host": 3, "switch": 1, "loadbalancer": 1}, "star")
