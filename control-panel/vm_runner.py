@@ -330,6 +330,50 @@ def vm_name_for_node(rid, name):
     return f"aiagentplayground-vmtopo-{rid}-{name}"
 
 
+def vmrun_script(key_path, port, host, log_path):
+    """The `vmrun` wrapper put in an agent's workspace: runs commands on a VM through its relay and logs them.
+
+    Two ways to call it, because the agent's own shell expands $variables inside double quotes BEFORE the wrapper
+    runs. A script passed as `./vmrun "echo $i"` arrives as `echo ` - found when an agent's FizzBuzz printed blank
+    lines for every number:
+      ./vmrun 'one-line command'      argument(s) form; single quotes keep $ for the VM's shell
+      ./vmrun <<'EOF' ... EOF         no arguments: the script is read from stdin and run with `bash -s` on the VM;
+                                      a quoted heredoc delimiter means nothing is expanded locally
+    """
+    ssh = (f"ssh -i {key_path} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+           f"-o LogLevel=ERROR {host}")
+    return ("#!/bin/sh\n"
+            f"LOG={log_path}\n"
+            "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
+            "if [ $# -gt 0 ]; then\n"
+            "  echo \"=== $ts \\$ $*\" >> \"$LOG\"\n"
+            f"  {ssh} \"$@\" 2>&1 | tee -a \"$LOG\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ -t 0 ]; then\n"
+            "  echo \"usage: $0 'command'   or   $0 <<'EOF' (script lines) EOF\" >&2; exit 2\n"
+            "fi\n"
+            "script=\"$(cat)\"\n"
+            "if [ -z \"$script\" ]; then\n"
+            "  echo \"usage: $0 'command'   or   $0 <<'EOF' (script lines) EOF\" >&2; exit 2\n"
+            "fi\n"
+            "printf '=== %s $ (script on stdin)\\n%s\\n' \"$ts\" \"$script\" >> \"$LOG\"\n"
+            f"printf '%s\\n' \"$script\" | {ssh} 'bash -s' 2>&1 | tee -a \"$LOG\"\n")
+
+
+VMRUN_HOWTO = (
+    "Your own shell expands $variables inside double quotes before the command reaches the machine, so pass a "
+    "one-line command in single quotes, and send anything longer, or anything containing $, as a script on "
+    "standard input with a quoted heredoc - nothing inside it is changed:\n"
+    "{cmd} <<'EOF'\n"
+    "cat > /tmp/example.sh <<'INNER'\n"
+    "for i in 1 2 3; do echo \"$i\"; done\n"
+    "INNER\n"
+    "chmod +x /tmp/example.sh && /tmp/example.sh\n"
+    "EOF"
+)
+
+
 def relay_port_for_node(topology, name):
     """Deterministic container-internal port (on the agent's own docker network) for this node's SSH relay -
     independent of the node's host-forwarded SSH port, and collision-free within one topology by construction."""

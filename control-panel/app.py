@@ -981,12 +981,8 @@ def vm_run_runner(rid):
         rc, out, err = dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
             "mkdir -p /home/node/.openclaw/workspace/.vmkey && cat > /home/node/.openclaw/workspace/.vmkey/id_ed25519 "
             "&& chmod 600 /home/node/.openclaw/workspace/.vmkey/id_ed25519", input=key_text, timeout=20)
-        wrapper = ("#!/bin/sh\n"
-                  "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
-                  "echo \"=== $ts \\$ $*\" >> /home/node/.openclaw/workspace/vm-session.log\n"
-                  "ssh -i /home/node/.openclaw/workspace/.vmkey/id_ed25519 -p 22 -o StrictHostKeyChecking=no "
-                  "-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR bench@vm-relay \"$@\" 2>&1 | "
-                  "tee -a /home/node/.openclaw/workspace/vm-session.log\n")
+        wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey/id_ed25519", 22, "bench@vm-relay",
+                                  "/home/node/.openclaw/workspace/vm-session.log")
         dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
            "cat > /home/node/.openclaw/workspace/vmrun && chmod +x /home/node/.openclaw/workspace/vmrun",
            input=wrapper, timeout=20)
@@ -999,10 +995,11 @@ def vm_run_runner(rid):
         prompt = (
             f"{task['prompt']}\n\n"
             "You have an executable command available in your current working directory called ./vmrun. "
-            "Running `./vmrun \"some shell command\"` runs that command on a separate Linux machine set up for "
-            "this task and returns its output - do all of this task's file creation and testing there, not in "
-            "your own filesystem. For example: ./vmrun \"cat > /home/bench/work/app.py <<'EOF'\\n...\\nEOF\" or "
-            "./vmrun \"cd /home/bench/work && pytest -q\"."
+            "It runs shell commands on a separate Linux machine set up for this task and returns their output - do "
+            "all of this task's file creation and testing there, not in your own filesystem. For example: "
+            "./vmrun 'cd /home/bench/work && ls -la'\n"
+            + vr.VMRUN_HOWTO.format(cmd="./vmrun") + "\n"
+            "Before you reply, run what you built on that machine and check that its output is what the task asks for."
         )
         t0 = time.time()
         res = run_turn(r["agent"], r["chat"], prompt, {"via": "vmbench", "run": rid}, lambda s: vm_log(r, s), timeout=1200)
@@ -1409,12 +1406,8 @@ def topo_run_runner(rid):
            "chmod 600 /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", input=key_text, timeout=20)
         for name in r["nodes"]:
             relay_port = vr.relay_port_for_node(topology, name)
-            wrapper = ("#!/bin/sh\n"
-                      "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
-                      "echo \"=== $ts \\$ $*\" >> /home/node/.openclaw/workspace/vm-session-topo.log\n"
-                      f"ssh -i /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519 -p {relay_port} "
-                      "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "
-                      "bench@vm-relay-topo \"$@\" 2>&1 | tee -a /home/node/.openclaw/workspace/vm-session-topo.log\n")
+            wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", relay_port,
+                                      "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log")
             dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
                f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
                input=wrapper, timeout=20)
@@ -1425,11 +1418,12 @@ def topo_run_runner(rid):
                            *files, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
         if rc != 0:
             return finish("error", "could not attach the agent's lab relay (see transcript)")
-        node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} \"<command>\"" for name in r["nodes"])
+        node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} '<command>'" for name in r["nodes"])
         prompt = (
             f"{task['prompt'] if task else r['custom_prompt']}\n\n"
             "This lab has these nodes, each reachable with its own command run from your current working "
-            f"directory (e.g. ./vmrun-h1 \"ip addr\"):\n{node_lines}\n\n"
+            f"directory (e.g. ./vmrun-h1 'ip addr'):\n{node_lines}\n\n"
+            + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n\n"
             "Every node's first network interface is for setup only (already configured - leave it alone); its "
             "other interfaces are the lab links, with no address until you (or the task) configure them. A "
             "'switch' node is already working as a plain Ethernet switch and needs no configuration."
