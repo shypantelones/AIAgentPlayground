@@ -35,6 +35,7 @@ function showTerminalLogin(what, t) {
 }
 
 let vbData = { tasks: [], settings: {}, runs: [] }, vbSelRun = null, vbTimer = null;
+let vbTab = (() => { try { return localStorage.getItem("vmlabs-tab") || "network"; } catch { return "network"; } })();
 let VB = null;
 const vbSig = {};
 const vbDrafts = {};          // "<api base>/<run id>" -> unsent follow-up text, kept across the detail views' 2-second redraws
@@ -147,25 +148,80 @@ function buildVBDialog() {
     } catch (e) { VB.newMsg.textContent = e.message; }
   } }, "Create");
 
-  vbDlg.replaceChildren(
-    h("div", { class: "row" }, h("h3", { style: "flex:1;margin:0" }, "VM Labs: code-creation tasks in isolated Linux VMs"), h("button", { onclick: () => vbDlg.close() }, "Close")),
+  const codingPane = h("div", { class: "col" },
     h("p", { class: "hint" },
-      "Each run is a fresh, throwaway Ubuntu VM (VirtualBox): no shared folders, no network to this computer or to any agent, and no internet at all once it finishes setting up. Open a terminal and do the task yourself, or attach an agent to attempt it. Either way, \"Score now\" runs the task's check script and tells you pass/fail.",
-      " An agent needs tool calling to actually work the VM: check a model's status in the Model tab before attaching it — local models here are not yet verified to reliably invoke tools."),
-    h("h4", {}, "Settings"),
-    h("div", { class: "row" }, "Max VMs at once", VB.sMaxC, "Memory (MB)", VB.sMem, "CPUs", VB.sCpus,
-      h("label", { class: "row" }, VB.sKeep, "keep VMs by default"), saveSettings, VB.sMsg),
+      "One throwaway Ubuntu VM per run: a coding task from the catalog, your own prompt for an agent, or a scratch VM to use yourself. Open a terminal and do the task yourself, or attach an agent to attempt it. \"Score now\" runs the task's check script and tells you pass/fail."),
     h("h4", {}, "New VM / task"),
     h("div", { class: "col" }, h("div", { class: "row" }, "Task", VB.newTask), VB.newTaskInfo, VB.newPrompt,
       h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
       h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VB.newAgents,
-      h("label", { class: "row" }, VB.newInteractive, "interactive session: keep the agent attached after its first reply so you can send it more guidance (ends when you press End session, or after 2 hours with no new message)"),
+      h("label", { class: "row" }, VB.newInteractive, "interactive session"),
+      h("div", { class: "hint" }, "The agent stays attached after its first reply so you can send it more guidance. It ends when you press End session, or after 2 hours with no new message."),
       h("label", { class: "row" }, VB.newKeep, "keep this VM running afterward, for later inspection"),
       VB.newMsg, h("div", { class: "row" }, create)),
     h("h4", {}, "Runs"), VB.runsBox, VB.detail);
+  VB.benchBox = h("div", { class: "col" });
+  const benchPane = h("div", { class: "col" },
+    h("p", { class: "hint" }, "A benchmark gives one task to several agents at once: tick more than one agent when you create a coding VM or a network lab. Each benchmark is shown here side by side, with every agent's model, its score and how many commands it actually ran. Select a row to open that run."),
+    VB.benchBox);
+  VB.panes = { network: typeof vtBuildSection === "function" ? vtBuildSection() : h("div"), coding: codingPane, bench: benchPane };
+  VB.tabs = h("div", { class: "tabs", role: "tablist" }, ...[["network", "Network labs"], ["coding", "Coding VMs"], ["bench", "Benchmarks"]]
+    .map(([k, label]) => h("button", { role: "tab", "data-tab": k, onclick: () => vbShowTab(k) }, label)));
+
+  vbDlg.replaceChildren(
+    h("div", { class: "row" }, h("h3", { style: "flex:1;margin:0" }, "VM Labs"), h("button", { onclick: () => vbDlg.close() }, "Close")),
+    h("p", { class: "hint" },
+      "Real, throwaway VirtualBox VMs: no shared folders, no network to this computer or to any agent, and no internet once they finish setting up. Network labs wire several VMs together; coding VMs are single machines. Both can be benchmarked across agents."),
+    h("h4", {}, "Settings (shared by all VM Labs runs)"),
+    h("div", { class: "row" }, "Max VMs at once", VB.sMaxC, "Memory (MB)", VB.sMem, "CPUs", VB.sCpus,
+      h("label", { class: "row" }, VB.sKeep, "keep VMs by default"), saveSettings, VB.sMsg),
+    VB.tabs, VB.panes.network, VB.panes.coding, VB.panes.bench);
   VB.newTask.dispatchEvent(new Event("change"));
   Object.keys(vbSig).forEach(k => delete vbSig[k]);
-  if (typeof vtBuildSection === "function") vbDlg.append(h("hr"), vtBuildSection());
+  vbShowTab(vbTab);
+}
+
+function vbShowTab(k) {
+  if (!VB.panes[k]) k = "network";
+  vbTab = k;
+  try { localStorage.setItem("vmlabs-tab", k); } catch { /* per-browser convenience only */ }
+  for (const [name, pane] of Object.entries(VB.panes)) pane.hidden = name !== k;
+  for (const b of VB.tabs.children) { b.classList.toggle("on", b.dataset.tab === k); b.setAttribute("aria-selected", b.dataset.tab === k); }
+}
+
+/* Open a run from the Benchmarks tab in its own tab, selected. */
+function vbOpenRun(r) {
+  if (r.kind === "network") { vtSelRun = r.id; vtSig.runs = ""; vtSig.detail = ""; vbShowTab("network"); vtLoad(); }
+  else { vbSelRun = r.id; vbSig.runs = ""; vbSig.detail = ""; vbShowTab("coding"); loadVB(); }
+}
+
+/* Benchmarks tab: every multi-agent run of both kinds, one table per benchmark. Redrawn when either list changes. */
+function renderBench() {
+  if (!VB || !VB.benchBox) return;
+  const runs = [...vbData.runs.map(r => ({ ...r, kind: "coding" })),
+                ...(typeof vtData !== "undefined" ? vtData.runs.map(r => ({ ...r, kind: "network" })) : [])].filter(r => r.benchmark_id);
+  const sig = JSON.stringify(runs);
+  if (sig === vbSig.bench) return;
+  vbSig.bench = sig;
+  if (!runs.length) { VB.benchBox.replaceChildren(h("p", { class: "hint" }, "No benchmarks yet.")); return; }
+  const groups = {};
+  for (const r of runs) (groups[r.benchmark_id] = groups[r.benchmark_id] || []).push(r);
+  const ordered = Object.values(groups).sort((a, b) => Math.max(...b.map(r => r.created)) - Math.max(...a.map(r => r.created)));
+  VB.benchBox.replaceChildren(...ordered.map(grp => {
+    const g = grp[0];
+    const what = (g.kind === "network" ? `${g.topology_title} · ` : "Coding VM · ") + (g.task_title || (g.custom_prompt ? "your prompt" : "no task"));
+    const rows = [...grp].sort((a, b) => (b.score ? +b.score.passed : -1) - (a.score ? +a.score.passed : -1) || a.agent.localeCompare(b.agent));
+    return h("div", { class: "col bench" },
+      h("div", { class: "row" }, h("b", {}, what), h("span", { class: "status" }, `${grp.length} agents · started ${vbFmtTime(Math.min(...grp.map(r => r.created)))}`)),
+      h("div", { class: "bench-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, ...["Agent", "Model", "State", "Score", "Commands run", "Time"].map(t => h("th", {}, t)))),
+        h("tbody", {}, ...rows.map(r => h("tr", { tabindex: 0, onclick: () => vbOpenRun(r), onkeydown: e => { if (e.key === "Enter") vbOpenRun(r); } },
+          h("td", {}, r.agent), h("td", {}, r.agent_model || "?"),
+          h("td", {}, h("span", { class: "chip " + r.state }, VB_STATE_LABEL[r.state] || r.state)),
+          h("td", { class: r.score ? (r.score.passed ? "pass" : "fail") : "" }, r.score ? (r.score.passed ? "PASS" : "FAIL") : r.task_id ? "—" : "not scored"),
+          h("td", { class: "num" }, r.agent_turns ? `${r.agent_commands ?? "?"} in ${r.agent_turns} turn${r.agent_turns === 1 ? "" : "s"}` : "—"),
+          h("td", { class: "num" }, vbElapsed(r))))))));
+  }));
 }
 
 async function loadVB() {
@@ -180,6 +236,7 @@ async function loadVB() {
   }
   const rs = JSON.stringify(vbData.runs);
   if (rs !== vbSig.runs) { vbSig.runs = rs; renderVBRuns(); }
+  renderBench();
   if (vbSelRun) loadVBDetail();
 }
 

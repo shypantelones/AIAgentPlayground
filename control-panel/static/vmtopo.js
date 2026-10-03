@@ -1,6 +1,6 @@
 "use strict";
 /* VM Labs: network topologies (routers/switches/hosts, all real VMs wired together). Loaded after vmbench.js in
-   the same dialog: appends its own section via vtBuildSection(), and its own 2s poll tick via vtLoad(), called
+   the same dialog: vtBuildSection() is the "Network labs" tab, and its own 2s poll tick via vtLoad() is called
    from vmbench.js's existing loadVB(). Mirrors vmbench.js's structure throughout. */
 
 let vtData = { topologies: [], tasks: [], settings: {}, runs: [] }, vtSelRun = null;
@@ -130,7 +130,8 @@ function vtBuildSection() {
       taskRow, VT.newTaskInfo, promptRow, VT.customPrompt,
       h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
       h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VT.newAgents,
-      h("label", { class: "row" }, VT.newInteractive, "interactive session: keep the agent attached to every node after its first reply so you can send it more guidance (ends when you press End session, or after 2 hours with no new message)"),
+      h("label", { class: "row" }, VT.newInteractive, "interactive session"),
+      h("div", { class: "hint" }, "The agent keeps its access to every node after its first reply so you can send it more guidance. It ends when you press End session, or after 2 hours with no new message."),
       h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection"),
       VT.newMsg, h("div", { class: "row" }, create)),
     h("h5", {}, "Topology runs"), VT.runsBox, VT.detail);
@@ -141,6 +142,7 @@ async function vtLoad() {
   try { vtData = await api("/api/vmtopo"); } catch { return; }
   const rs = JSON.stringify(vtData.runs);
   if (rs !== vtSig.runs) { vtSig.runs = rs; renderVTRuns(); }
+  if (typeof renderBench === "function") renderBench();
   if (vtSelRun) loadVTDetail();
 }
 
