@@ -580,6 +580,144 @@ class SaveResumeTests(VmTopoBase):
         self.assertTrue(self.finished(rid2))
 
 
+class AttachAgentTests(VmTopoBase):
+    """Attaching an agent to a lab that already exists (built by you, or saved and resumed). When the agent is done
+    the lab goes back to "ready" instead of finishing, and re-attaching continues the lab's conversation."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_agent("alpha")
+        self.add_agent("beta")
+        self.turns, self.detached = [], []
+        for p in (mock.patch.object(app, "run_turn", self.record_turn),
+                  mock.patch.object(app, "detach_topo_agent", lambda agent: self.detached.append(agent))):
+            p.start()
+            self.patches.append(p)
+
+    def record_turn(self, name, chat_id, message, meta=None, log=lambda s: None, title=None, timeout=700):
+        self.turns.append((name, chat_id, message))
+        return {"reply": "ok", "ok": True}
+
+    def scratch_lab(self, **form):
+        rid = app.create_topo_run(dict({"topology_id": "s1h2"}, **form))
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))
+        (app.topo_run_dir(rid) / "Vagrantfile").write_text("# fake")
+        return rid
+
+    def attach(self, rid, **form):
+        app.attach_agent_to_lab(rid, dict({"agent": "alpha", "custom_prompt": "Address h1 and h2."}, **form))
+
+    def back_to_ready(self, rid):
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid].get("agent_done") and app.TOPO_RUNS[rid]["state"] == "ready"))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+
+    def destroys(self):
+        return [c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"]
+
+    def test_attach_runs_the_agent_then_hands_the_lab_back(self):
+        rid = self.scratch_lab()
+        self.attach(rid)
+        self.back_to_ready(rid)
+        r = app.TOPO_RUNS[rid]
+        self.assertEqual(len(self.turns), 1)
+        name, chat, msg = self.turns[0]
+        self.assertEqual((name, chat), ("alpha", f"vmtopo-{rid}"))
+        self.assertTrue(msg.startswith("Address h1 and h2."))
+        self.assertIn("./vmrun-h1", msg)
+        self.assertEqual(self.detached, ["alpha"])
+        self.assertFalse(self.destroys(), "the lab is still yours: not torn down when the agent finishes")
+        self.assertTrue(app.topo_run_dir(rid).exists())
+        self.assertEqual(r["agent_model"], f"ollama/{app.DEFAULT_MODEL}")
+        self.assertEqual(app.load_model_evidence()[r["agent_model"]]["turns"], 1)
+        self.assertFalse(app.topo_run_view(r)["agent_holds"])
+
+    def test_reattaching_continues_the_same_conversation(self):
+        rid = self.scratch_lab()
+        self.attach(rid)
+        self.back_to_ready(rid)
+        self.attach(rid, custom_prompt="Now add a route.")
+        self.back_to_ready(rid)
+        self.assertEqual([t[1] for t in self.turns], [f"vmtopo-{rid}"] * 2)
+
+    def test_interactive_session_on_an_existing_lab(self):
+        rid = self.scratch_lab()
+        self.attach(rid, interactive=True)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "attached"))
+        app.send_topo_followup(rid, "and ping h2")
+        self.assertTrue(wait_for(lambda: len(self.turns) == 2))
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "attached"))
+        app.end_topo_session(rid)
+        self.back_to_ready(rid)
+        self.assertFalse(self.destroys())
+
+    def test_using_the_labs_task_scores_it_and_stays_ready(self):
+        rid = self.scratch_lab(task_id="s1h2-connectivity")
+        self.attach(rid, custom_prompt=None, use_task=True)
+        self.back_to_ready(rid)
+        r = app.TOPO_RUNS[rid]
+        self.assertTrue(r["score"]["passed"])
+        task = app.vr.get_topology_task("s1h2-connectivity")
+        self.assertTrue(self.turns[0][2].startswith(task["prompt"]))
+
+    def test_a_resumed_lab_can_get_an_agent(self):
+        rid = self.scratch_lab()
+        app.save_topo_lab(rid)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "saved"))
+        app.resume_topo_lab(rid)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+        self.attach(rid)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "working" or self.turns))
+        self.back_to_ready(rid)
+        self.assertEqual(len(self.turns), 1)
+        app.save_topo_lab(rid)                      # and it can be saved again afterwards
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "saved"))
+
+    def test_stop_while_the_agent_works_is_the_usual_stop(self):
+        for keep, destroyed in ((False, 1), (True, 0)):
+            with self.subTest(keep=keep):
+                self.calls.clear()
+                rid = self.scratch_lab(keep=keep)
+                self.attach(rid, interactive=True)
+                self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "attached"))
+                app.stop_topo_run(rid)
+                self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "stopped"))
+                for t in set(threading.enumerate()) - self._threads_before:
+                    t.join(timeout=8)
+                self.assertEqual(len(self.destroys()), destroyed)
+
+    def test_validation(self):
+        app.update_vmb_settings({"max_concurrent": 6})           # room for two 3-node labs at once
+        rid = self.scratch_lab(task_id="s1h2-connectivity")
+        bad = [({}, "no prompt"), ({"agent": ""}, "no agent"), ({"agent": "nope"}, "unknown agent"),
+               ({"use_task": True}, "task and prompt together"),
+               ({"custom_prompt": "x" * (app.VM_PROMPT_MAX + 1)}, "too long")]
+        for form, why in bad:
+            with self.subTest(why):
+                full = dict({"agent": "alpha", "custom_prompt": None if why == "no prompt" else "x"}, **form)
+                with self.assertRaises((ValueError, KeyError)):
+                    app.attach_agent_to_lab(rid, full)
+        self.down = {"beta"}
+        with self.assertRaises(ValueError):
+            self.attach(rid, agent="beta")                       # not running
+        self.attach(rid, interactive=True)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "attached"))
+        with self.assertRaises(ValueError):
+            self.attach(rid)                                     # an agent is already at work here
+        rid2 = self.scratch_lab()
+        with self.assertRaises(ValueError):
+            self.attach(rid2)                                    # alpha is busy in the other lab
+        app.end_topo_session(rid)
+        self.back_to_ready(rid)
+        (app.topo_run_dir(rid2) / "Vagrantfile").unlink()
+        with self.assertRaises(ValueError):
+            self.attach(rid2)                                    # VMs gone
+        with self.assertRaises(KeyError):
+            app.attach_agent_to_lab("deadbeef", {"agent": "alpha", "custom_prompt": "x"})
+
+
 class TaskWithAgentTests(VmTopoBase):
     def test_agent_must_exist_and_be_running(self):
         with self.assertRaises(KeyError):

@@ -173,7 +173,7 @@ async function loadVTDetail() {
   const canScore = r.task_id && ["ready", "working", "attached", "done"].includes(r.state);
   const canStop = live || r.state === "ready";
   const canDelete = !live && r.state !== "saving";
-  const canSave = r.has_vms && ["ready", "done", "stopped"].includes(r.state) && !(r.state === "ready" && r.agent && !r.resumed);
+  const canSave = r.has_vms && ["ready", "done", "stopped"].includes(r.state) && !(r.state === "ready" && r.agent_holds);
   const labAction = (what, label) => async () => {
     try { await api(`/api/vmtopo/runs/${r.id}/${what}`, {}); vtSig.runs = ""; vtSig.detail = ""; vtLoad(); }
     catch (e) { alert(`${label}: ${e.message}`); }
@@ -211,6 +211,7 @@ async function loadVTDetail() {
     `Saved ${r.saved_at ? new Date(r.saved_at * 1000).toLocaleString() : ""}. Its VMs are suspended to disk and hold no VM slots; Resume restores them exactly as they were, including addresses, routes and rules you set. Delete destroys them.`));
   if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
   parts.push(...nodeRows);
+  if (r.state === "ready" && r.has_vms && !r.agent_holds) parts.push(vtAttachBox(r));
   if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "lab"));
   if (r.interactive && ["attached", "working"].includes(r.state))
     parts.push(sessionBox(r, "/api/vmtopo/runs", "lab", () => { vtSig.detail = ""; vtLoad(); }));
@@ -221,4 +222,39 @@ async function loadVTDetail() {
   parts.push(h("div", { class: "hint" }, "Live transcript:"));
   parts.push(h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)"));
   replaceKeepingFocus(VT.detail, parts);
+}
+
+/* Attach an agent to a lab that already exists (one you built yourself, or saved and resumed). When it's done the lab
+   is "ready" again; attaching the same agent again continues the lab's conversation. */
+function vtAttachBox(r) {
+  const draftKey = `attach/${r.id}`;
+  const agents = state.instances.filter(i => i.status === "healthy");
+  const sel = h("select", {}, h("option", { value: "" }, agents.length ? "Choose an agent..." : "No running agents"),
+    ...agents.map(i => h("option", { value: i.name, selected: i.name === r.agent }, `${i.name} · ${i.modelId} · ${evidenceText(i.evidence)}`)));
+  const prompt = h("textarea", { class: "al followup", placeholder: "What should the agent do in this lab? e.g. Route between h1 and h2 through r1, then prove it with ping and traceroute." });
+  prompt.value = vbDrafts[draftKey] || "";
+  prompt.addEventListener("input", () => { vbDrafts[draftKey] = prompt.value; });
+  const useTask = h("input", { type: "checkbox" });
+  useTask.addEventListener("change", () => { prompt.hidden = useTask.checked; });
+  const interactive = h("input", { type: "checkbox" });
+  const msg = h("div", { class: "fail" });
+  const go = h("button", { class: "primary", onclick: async () => {
+    msg.textContent = "";
+    if (!sel.value) { msg.textContent = "Choose the agent to attach."; return; }
+    if (!useTask.checked && !prompt.value.trim()) { msg.textContent = "Write what the agent should do."; prompt.focus(); return; }
+    if (!confirmAgentModels([sel.value])) return;
+    try {
+      await api(`/api/vmtopo/runs/${r.id}/attach`, { agent: sel.value, custom_prompt: useTask.checked ? null : prompt.value,
+                                                     use_task: useTask.checked, interactive: interactive.checked });
+      delete vbDrafts[draftKey]; vtSig.runs = ""; vtSig.detail = ""; vtLoad();
+    } catch (e) { msg.textContent = e.message; }
+  } }, "Attach agent");
+  return h("div", { class: "col bench" },
+    h("b", {}, "Attach an agent to this lab"),
+    h("p", { class: "hint" }, `The agent gets commands for every node and works in the lab as it is now${r.resumed ? ", including what you saved" : ""}. When it's done, the lab is yours again${r.agent ? `; attaching ${r.agent} again continues its conversation about this lab` : ""}.`),
+    h("div", { class: "row" }, "Agent", sel),
+    r.task_id ? h("label", { class: "row" }, useTask, `use the lab's task instead (${r.task_title}; scored when the agent is done)`) : null,
+    prompt,
+    h("label", { class: "row" }, interactive, "interactive session"),
+    msg, h("div", { class: "row" }, go));
 }

@@ -1424,10 +1424,10 @@ TOPO_RELAY_FILES = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm
 
 
 def agent_holds_lab(r, agent):
-    """Is `agent` attached to (or about to work in) this lab? A resumed lab still names the agent that once worked in
-    it, for its conversation, but the agent has no access to it any more."""
+    """Is `agent` attached to (or about to work in) this lab? A resumed lab, or one an attached agent has finished
+    with, still names that agent, for its conversation, but the agent has no access to it any more."""
     return r.get("agent") == agent and r["state"] in TOPO_OCCUPYING_STATES and r["state"] not in ("saving", "resuming") \
-        and not r.get("resumed")
+        and not r.get("resumed") and not r.get("agent_done")
 
 
 def stop_topo_runs_for(agent_name):
@@ -1490,7 +1490,8 @@ def topo_run_view(r, full=False):
     v["interactive"] = bool(r.get("interactive"))
     v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
     v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
-    v.update({k: r.get(k) for k in ("saved_at", "resumed")})
+    v.update({k: r.get(k) for k in ("saved_at", "resumed", "agent_done")})
+    v["agent_holds"] = bool(r.get("agent")) and agent_holds_lab(r, r["agent"])
     if full:
         v["transcript"] = r.get("vm_log", "")[-20000:]
         if r.get("agent") and r.get("chat"):
@@ -1679,54 +1680,9 @@ def topo_run_runner(rid):
             return
         if stopped():
             return finish("stopped", "stopped before the agent's turn")
-        r["state"] = "working"
-        save_topo_run(r)
-        topo_log(r, f"attaching {r['agent']} to this lab...")
-        key_text = priv.read_text()
-        dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
-           "mkdir -p /home/node/.openclaw/workspace/.vmkey-topo && "
-           "cat > /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519 && "
-           "chmod 600 /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", input=key_text, timeout=20)
-        for name in r["nodes"]:
-            relay_port = vr.relay_port_for_node(topology, name)
-            wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", relay_port,
-                                      "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log")
-            dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
-               f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
-               input=wrapper, timeout=20)
-        relay_cmd = vr.relay_command(topology, node_ports)
-        env = dict(os.environ, VM_RELAY_TOPO_CMD=relay_cmd)
-        rc, out, err = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
-                           *TOPO_RELAY_FILES, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
-        if rc != 0:
-            detach_topo_agent(r["agent"])
-            return finish("error", "could not attach the agent's lab relay (see transcript)")
-        node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} '<command>'" for name in r["nodes"])
-        prompt = (
-            f"{task['prompt'] if task else r['custom_prompt']}\n\n"
-            "This lab has these nodes, each reachable with its own command run from your current working "
-            f"directory (e.g. ./vmrun-h1 'ip addr'):\n{node_lines}\n\n"
-            + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n\n"
-            "Every node's first network interface is for setup only (already configured - leave it alone); its "
-            "other interfaces are the lab links, with no address until you (or the task) configure them. A "
-            "'switch' node is already working as a plain Ethernet switch and needs no configuration."
-            + ("\n\nYour user may send you more guidance in this conversation after you reply; the lab stays "
-               "available to you until they end the session." if r.get("interactive") else "")
-        )
-        topo_agent_turn(r, prompt)
-        if r.get("interactive"):
-            agent_session_loop(r, stopped, TOPO_FOLLOWUPS, TOPO_END, lambda line: topo_log(r, line),
-                               lambda: save_topo_run(r), lambda m: topo_agent_turn(r, m), TOPO_FOLLOWUP_REMINDER)
-        topo_log(r, f"detaching {r['agent']} from this lab...")
-        detach_topo_agent(r["agent"])
-
-        if task and task.get("check") and not stopped():
-            r["state"] = "scoring"
-            save_topo_run(r)
-            topo_log(r, "scoring...")
-            r["score"] = score_run(node_ports[task["check_node"]], priv, task)
-            save_topo_run(r)
-            topo_log(r, f"score: {'PASS' if r['score']['passed'] else 'FAIL'}\n{r['score']['output']}")
+        err = topo_agent_phase(r, topology, node_ports, priv, task, stopped)
+        if err:
+            return finish("error", err)
         finish("stopped" if stopped() else "done", r.get("reason", ""))
     except Exception as e:  # noqa
         finish("error", str(e))
@@ -1756,6 +1712,62 @@ def topo_run_runner(rid):
                     pass
             shutil.rmtree(d, ignore_errors=True)
         TOPO_STOP.pop(rid, None)
+
+
+def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
+    """Attach r["agent"] to the lab, give it its prompt (the task's, or r["custom_prompt"]), run its turn (and the
+    interactive session, if any), detach it, and score the task if it has a check. Shared by a lab created with an
+    agent (topo_run_runner) and an agent attached to a lab that already exists (topo_attach_runner).
+    Returns an error message if the agent couldn't be attached, else None."""
+    r["state"] = "working"
+    save_topo_run(r)
+    topo_log(r, f"attaching {r['agent']} to this lab...")
+    key_text = priv.read_text()
+    dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
+       "mkdir -p /home/node/.openclaw/workspace/.vmkey-topo && "
+       "cat > /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519 && "
+       "chmod 600 /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", input=key_text, timeout=20)
+    for name in r["nodes"]:
+        relay_port = vr.relay_port_for_node(topology, name)
+        wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", relay_port,
+                                  "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log")
+        dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
+           f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
+           input=wrapper, timeout=20)
+    relay_cmd = vr.relay_command(topology, node_ports)
+    env = dict(os.environ, VM_RELAY_TOPO_CMD=relay_cmd)
+    rc, out, err = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
+                       *TOPO_RELAY_FILES, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
+    if rc != 0:
+        detach_topo_agent(r["agent"])
+        return "could not attach the agent's lab relay (see transcript)"
+    node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} '<command>'" for name in r["nodes"])
+    prompt = (
+        f"{task['prompt'] if task else r['custom_prompt']}\n\n"
+        "This lab has these nodes, each reachable with its own command run from your current working "
+        f"directory (e.g. ./vmrun-h1 'ip addr'):\n{node_lines}\n\n"
+        + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n\n"
+        "Every node's first network interface is for setup only (already configured - leave it alone); its "
+        "other interfaces are the lab links, with no address until you (or the task) configure them. A "
+        "'switch' node is already working as a plain Ethernet switch and needs no configuration."
+        + ("\n\nYour user may send you more guidance in this conversation after you reply; the lab stays "
+           "available to you until they end the session." if r.get("interactive") else "")
+    )
+    topo_agent_turn(r, prompt)
+    if r.get("interactive"):
+        agent_session_loop(r, stopped, TOPO_FOLLOWUPS, TOPO_END, lambda line: topo_log(r, line),
+                           lambda: save_topo_run(r), lambda m: topo_agent_turn(r, m), TOPO_FOLLOWUP_REMINDER)
+    topo_log(r, f"detaching {r['agent']} from this lab...")
+    detach_topo_agent(r["agent"])
+
+    if task and task.get("check") and not stopped():
+        r["state"] = "scoring"
+        save_topo_run(r)
+        topo_log(r, "scoring...")
+        r["score"] = score_run(node_ports[task["check_node"]], priv, task)
+        save_topo_run(r)
+        topo_log(r, f"score: {'PASS' if r['score']['passed'] else 'FAIL'}\n{r['score']['output']}")
+    return None
 
 
 def detach_topo_agent(agent):
@@ -1856,7 +1868,7 @@ def save_topo_lab(rid):
         raise KeyError("unknown run")
     if r["state"] not in TOPO_SAVABLE_STATES:
         raise ValueError("only a lab that's ready, done or stopped can be saved (end any session first)")
-    if r["state"] == "ready" and r.get("agent") and not r.get("resumed"):
+    if r["state"] == "ready" and r.get("agent") and agent_holds_lab(r, r["agent"]):
         raise ValueError("an agent is about to start working in this lab")
     if not (topo_run_dir(rid) / "Vagrantfile").exists():
         raise ValueError("this lab's VMs are gone, so there's nothing to save")
@@ -1948,6 +1960,75 @@ def topo_resume_runner(rid):
     finally:
         save_topo_run(r)
         TOPO_STOP.pop(rid, None)
+
+
+# ---------------------------------------------------------------- attach an agent to a lab that already exists
+# A lab you built yourself, or one you saved and resumed, can get an agent later: same prompt / catalog task /
+# interactive session as at creation. When the agent is done the lab goes back to "ready" - it's still your lab -
+# instead of finishing. Re-attaching the same agent continues the lab's conversation, so it remembers its earlier work.
+def attach_agent_to_lab(rid, form):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] != "ready" or (r.get("agent") and agent_holds_lab(r, r["agent"])):
+        raise ValueError("an agent can only be attached to a lab that's ready, with no agent at work in it")
+    d = topo_run_dir(rid)
+    if not (d / "Vagrantfile").exists() or not (d / "id_ed25519").exists():
+        raise ValueError("this lab's VMs are gone")
+    agent = str(form.get("agent") or "").strip().lower()
+    if not agent:
+        raise ValueError("pick the agent to attach")
+    meta = load_meta(agent)                        # raises KeyError if unknown
+    if not agent_running(agent):
+        raise ValueError(f"{agent} is not running; start it first")
+    busy = [x for x in TOPO_RUNS.values() if x["id"] != rid and agent_holds_lab(x, agent)]
+    if busy:
+        raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
+    prompt = str(form.get("custom_prompt") or "").strip() or None
+    use_task = bool(form.get("use_task")) and bool(r.get("task_id"))
+    if not prompt and not use_task:
+        raise ValueError("write a prompt for the agent" + (", or use the lab's task" if r.get("task_id") else ""))
+    if prompt and use_task:
+        raise ValueError("use the lab's task or write your own prompt, not both")
+    if prompt and len(prompt) > VM_PROMPT_MAX:
+        raise ValueError(f"the prompt is too long (max {VM_PROMPT_MAX} characters)")
+    r.update(agent=agent, agent_model=agent_model_id(meta), chat=f"vmtopo-{rid}", custom_prompt=prompt,
+             attach_task=use_task, interactive=bool(form.get("interactive")), idle_since=None, agent_done=False,
+             resumed=False, agent_turns=0, agent_turns_with_commands=0, agent_commands=0, state="working", reason="")
+    save_topo_run(r)
+    topo_log(r, f"attaching {agent} ({r['agent_model']}) to this existing lab...")
+    threading.Thread(target=topo_attach_runner, args=(rid,), daemon=True).start()
+
+
+def topo_attach_runner(rid):
+    r = TOPO_RUNS[rid]
+    d = topo_run_dir(rid)
+    topology = vr.get_topology(r["topology_id"]) if r["topology_id"] else r["topology"]
+    task = vr.get_topology_task(r["task_id"]) if r.get("attach_task") and r.get("task_id") else None
+    node_ports = {name: node["ssh_port"] for name, node in r["nodes"].items()}
+
+    def stopped():
+        return TOPO_STOP.get(rid, False)
+
+    try:
+        err = topo_agent_phase(r, topology, node_ports, d / "id_ed25519", task, stopped)
+        r["reason"] = err or ""
+    except Exception as e:  # noqa
+        r["reason"] = f"the agent run failed: {e}"
+        detach_topo_agent(r["agent"])
+    finally:
+        TOPO_FOLLOWUPS.pop(rid, None)
+        TOPO_END.pop(rid, None)
+        try:
+            record_model_evidence(r)
+        except Exception:  # noqa
+            pass
+        was_stopped = TOPO_STOP.pop(rid, False)
+        r.update(state="ready", agent_done=True)
+        save_topo_run(r)
+        topo_log(r, f"{r['agent']} is detached; the lab is yours again.")
+        if was_stopped:
+            stop_topo_run(rid)          # a Stop while the agent worked: the usual Stop for a ready lab
 
 
 def delete_topo_run(rid):
@@ -2712,6 +2793,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(send_topo_followup(parts[3], b.get("text")))
                 if parts[4] == "save":
                     save_topo_lab(parts[3])
+                    return self.send_json({"ok": True})
+                if parts[4] == "attach":
+                    attach_agent_to_lab(parts[3], b)
                     return self.send_json({"ok": True})
                 if parts[4] == "resume":
                     resume_topo_lab(parts[3])
