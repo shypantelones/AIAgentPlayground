@@ -300,6 +300,7 @@ class LabSessionTests(VmTopoBase):
         rid = self.open_session()
         self.assertIn("more guidance", self.turns[0][1])
         self.assertIn("./vmrun-h1", self.turns[0][1])
+        self.assertIn("ready. Your own prompt", app.TOPO_RUNS[rid]["vm_log"])
         self.assertEqual(self.detached, [], "the agent keeps its lab access while the session is open")
         self.assertIsNotNone(app.topo_run_view(app.TOPO_RUNS[rid])["idle_deadline"])
 

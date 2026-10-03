@@ -1541,7 +1541,8 @@ def topo_run_runner(rid):
         r["state"] = "ready"
         save_topo_run(r)
         task = vr.get_topology_task(r["task_id"]) if r["task_id"] else None
-        topo_log(r, "ready." + (f" Task: {task['title']}" if task else " No task attached: open a terminal on any node to use this lab directly."))
+        topo_log(r, "ready." + (f" Task: {task['title']}" if task else " Your own prompt for the agent." if r.get("custom_prompt")
+                                else " No task attached: open a terminal on any node to use this lab directly."))
 
         if not r["agent"]:
             # No agent attached: this lab is for YOU - open terminals, do the task (if any), then use "Score now"
