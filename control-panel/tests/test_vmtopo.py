@@ -587,6 +587,9 @@ class InstantStopTests(VmTopoBase):
         for t in set(threading.enumerate()) - self._threads_before:
             t.join(timeout=8)
         self.assertIn(("destroy_after_cancel",), self.calls)
+        self.assertFalse([c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"],
+                         "already torn down after the cancel; the runner's cleanup must not destroy a second time")
+        self.assertFalse(app.topo_run_dir(rid).exists(), "the run folder (Vagrantfile, SSH key) is still removed")
 
     def test_stop_while_waiting_for_ssh_stops_instead_of_erroring(self):
         waits = []

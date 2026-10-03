@@ -953,6 +953,7 @@ def vm_run_runner(rid):
         return VM_STOP.get(rid, False)
 
     finished = False                # set only when THIS thread ends the run (see the teardown in `finally`)
+    torn_down = False               # set when a failed or stopped build was already destroyed below
 
     def finish(state, reason):
         nonlocal finished
@@ -992,9 +993,11 @@ def vm_run_runner(rid):
         if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
             vm_log(r, "stopping: tearing down the half-built VM...")
             vr.destroy_after_cancel(d, timeout=120)
+            torn_down = True
             return finish("stopped", "stopped during setup")
         if rc != 0:
             vr.vagrant(d, "destroy", "-f", timeout=120)
+            torn_down = True
             return finish("error", "failed to start the VM (see transcript)")
         vm_log(r, "waiting for the VM to accept SSH...")
         if not vr.ssh_wait(port, priv, tries=60, delay=2, cancel=stopped):
@@ -1075,10 +1078,11 @@ def vm_run_runner(rid):
         # Go by `finished`, not r["state"]: stop_vm_run() can tear a "ready" run down and mark it "stopped" between
         # that early return and this block, and checking the state would then destroy it a second time.
         if finished and not r.get("keep"):
-            try:
-                vr.vagrant(d, "destroy", "-f", timeout=120)
-            except Exception:
-                pass
+            if not torn_down:
+                try:
+                    vr.vagrant(d, "destroy", "-f", timeout=120)
+                except Exception:
+                    pass
             shutil.rmtree(d, ignore_errors=True)
         VM_STOP.pop(rid, None)
 
@@ -1479,6 +1483,7 @@ def topo_run_runner(rid):
         return TOPO_STOP.get(rid, False)
 
     finished = False                # set only when THIS thread ends the run (see the teardown in `finally`)
+    torn_down = False               # set when a failed or stopped build was already destroyed below
 
     def finish(state, reason):
         nonlocal finished
@@ -1536,10 +1541,12 @@ def topo_run_runner(rid):
         if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
             topo_log(r, "stopping: tearing down the half-built lab...")
             vr.destroy_after_cancel(d, timeout=180)
+            torn_down = True
             return finish("stopped", "stopped during setup")
         if rc != 0:
             topo_log(r, (out or err)[-2000:])
             vr.vagrant(d, "destroy", "-f", timeout=180)
+            torn_down = True
             return finish("error", "failed to start the lab (see transcript)")
         topo_log(r, "waiting for every node to accept SSH...")
         for name, port in node_ports.items():
@@ -1627,10 +1634,11 @@ def topo_run_runner(rid):
         # Go by `finished`, not r["state"]: stop_topo_run() can tear a "ready" run down and mark it "stopped" between
         # that early return and this block, and checking the state would then destroy it a second time.
         if finished and not r.get("keep"):
-            try:
-                vr.vagrant(d, "destroy", "-f", timeout=180)
-            except Exception:
-                pass
+            if not torn_down:
+                try:
+                    vr.vagrant(d, "destroy", "-f", timeout=180)
+                except Exception:
+                    pass
             shutil.rmtree(d, ignore_errors=True)
         TOPO_STOP.pop(rid, None)
 

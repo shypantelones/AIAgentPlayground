@@ -204,6 +204,9 @@ class InstantStopTests(VmBenchBase):
         for t in set(threading.enumerate()) - self._threads_before:
             t.join(timeout=8)
         self.assertIn(("destroy_after_cancel",), self.calls)
+        self.assertFalse([c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"],
+                         "already torn down after the cancel; the runner's cleanup must not destroy a second time")
+        self.assertFalse(app.vm_run_dir(rid).exists(), "the run folder (Vagrantfile, SSH key) is still removed")
 
     def test_build_progress_is_streamed_into_the_transcript(self):
         rid = app.create_vm_run({})
