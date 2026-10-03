@@ -90,3 +90,5 @@ select{max-width:100%}
 .bench th{color:var(--mute);font-weight:600}
 .bench tbody tr{cursor:pointer}.bench tbody tr:hover,.bench tbody tr:focus{background:var(--agent);outline:none}
 .bench td.num{font-variant-numeric:tabular-nums}
+/* `hidden` must win over the flex/grid display rules above (.row, .col ...), or toggled sections stay visible */
+[hidden]{display:none!important}

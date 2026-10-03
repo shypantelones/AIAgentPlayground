@@ -155,7 +155,8 @@ function buildVBDialog() {
     h("div", { class: "col" }, h("div", { class: "row" }, "Task", VB.newTask), VB.newTaskInfo, VB.newPrompt,
       h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
       h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VB.newAgents,
-      h("label", { class: "row" }, VB.newInteractive, "interactive session: keep the agent attached after its first reply so you can send it more guidance (ends when you press End session, or after 2 hours with no new message)"),
+      h("label", { class: "row" }, VB.newInteractive, "interactive session"),
+      h("div", { class: "hint" }, "The agent stays attached after its first reply so you can send it more guidance. It ends when you press End session, or after 2 hours with no new message."),
       h("label", { class: "row" }, VB.newKeep, "keep this VM running afterward, for later inspection"),
       VB.newMsg, h("div", { class: "row" }, create)),
     h("h4", {}, "Runs"), VB.runsBox, VB.detail);
