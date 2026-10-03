@@ -1759,6 +1759,10 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         "Every node's first network interface is for setup only (already configured - leave it alone); its "
         "other interfaces are the lab links, with no address until you (or the task) configure them. A "
         "'switch' node is already working as a plain Ethernet switch and needs no configuration."
+        + ("\n\nRouter nodes run FRR with the OSPF, OSPFv3 and BGP daemons available but not configured. Configure "
+           "them with vtysh, for example: ./vmrun-r1 <<'EOF'\nvtysh -c 'configure terminal' -c 'router ospf' "
+           "-c 'network 10.0.0.0/30 area 0'\nvtysh -c 'show ip ospf neighbor'\nEOF\n"
+           "Static routes with `ip route` work too." if any(n["role"] == "router" for n in r["nodes"].values()) else "")
         + ("\n\nYour user may send you more guidance in this conversation after you reply; the lab stays "
            "available to you until they end the session." if r.get("interactive") else "")
     )

@@ -286,6 +286,9 @@ sec forwarding; sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding 2>/dev/n
 if command -v bridge >/dev/null; then sec bridge; bridge link 2>/dev/null; echo "# vlans"; bridge vlan show 2>/dev/null; fi
 if command -v nft >/dev/null; then sec nftables; sudo -n nft list ruleset 2>&1; fi
 if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save 2>&1 | grep -v '^#'; fi
+if command -v vtysh >/dev/null; then
+  sec frr; sudo -n vtysh -c 'show running-config' 2>&1 | grep -v -e '^Building configuration' -e '^Current configuration:'
+fi
 for f in /etc/netplan/*.yaml /etc/frr/frr.conf /etc/frr/daemons /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf          /etc/nginx/sites-enabled/* /etc/nginx/streams-enabled/*; do
   [ -f "$f" ] && { sec "file $f"; sudo -n cat "$f" 2>&1; }
 done
@@ -329,6 +332,8 @@ APPLY_FILE_RE = re.compile(r"^/etc/(nginx|frr)/[A-Za-z0-9._/-]+$")     # service
 APPLY_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:/@%-]+$")                  # one word of an `ip` address/route
 APPLY_SYSCTL_RE = re.compile(r"^(net\.[a-z0-9_.]+) = (-?\d+)$")
 APPLY_SKIP_PROTOS = ("kernel", "dhcp", "ra")                           # routes the system creates on its own
+# routes a routing daemon (FRR) installs; they come back from its restored config, so they're not restored by hand
+DAEMON_PROTOS = ("ospf", "ospf6", "bgp", "isis", "rip", "ripng", "eigrp", "babel", "zebra", "static", "openfabric")
 
 
 def build_labfile(title, topology, configs, intents=None, source=None):
@@ -375,6 +380,10 @@ def parse_labfile(obj):
     return title, topology, {n: {s: t for s, t in secs.items() if s != "_error"} for n, secs in configs.items()}, intents
 
 
+def _route_proto(toks):
+    return toks[toks.index("proto") + 1] if "proto" in toks and toks.index("proto") + 1 < len(toks) else None
+
+
 def _usable(text):
     return text.strip() and not text.lstrip().startswith(("sudo:", "bash:")) and "command not found" not in text
 
@@ -410,8 +419,7 @@ def render_apply_script(sections):
         toks = line.split()
         if not toks or line.startswith("#") or toks[0] in ("broadcast", "local", "multicast", "anycast"):
             continue
-        if any(t in SETUP_IFACES for t in toks) or ("proto" in toks and toks.index("proto") + 1 < len(toks)
-                                                   and toks[toks.index("proto") + 1] in APPLY_SKIP_PROTOS):
+        if any(t in SETUP_IFACES for t in toks) or _route_proto(toks) in APPLY_SKIP_PROTOS + DAEMON_PROTOS:
             continue
         if not all(APPLY_TOKEN_RE.match(t) for t in toks):
             skipped.append(f"route: {line.strip()}")
@@ -428,10 +436,16 @@ def render_apply_script(sections):
     elif _usable(ipt):
         cmds.append(f"echo {b64(ipt)} | base64 -d | sudo -n iptables-restore")
     reload_nginx = restart_frr = False
+    frr = sections.get("frr", "")
+    if _usable(frr):                                      # FRR's running config: what was really in effect
+        cmds.append(f"sudo -n mkdir -p /etc/frr && echo {b64(frr)} | base64 -d | sudo -n tee /etc/frr/frr.conf >/dev/null")
+        restart_frr = True
     for sec, text in sections.items():
         if not sec.startswith("file "):
             continue
         path = sec[5:].strip()
+        if path == "/etc/frr/frr.conf" and _usable(frr):
+            continue                                      # the saved file can be stale; the running config wins
         if not APPLY_FILE_RE.match(path) or ".." in path:
             if not path.startswith("/etc/netplan/"):           # netplan is setup NIC config: deliberately not restored
                 skipped.append(f"file {path}")
@@ -460,8 +474,8 @@ def _compare_view(sec, text):
                 continue
             toks = [t for t in toks if not t.lower().startswith("fe80:")]
         elif sec == "routes":
-            if any(t in SETUP_IFACES for t in toks) or "fe80::/64" in toks:
-                continue
+            if any(t in SETUP_IFACES for t in toks) or "fe80::/64" in toks or _route_proto(toks) in DAEMON_PROTOS:
+                continue                                  # daemon-learned routes reconverge on their own time
         lines.append(" ".join(toks))
     return sorted(lines)
 
@@ -470,7 +484,7 @@ def config_mismatches(wanted, live):
     """Sections of a node's lab-file config that the rebuilt node doesn't match (addresses, routes, forwarding,
     firewall). [] means the rebuild is faithful."""
     out = []
-    for sec in ("addresses", "routes", "forwarding", "nftables"):
+    for sec in ("addresses", "routes", "forwarding", "nftables", "frr"):
         if sec in wanted and _usable(wanted[sec]) and _compare_view(sec, wanted[sec]) != _compare_view(sec, live.get(sec, "")):
             out.append(sec)
     return out
@@ -734,6 +748,14 @@ def build_custom_topology(counts, wiring, links=None):
     return validate_topology(topology)
 
 
+ROUTER_FRR_SETUP = """
+sed -i -E 's/^(ospfd|ospf6d|bgpd)=no/\\1=yes/' /etc/frr/daemons
+usermod -aG frrvty,frr bench
+systemctl enable frr
+systemctl restart frr
+"""
+
+
 def _topo_provision_script(role, pubkey_text):
     common = """#!/bin/bash
 set -e
@@ -781,11 +803,18 @@ ip link set br0 up
         # proxy config is pre-written - wiring a real backend pool is the task.
         pkgs = "nginx libnginx-mod-stream iproute2 iputils-ping tcpdump"
         extra = ""
+    elif role == "router":
+        # Same tooling as a host, plus FRR: zebra with the OSPF, OSPFv3 and BGP daemons enabled but NOT configured -
+        # no router-id, no networks, no neighbors - so routing protocols are available through `vtysh` and choosing
+        # what to run is the task. bench joins frrvty so `vtysh` works without sudo. Static routes with `ip route`
+        # still work exactly as before (zebra leaves kernel routes alone), so existing static-routing tasks are
+        # unchanged. Deliberately no pre-enabled ip_forward, same principle as a host.
+        pkgs = "iproute2 iputils-ping traceroute tcpdump iptables frr"
+        extra = ROUTER_FRR_SETUP
     else:
-        # host and router: enough tooling to assign addresses, add routes, and prove connectivity. Deliberately NO
-        # ufw lockdown and NO pre-enabled ip_forward (on router) - unlike the offline coding-task VMs above, this
-        # VM's whole point is reaching its neighbors, and enabling forwarding is literally part of the task.
-        pkgs = "iproute2 iputils-ping traceroute tcpdump" + (" iptables" if role == "router" else "")
+        # host: enough tooling to assign addresses, add routes, and prove connectivity. Deliberately NO ufw lockdown -
+        # unlike the offline coding-task VMs above, this VM's whole point is reaching its neighbors.
+        pkgs = "iproute2 iputils-ping traceroute tcpdump"
         extra = ""
     return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra)
 

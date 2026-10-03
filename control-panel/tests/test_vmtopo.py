@@ -942,6 +942,22 @@ class LabFileRunTests(VmTopoBase):
         self.assertTrue(self.applied, "configs were applied before the agent's turn")
 
 
+class RouterPromptTests(VmTopoBase):
+    def prompt_for(self, topology_id):
+        self.add_agent("alpha")
+        prompts = []
+        with mock.patch.object(app, "run_turn", lambda name, chat, msg, *a, **k: prompts.append(msg) or {"reply": "ok", "ok": True}):
+            rid = app.create_topo_run({"topology_id": topology_id, "agent": "alpha", "custom_prompt": "x"})
+            self.assertTrue(self.finished(rid))
+        return prompts[0]
+
+    def test_labs_with_routers_tell_the_agent_about_frr(self):
+        self.assertIn("vtysh", self.prompt_for("r2s2h2"))
+
+    def test_labs_without_routers_do_not(self):
+        self.assertNotIn("vtysh", self.prompt_for("s1h2"))
+
+
 class TaskWithAgentTests(VmTopoBase):
     def test_agent_must_exist_and_be_running(self):
         with self.assertRaises(KeyError):
