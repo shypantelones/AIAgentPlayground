@@ -775,6 +775,9 @@ VM_END = {}              # run id -> True once you end an interactive session (d
 VM_SESSION_IDLE_S = 2 * 3600      # an interactive session with no new message for this long ends by itself
 VM_SESSION_POLL_S = 1.0
 VM_PROMPT_MAX = 20_000
+# Appended to each follow-up: with a bare follow-up, a local model was seen to just describe the ./vmrun command it
+# would run instead of running it.
+VM_FOLLOWUP_REMINDER = "\n\n(Keep working on the VM with ./vmrun as before, and check the output before you reply.)"
 
 
 def stop_vm_runs_for(agent_name):
@@ -996,7 +999,8 @@ def vm_run_runner(rid):
             vr.ssh_run(port, priv, "chown -R bench:bench /home/bench/work", timeout=20)
         r["state"] = "ready"
         save_vm_run(r)
-        vm_log(r, "ready." + (f" Task: {task['title']}" if task else " No task attached: open a terminal to use this VM directly."))
+        vm_log(r, "ready." + (f" Task: {task['title']}" if task else " Your own prompt for the agent." if r.get("custom_prompt")
+                              else " No task attached: open a terminal to use this VM directly."))
 
         if not r["agent"]:
             # No agent attached: this VM is for YOU - open a terminal, do the task (if any), then use "Score now"
@@ -1115,7 +1119,7 @@ def vm_session_loop(r, stopped):
         r["state"] = "working"
         save_vm_run(r)
         vm_log(r, "you: " + (msg if len(msg) <= 500 else msg[:500] + "..."))
-        vm_agent_turn(r, msg)
+        vm_agent_turn(r, msg + VM_FOLLOWUP_REMINDER)
 
 
 def send_vm_followup(rid, text):

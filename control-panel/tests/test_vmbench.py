@@ -292,6 +292,7 @@ class AgentSessionTests(VmBenchBase):
         self.assertTrue(msg.startswith("Install nginx and serve hello on port 80."))
         self.assertIn("./vmrun <<'EOF'", msg)
         self.assertNotIn("more guidance", msg)                   # not interactive
+        self.assertIn("Your own prompt", app.VM_RUNS[rid]["vm_log"])
         self.assertEqual(self.detached, ["alpha"])
         self.assertFalse(any(c[0] == "ssh_run" for c in self.calls), "no check script to run for a custom prompt")
         self.assertEqual(app.vm_run_view(r)["custom_prompt"], "Install nginx and serve hello on port 80.")
@@ -327,7 +328,8 @@ class AgentSessionTests(VmBenchBase):
         app.send_vm_followup(rid, "Use port 8080 instead.")
         self.assertTrue(wait_for(lambda: len(self.turns) == 2))
         self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
-        self.assertEqual(self.turns[1], (f"vmbench-{rid}", "Use port 8080 instead."))
+        self.assertEqual(self.turns[1], (f"vmbench-{rid}", "Use port 8080 instead." + app.VM_FOLLOWUP_REMINDER))
+        self.assertIn("./vmrun", app.VM_FOLLOWUP_REMINDER)
         self.assertEqual(self.turns[0][0], self.turns[1][0], "follow-ups continue the same conversation")
         self.assertIn("you: Use port 8080 instead.", app.VM_RUNS[rid]["vm_log"])
 
