@@ -57,6 +57,8 @@ async function buildLocalPicker(container, inst, name, msg, opts = {}) {
       : tc === "verified_working" ? "✓ Tested through OpenClaw: it reliably invokes tools here."
       : "Not tested through OpenClaw specifically: \"function calling\" above is the model's own general capability, not a guarantee it works with this harness. Untested models may still work; they just haven't been checked here yet."));
     if (e.note) lines.push(h("div", { class: "hint" }, e.note));
+    if (e.evidence) lines.push(h("div", { class: e.evidence.verdict === "unreliable" ? "fail" : e.evidence.verdict === "works" ? "pass" : "hint" },
+      `In VM Labs on this computer: ${evidenceText(e.evidence)}.`));
     if (!e.disk_ok) lines.push(h("div", { class: "fail" }, `Not enough free disk (${GB(m.free_disk_gb)} GB free; needs about ${GB(e.size_gb + 2)} GB including headroom).`));
     if (e.fit === "toobig") lines.push(h("div", { class: "fail" }, "This is unlikely to run on this computer."));
     if (e.fit === "partial") lines.push(h("div", { class: "hint" }, "Part of the model will sit in system RAM, so replies will be noticeably slower."));

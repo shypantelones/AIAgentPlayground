@@ -107,6 +107,7 @@ function vtBuildSection() {
       body.custom_prompt = VT.promptOn.checked ? (VT.customPrompt.value.trim() || null) : null;
     }
     try {
+      if (agents.length && !confirmAgentModels(agents)) return;
       if (agents.length > 1) await api("/api/vmtopo/benchmarks", { ...body, agents });
       else await api("/api/vmtopo/runs", { ...body, agent: agents[0] || null });
       vtSig.runs = ""; vtLoad();
@@ -127,7 +128,8 @@ function vtBuildSection() {
       h("label", { class: "row" }, VT.customOn, "build a custom topology instead"),
       custBuilder,
       taskRow, VT.newTaskInfo, promptRow, VT.customPrompt,
-      h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"), VT.newAgents,
+      h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
+      h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VT.newAgents,
       h("label", { class: "row" }, VT.newInteractive, "interactive session: keep the agent attached to every node after its first reply so you can send it more guidance (ends when you press End session, or after 2 hours with no new message)"),
       h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection"),
       VT.newMsg, h("div", { class: "row" }, create)),
@@ -153,7 +155,7 @@ function renderVTRuns() {
       grp.length > 1 ? h("div", { class: "hint" }, `Benchmark: ${grp[0].task_title || "task"} across ${grp.length} agents`) : null,
       ...sorted.map(r => h("div", { class: "sess" + (r.id === vtSelRun ? " sel" : ""), onclick: () => { vtSelRun = r.id; vtSig.detail = ""; vtLoad(); } },
         h("span", { class: "chip " + r.state }, VB_STATE_LABEL[r.state] || r.state),
-        ` ${r.topology_title} — ${r.agent ? r.agent : "(no agent)"}${r.task_title ? " — " + r.task_title : r.custom_prompt ? " — your prompt" : " — scratch lab"}${r.interactive ? " (session)" : ""} `,
+        ` ${r.topology_title} — ${r.agent ? r.agent + (r.agent_model ? ` (${r.agent_model})` : "") : "(no agent)"}${r.task_title ? " — " + r.task_title : r.custom_prompt ? " — your prompt" : " — scratch lab"}${r.interactive ? " (session)" : ""} `,
         h("span", { class: "status" }, `${vtElapsed(r)}${r.score ? " · " + (r.score.passed ? "PASS" : "FAIL") : ""}`))));
   }));
 }
@@ -191,7 +193,7 @@ async function loadVTDetail() {
     h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), scoreBtn, stopBtn, delBtn)];
   const taskDesc = r.task_title ? " · task: " + r.task_title
     : r.custom_prompt ? " · custom prompt (no automated score)" : " · no task (scratch lab)";
-  parts.push(h("div", { class: "hint" }, `${r.topology_title}${taskDesc}${r.agent ? " · agent: " + r.agent : " · no agent attached"}${r.interactive ? " · interactive session" : ""} · started ${vtFmtTime(r.started)} · elapsed ${vtElapsed(r)}`));
+  parts.push(h("div", { class: "hint" }, `${r.topology_title}${taskDesc}${r.agent ? ` · agent: ${r.agent} (${r.agent_model || "?"})` : " · no agent attached"}${r.agent_turns ? ` · ran ${r.agent_commands ?? "?"} commands in ${r.agent_turns} turn${r.agent_turns === 1 ? "" : "s"}` : ""}${r.interactive ? " · interactive session" : ""} · started ${vtFmtTime(r.started)} · elapsed ${vtElapsed(r)}`));
   if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
   parts.push(...nodeRows);
   if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "lab"));

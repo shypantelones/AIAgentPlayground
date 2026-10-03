@@ -34,6 +34,7 @@ class VmTopoBase(unittest.TestCase):
             # the next real server restart.
             mock.patch.object(app, "VMR_DIR", self.tmp / "vm-runs"),
             mock.patch.object(app, "VMB_SETTINGS_FILE", self.tmp / "vmbench-settings.json"),
+            mock.patch.object(app, "MODEL_EVIDENCE_FILE", self.tmp / "model-evidence.json"),
             mock.patch.object(app, "VM_RUNS", {}),
             mock.patch.object(app, "TOPO_RUNS", {}),
             mock.patch.object(app, "TOPO_STOP", {}),
@@ -399,6 +400,25 @@ class LabSessionTests(VmTopoBase):
             t.join(timeout=5)
         self.assertEqual(app.TOPO_RUNS["abcd1234"]["state"], "interrupted")
         self.assertEqual(self.detached, ["alpha"])
+
+
+class LabModelEvidenceTests(VmTopoBase):
+    def test_lab_turns_are_counted_from_the_lab_session_log(self):
+        self.add_agent("alpha")
+        logs = []
+
+        def count(agent, log):
+            logs.append(log)
+            return 5 if len(logs) % 2 == 0 else 2       # 3 commands in the turn
+        with mock.patch.object(app, "count_vm_commands", count):
+            rid = app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "address the hosts"})
+            self.assertTrue(self.finished(rid))
+            for t in set(threading.enumerate()) - self._threads_before:
+                t.join(timeout=8)
+        self.assertEqual(set(logs), {"vm-session-topo.log"})
+        e = app.load_model_evidence()[app.TOPO_RUNS[rid]["agent_model"]]
+        self.assertEqual((e["runs"], e["turns"], e["turns_with_commands"]), (1, 1, 1))
+        self.assertEqual(app.topo_run_view(app.TOPO_RUNS[rid])["agent_commands"], 3)
 
 
 class TaskWithAgentTests(VmTopoBase):

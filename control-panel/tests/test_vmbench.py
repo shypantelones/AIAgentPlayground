@@ -27,6 +27,7 @@ class VmBenchBase(unittest.TestCase):
             mock.patch.object(app, "VMR_DIR", self.tmp / "vm-runs"),
             mock.patch.object(app, "TOPOR_DIR", self.tmp / "topo-runs"),  # defense in depth; see topo_log() in app.py
             mock.patch.object(app, "VMB_SETTINGS_FILE", self.tmp / "vmbench-settings.json"),
+            mock.patch.object(app, "MODEL_EVIDENCE_FILE", self.tmp / "model-evidence.json"),
             mock.patch.object(app, "VM_RUNS", {}),
             mock.patch.object(app, "VM_STOP", {}),
             mock.patch.object(app, "VM_FOLLOWUPS", {}),
@@ -460,6 +461,77 @@ class AgentSessionTests(VmBenchBase):
             t.join(timeout=5)
         self.assertEqual(app.VM_RUNS["abcd1234"]["state"], "interrupted")
         self.assertEqual(self.detached, ["alpha"])
+
+
+class ModelEvidenceTests(VmBenchBase):
+    """Every agent turn in a VM run is counted (did the agent run any ./vmrun commands?) and folded into its model's
+    totals when the run ends, so the panel can show which models really drive the VMs and warn about the others."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_agent("alpha")                     # local agent: model falls back to DEFAULT_MODEL
+        self.counts = iter([])
+        self.real_count = app.count_vm_commands
+        p = mock.patch.object(app, "count_vm_commands", lambda agent, log: next(self.counts, 0))
+        p.start()
+        self.patches.append(p)
+
+    def run_once(self, counts, **form):
+        self.counts = iter(counts)                  # (before, after) per turn
+        rid = app.create_vm_run(dict({"agent": "alpha", "task_id": "fizzbuzz-cli"}, **form))
+        self.assertTrue(self.finished(rid))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+        return app.VM_RUNS[rid]
+
+    def test_turns_with_and_without_commands_are_recorded_per_model(self):
+        model = f"ollama/{app.DEFAULT_MODEL}"
+        r = self.run_once([3, 7])                   # ran 4 commands
+        self.assertEqual((r["agent_model"], r["agent_turns"], r["agent_turns_with_commands"], r["agent_commands"]),
+                         (model, 1, 1, 4))
+        self.run_once([7, 7])                       # described commands but ran none
+        e = app.load_model_evidence()[model]
+        self.assertEqual((e["runs"], e["turns"], e["turns_with_commands"], e["scored"], e["passed"]), (2, 2, 1, 2, 2))
+        self.assertEqual(app.evidence_view(model)["verdict"], "mixed")
+
+    def test_verdicts(self):
+        ev = {"a": {"turns": 5, "turns_with_commands": 5}, "b": {"turns": 4, "turns_with_commands": 1},
+              "c": {"turns": 1, "turns_with_commands": 0}}
+        self.assertEqual(app.evidence_view("a", ev)["verdict"], "works")
+        self.assertEqual(app.evidence_view("b", ev)["verdict"], "unreliable")
+        self.assertEqual(app.evidence_view("c", ev)["verdict"], "unknown")          # too few turns to judge
+        self.assertEqual(app.evidence_view("d", ev, "verified_broken")["verdict"], "unreliable")
+        self.assertEqual(app.evidence_view("a", ev, "verified_broken")["verdict"], "works")   # real runs win
+
+    def test_session_follow_ups_count_as_turns(self):
+        self.counts = iter([0, 2, 2, 2])            # first turn ran 2 commands, the follow-up ran none
+        rid = app.create_vm_run({"agent": "alpha", "custom_prompt": "x", "interactive": True})
+        self.assertTrue(wait_for(lambda: app.VM_RUNS[rid]["state"] == "attached"))
+        app.send_vm_followup(rid, "and again")
+        self.assertTrue(wait_for(lambda: app.VM_RUNS[rid].get("agent_turns") == 2))
+        app.end_vm_session(rid)
+        self.assertTrue(self.finished(rid))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+        e = app.load_model_evidence()[f"ollama/{app.DEFAULT_MODEL}"]
+        self.assertEqual((e["turns"], e["turns_with_commands"], e["scored"]), (2, 1, 0))
+
+    def test_command_count_parsing(self):
+        for dc_result, expected in (((0, "4\n", ""), 4), ((0, "", ""), 0), ((1, "", "no such container"), None),
+                                    ((0, "garbage", ""), None)):
+            with self.subTest(dc_result=dc_result), mock.patch.object(app, "dc", lambda *a, **k: dc_result):
+                self.assertEqual(self.real_count("alpha", "vm-session.log"), expected)
+
+    def test_cloud_agents_are_keyed_by_provider_and_model(self):
+        self.assertEqual(app.agent_model_id({"backend": "cloud", "provider": "anthropic", "cloud_model": "claude-haiku-4-5"}),
+                         "anthropic/claude-haiku-4-5")
+        self.assertEqual(app.agent_model_id({"backend": "local", "model": "qwen2.5:14b"}), "ollama/qwen2.5:14b")
+
+    def test_runs_without_an_agent_record_nothing(self):
+        rid = app.create_vm_run({})
+        self.assertTrue(wait_for(lambda: app.VM_RUNS[rid]["state"] == "ready"))
+        app.stop_vm_run(rid)
+        self.assertEqual(app.load_model_evidence(), {})
 
 
 class ConcurrencyTests(VmBenchBase):
