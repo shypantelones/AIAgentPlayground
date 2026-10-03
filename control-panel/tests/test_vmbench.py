@@ -344,6 +344,22 @@ class TerminalTests(VmBenchBase):
         self.assertFalse(app.VM_RUNS[rid]["terminal"]["active"])
         self.assertNotIn(rid, app.VM_TERM_CREDS)
 
+    def test_running_terminal_whose_credential_was_lost_gets_a_fresh_one(self):
+        """Regression: credentials live in memory only, so after a panel restart a still-running terminal came back
+        with an empty credential and the browser's login prompt could never be answered."""
+        rid = app.create_vm_run({})
+        self.assertTrue(self.finished(rid))
+        (app.vm_run_dir(rid)).mkdir(parents=True, exist_ok=True)
+        (app.vm_run_dir(rid) / "id_ed25519").write_text("k")
+        app.start_terminal(rid)
+        app.VM_TERM_CREDS.clear()                               # what a panel restart leaves behind
+        with mock.patch.object(app, "stop_terminal", wraps=app.stop_terminal) as stop:
+            port, cred = app.start_terminal(rid)
+        stop.assert_called_once_with(rid, quiet=True)           # the old, unusable terminal is replaced
+        self.assertEqual(len(cred), 32)
+        self.assertEqual(app.VM_TERM_CREDS[rid], cred)
+        self.assertTrue(app.VM_RUNS[rid]["terminal"]["active"])
+
     def test_stop_passes_env_so_compose_down_can_parse_the_file(self):
         """Regression: stop_terminal used to call `docker compose down` without the env vars the compose file's
         ${VAR} interpolation needs, so compose failed to even parse the file (empty volume/port spec) and the
