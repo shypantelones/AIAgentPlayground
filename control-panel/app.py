@@ -1073,8 +1073,19 @@ def vm_run_runner(rid):
             idx = line.find("==>")
             if idx != -1:
                 vm_log(r, line[idx:])
-        rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", timeout=900, cancel=stopped,
-                                         on_line=on_vagrant_line)
+        for attempt in range(vr.PORT_COLLISION_RETRIES + 1):
+            rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", timeout=900, cancel=stopped,
+                                             on_line=on_vagrant_line)
+            busy = vr.port_collision(out) if rc != 0 and not stopped() else None
+            if busy != port or attempt == vr.PORT_COLLISION_RETRIES:
+                break
+            with VM_LOCK:
+                port = vr.allocate_port(vr.SSH_PORT_RANGE, taken_ports(vr.SSH_PORT_RANGE) | {busy})
+            vm_log(r, f"host port {busy} was taken by something else just before the VM booted; retrying on port {port}...")
+            r["ssh_port"] = port
+            save_vm_run(r)
+            vr.render_vagrantfile(d, r["vm_name"], port, pub.read_text().strip(), r["memory_mb"], r["cpus"],
+                                  offline=(task or {}).get("offline", True))
         if rc != 0 and not stopped():
             vm_log(r, out[-2000:] or err[-500:])     # the full tail only when it failed, for diagnosis
         if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
@@ -1654,8 +1665,20 @@ def topo_run_runner(rid):
             idx = line.find("==>")
             if idx != -1:
                 topo_log(r, line[idx:])
-        rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
-                                         on_line=on_vagrant_line, cancel=stopped)
+        for attempt in range(vr.PORT_COLLISION_RETRIES + 1):
+            rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
+                                             on_line=on_vagrant_line, cancel=stopped)
+            busy = vr.port_collision(out) if rc != 0 and not stopped() else None
+            node = next((n for n, p in node_ports.items() if p == busy), None)
+            if node is None or attempt == vr.PORT_COLLISION_RETRIES:
+                break
+            with TOPO_LOCK:
+                new = vr.allocate_port(vr.TOPO_SSH_PORT_RANGE, topo_taken_ports(vr.TOPO_SSH_PORT_RANGE) | {busy})
+            topo_log(r, f"host port {busy} ({node}) was taken by something else just before it booted; retrying on port {new}...")
+            node_ports[node] = r["nodes"][node]["ssh_port"] = new
+            save_topo_run(r)
+            # nodes already up stay up; `vagrant up` carries on from the one that failed, with its new port
+            vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"])
         if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
             topo_log(r, "stopping: tearing down the half-built lab...")
             vr.destroy_after_cancel(d, timeout=180)

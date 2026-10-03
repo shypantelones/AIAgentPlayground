@@ -230,6 +230,28 @@ class InstantStopTests(VmBenchBase):
         self.assertEqual(app.VM_RUNS[rid]["state"], "stopped")
 
 
+class PortCollisionTests(VmBenchBase):
+    def test_a_taken_port_is_replaced_and_the_build_retried(self):
+        seen = []
+
+        def stream(run_dir, *args, on_line=None, timeout=120, cancel=None):
+            self.calls.append(("vagrant", args))
+            rid = run_dir.name
+            seen.append(app.VM_RUNS[rid]["ssh_port"])
+            if len(seen) == 1:
+                return 1, f"The forwarded port to {seen[0]} is already in use on the host machine.", ""
+            return 0, "ok", ""
+        renders = []
+        with mock.patch.object(vr, "vagrant_stream", stream), \
+             mock.patch.object(vr, "render_vagrantfile", lambda d, name, port, *a, **k: renders.append(port)):
+            rid = app.create_vm_run({})
+            self.assertTrue(wait_for(lambda: app.VM_RUNS[rid]["state"] in ("ready", "error")))
+        self.assertEqual(app.VM_RUNS[rid]["state"], "ready", app.VM_RUNS[rid].get("reason"))
+        self.assertEqual(len(renders), 2)
+        self.assertNotEqual(seen[0], seen[1])
+        self.assertEqual(app.VM_RUNS[rid]["ssh_port"], seen[1])
+
+
 class StopRaceTests(VmBenchBase):
     def test_stop_right_after_ready_destroys_the_vm_once(self):
         """Regression: a no-agent run's thread returns at "ready" and its `finally` used to tear down whenever the

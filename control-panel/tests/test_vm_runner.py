@@ -325,6 +325,15 @@ class FrrTests(unittest.TestCase):
         self.assertIn("proto ospf", task["check"])
 
 
+class PortCollisionParseTests(unittest.TestCase):
+    def test_parses_vagrants_message(self):
+        msg = ("Vagrant cannot forward the specified ports on this VM, since they\nwould collide with some other "
+               "application that is already listening\non these ports. The forwarded port to 62416 is already in use\non the host machine.")
+        self.assertEqual(vr.port_collision(msg), 62416)
+        self.assertIsNone(vr.port_collision("some other failure"))
+        self.assertIsNone(vr.port_collision(None))
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to

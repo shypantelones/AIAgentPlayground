@@ -198,6 +198,18 @@ def vagrant_stream(run_dir, *args, on_line=None, timeout=120, cancel=None):
     return p.returncode, "\n".join(lines), ""
 
 
+PORT_COLLISION_RE = re.compile(r"forwarded port to (\d+) is already in use")
+PORT_COLLISION_RETRIES = 3
+
+
+def port_collision(output):
+    """The host port Vagrant refused because something else was answering on it, or None. The port was free when
+    allocated (allocate_port checks), but on a desktop something can take it before the VM boots - on Windows,
+    for example, a port forwarded from WSL by an editor. The caller re-allocates that VM's port and runs `up` again."""
+    m = PORT_COLLISION_RE.search(output or "")
+    return int(m.group(1)) if m else None
+
+
 def vagrant_retry(run_dir, *args, tries=3, delay=5, timeout=180):
     """A vagrant command right after an interrupted `up`: VirtualBox can still hold the session lock of the operation
     that was killed for a few seconds, so retry a little before giving up."""
