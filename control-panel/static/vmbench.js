@@ -64,10 +64,36 @@ function openVB() {
 }
 vbDlg.addEventListener("close", () => { clearInterval(vbTimer); vbTimer = null; });
 
+/* What this panel has seen a model do in VM Labs: did the agent actually run commands on the machines? */
+function evidenceText(ev) {
+  if (!ev || !ev.turns) return "not used in VM Labs here yet";
+  const scored = ev.scored ? `, passed ${ev.passed} of ${ev.scored} scored runs` : "";
+  return `ran commands in ${ev.turns_with_commands} of ${ev.turns} agent turns${scored}`;
+}
+const EVIDENCE_MARK = { works: "✓", mixed: "∼", unreliable: "⚠", unknown: "" };
+
 function vbAgentCheckboxes() {
-  return state.instances.map(i => h("label", { class: "row", style: "justify-content:flex-start" },
-    h("input", { type: "checkbox", value: i.name, disabled: i.status !== "healthy" && i.status !== "starting" }),
-    `${i.name} (${i.status})${i.backend === "local" && i.model ? " · local: " + i.model : i.backend === "cloud" ? " · cloud" : ""}`));
+  return state.instances.map(i => {
+    const ev = i.evidence || {};
+    return h("label", { class: "row", style: "justify-content:flex-start" },
+      h("input", { type: "checkbox", value: i.name, disabled: i.status !== "healthy" && i.status !== "starting" }),
+      `${i.name} (${i.status}) · ${i.modelId || (i.backend === "cloud" ? "cloud" : "local: " + (i.model || "?"))}`,
+      h("span", { class: ev.verdict === "unreliable" ? "fail" : ev.verdict === "works" ? "pass" : "hint" },
+        ` ${EVIDENCE_MARK[ev.verdict] || ""} ${evidenceText(ev)}`));
+  });
+}
+
+/* Before attaching agents: ask when one runs on a model that hasn't shown it can drive the VMs. Local models here
+   have often described the commands they would run instead of running them; cloud models have been reliable. */
+function confirmAgentModels(names) {
+  const risky = names.map(n => state.instances.find(i => i.name === n)).filter(i => i && (
+    ["unreliable", "mixed"].includes((i.evidence || {}).verdict) ||
+    (i.backend !== "cloud" && (i.evidence || {}).verdict === "unknown")));
+  if (!risky.length) return true;
+  return confirm("Some agents may not actually run commands in the VMs:\n\n" +
+    risky.map(i => `• ${i.name} (${i.modelId}): ${evidenceText(i.evidence)}`).join("\n") +
+    "\n\nLocal models often describe the commands they would run instead of running them. A cloud model is " +
+    "recommended for VM Labs. Continue anyway?");
 }
 
 function buildVBDialog() {
@@ -113,6 +139,7 @@ function buildVBDialog() {
     const body = { task_id: custom ? null : VB.newTask.value || null, custom_prompt: custom ? VB.newPrompt.value : null,
                    interactive: VB.newInteractive.checked, keep: VB.newKeep.checked };
     try {
+      if (agents.length && !confirmAgentModels(agents)) return;
       if (agents.length > 1) await api("/api/vmbench/benchmarks", { ...body, agents });
       else await api("/api/vmbench/runs", { ...body, agent: agents[0] || null });
       if (custom) VB.newPrompt.value = "";
@@ -130,7 +157,8 @@ function buildVBDialog() {
       h("label", { class: "row" }, VB.sKeep, "keep VMs by default"), saveSettings, VB.sMsg),
     h("h4", {}, "New VM / task"),
     h("div", { class: "col" }, h("div", { class: "row" }, "Task", VB.newTask), VB.newTaskInfo, VB.newPrompt,
-      h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"), VB.newAgents,
+      h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
+      h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VB.newAgents,
       h("label", { class: "row" }, VB.newInteractive, "interactive session: keep the agent attached after its first reply so you can send it more guidance (ends when you press End session, or after 2 hours with no new message)"),
       h("label", { class: "row" }, VB.newKeep, "keep this VM running afterward, for later inspection"),
       VB.newMsg, h("div", { class: "row" }, create)),
@@ -166,7 +194,7 @@ function renderVBRuns() {
       grp.length > 1 ? h("div", { class: "hint" }, `Benchmark: ${grp[0].task_title || "task"} across ${grp.length} agents`) : null,
       ...sorted.map(r => h("div", { class: "sess" + (r.id === vbSelRun ? " sel" : ""), onclick: () => { vbSelRun = r.id; vbSig.detail = ""; loadVB(); } },
         h("span", { class: "chip " + r.state }, VB_STATE_LABEL[r.state] || r.state),
-        ` ${r.agent ? r.agent : "(no agent)"}${r.task_title ? " — " + r.task_title : r.custom_prompt ? " — your prompt" : " — scratch VM"}${r.interactive ? " (session)" : ""} `,
+        ` ${r.agent ? r.agent + (r.agent_model ? ` (${r.agent_model})` : "") : "(no agent)"}${r.task_title ? " — " + r.task_title : r.custom_prompt ? " — your prompt" : " — scratch VM"}${r.interactive ? " (session)" : ""} `,
         h("span", { class: "status" }, `${vbElapsed(r)}${r.score ? " · " + (r.score.passed ? "PASS" : "FAIL") : ""}`))));
   }));
 }
@@ -198,7 +226,7 @@ async function loadVBDetail() {
 
   const parts = [h("div", { class: "row" }, h("b", {}, `Run ${r.id}`), h("span", { class: "chip " + r.state }, VB_STATE_LABEL[r.state] || r.state),
     h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), termBtn, scoreBtn, stopBtn, delBtn)];
-  parts.push(h("div", { class: "hint" }, `${r.task_title ? "Task: " + r.task_title : r.custom_prompt ? "Your prompt" : "No task (scratch VM)"}${r.agent ? " · agent: " + r.agent : " · no agent attached"}${r.interactive ? " · interactive session" : ""} · started ${vbFmtTime(r.started)} · elapsed ${vbElapsed(r)}`));
+  parts.push(h("div", { class: "hint" }, `${r.task_title ? "Task: " + r.task_title : r.custom_prompt ? "Your prompt" : "No task (scratch VM)"}${r.agent ? ` · agent: ${r.agent} (${r.agent_model || "?"})` : " · no agent attached"}${r.agent_turns ? ` · ran ${r.agent_commands ?? "?"} commands in ${r.agent_turns} turn${r.agent_turns === 1 ? "" : "s"}` : ""}${r.interactive ? " · interactive session" : ""} · started ${vbFmtTime(r.started)} · elapsed ${vbElapsed(r)}`));
   if (r.custom_prompt) parts.push(h("pre", { style: "max-height:12vh" }, r.custom_prompt));
   if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "VM"));
   if (r.interactive && ["attached", "working"].includes(r.state))

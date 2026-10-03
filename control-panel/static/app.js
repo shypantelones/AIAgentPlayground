@@ -103,7 +103,7 @@ function openCreateDialog(name0 = "") {
   let picker = null;                                                    // set once the model list has loaded
   const pickerReady = buildLocalPicker(localPick, {}, nameIn.value, null, { choose: true }).then(p => picker = p);
   const localBox = h("div", { class: "col" }, h("p", { class: "hint" },
-    "Runs on this computer's Ollama. Choose the model it uses (a model that isn't downloaded yet is downloaded when the agent is created). Needs a fairly powerful computer: on slower machines replies can time out."), localPick);
+    "Runs on this computer's Ollama. Choose the model it uses (a model that isn't downloaded yet is downloaded when the agent is created). Needs a fairly powerful computer: on slower machines replies can time out. For VM Labs, a cloud model is recommended: local models often describe commands instead of running them."), localPick);
   const cloudBox = h("div", { class: "col" }, ...cf.rows, h("div", { class: "row" }, "API key", tok), h("p", { class: "hint" },
     `The key is ${(state.platform || {}).secretStore || "stored securely"} and held by a separate relay container; the agent only ever gets a dummy key. ` +
     "Cloud models cost money per use: use a spend-capped key. In cloud mode, prompts leave this computer. No local model is downloaded."));

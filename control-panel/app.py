@@ -724,6 +724,88 @@ def ollama_show(name, size_gb):
     return info
 
 
+# ---------------------------------------------------------------- tool-use evidence per model, from real VM Labs runs
+# Whether a model actually drives the VMs (runs ./vmrun commands) varies a lot, and the catalog can only record what
+# was tested by hand. Every agent turn in a VM or lab run is counted here, keyed by model, so the panel can show
+# "ran commands in N of M turns" next to agents and models and warn before attaching one that rarely does.
+MODEL_EVIDENCE_FILE = ROOT / "data" / "model-evidence.json"
+MODEL_EVIDENCE_LOCK = threading.Lock()
+EVIDENCE_MIN_TURNS = 2           # below this, a model has "not enough runs yet"
+
+
+def agent_model_id(meta):
+    """'ollama/<model>' for a local agent, '<provider>/<model>' for a cloud one - the same id OpenClaw logs."""
+    if meta.get("backend") == "cloud":
+        return f"{meta.get('provider', 'cloud')}/{meta.get('cloud_model', '')}"
+    return f"ollama/{meta.get('model') or DEFAULT_MODEL}"
+
+
+def load_model_evidence():
+    try:
+        return json.loads(MODEL_EVIDENCE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def record_model_evidence(r):
+    """Fold one finished agent run into its model's totals."""
+    model, turns = r.get("agent_model"), r.get("agent_turns") or 0
+    if not model or not turns:
+        return
+    with MODEL_EVIDENCE_LOCK:
+        ev = load_model_evidence()
+        e = ev.setdefault(model, {"runs": 0, "turns": 0, "turns_with_commands": 0, "scored": 0, "passed": 0})
+        e["runs"] += 1
+        e["turns"] += turns
+        e["turns_with_commands"] += r.get("agent_turns_with_commands") or 0
+        if r.get("score") is not None:
+            e["scored"] += 1
+            e["passed"] += 1 if r["score"].get("passed") else 0
+        e["last"] = time.time()
+        MODEL_EVIDENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MODEL_EVIDENCE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(ev, indent=1))
+        tmp.replace(MODEL_EVIDENCE_FILE)
+
+
+def evidence_view(model, ev=None, catalog_status=None):
+    """What the UI shows for a model: the raw totals plus a verdict.
+    verdict: "works" (ran commands in >= 80% of turns), "unreliable" (< 50%), "mixed", or "unknown" (too few turns
+    yet). A catalog entry hand-tested as broken counts as "unreliable" until real runs here say otherwise."""
+    e = (ev if ev is not None else load_model_evidence()).get(model)
+    out = dict(e or {}, model=model, verdict="unknown")
+    if e and e["turns"] >= EVIDENCE_MIN_TURNS:
+        rate = e["turns_with_commands"] / e["turns"]
+        out["verdict"] = "works" if rate >= 0.8 else "unreliable" if rate < 0.5 else "mixed"
+    elif catalog_status == "verified_broken":
+        out["verdict"] = "unreliable"
+    return out
+
+
+def count_vm_commands(agent, log_name):
+    """How many ./vmrun commands the agent has run so far, from its session log (one '=== <time> $' line each).
+    None if it can't be read - then the turn isn't counted either way."""
+    rc, out, _ = dc(agent, "exec", "-T", "gateway", "sh", "-c",
+                    f"grep -c '^=== ' /home/node/.openclaw/workspace/{log_name} 2>/dev/null || true", timeout=20)
+    try:
+        return int(out.strip().splitlines()[-1]) if rc == 0 and out.strip() else 0 if rc == 0 else None
+    except ValueError:
+        return None
+
+
+def counted_agent_turn(r, message, log_name, turn):
+    """Run one agent turn via `turn()` and count whether the agent ran any commands on the machines during it."""
+    before = count_vm_commands(r["agent"], log_name)
+    res = turn()
+    after = count_vm_commands(r["agent"], log_name)
+    r["agent_turns"] = (r.get("agent_turns") or 0) + 1
+    if before is not None and after is not None:
+        ran = max(0, after - before)
+        r["agent_commands"] = (r.get("agent_commands") or 0) + ran
+        r["agent_turns_with_commands"] = (r.get("agent_turns_with_commands") or 0) + (1 if ran else 0)
+    return res
+
+
 def models_overview():
     ctx, cat = mi.load_catalog()
     machine = ps.machine_info(ROOT)
@@ -732,6 +814,9 @@ def models_overview():
     installed = [mi.describe_installed(n, s, ollama_show(n, s), machine, OLLAMA_MODE, ctx, by_name.get(n)) for n, s in sorted(have or [])]
     names = {m["name"] for m in installed}
     catalog = [mi.describe_catalog(e, machine, OLLAMA_MODE, ctx) for e in cat if e["name"] not in names]
+    ev = load_model_evidence()
+    for m in installed + catalog:
+        m["evidence"] = evidence_view(f"ollama/{m['name']}", ev, m.get("openclaw_tool_calling"))
     return {"machine": machine, "mode": OLLAMA_MODE, "modeLabel": ps.MODE_LABEL[OLLAMA_MODE], "context_tokens": ctx,
             "server_running": have is not None, "installed": installed, "catalog": catalog}
 
@@ -861,6 +946,7 @@ def load_vm_runs():
 def vm_run_view(r, full=False):
     v = {k: r[k] for k in ("id", "vm_name", "state", "reason", "keep", "memory_mb", "cpus", "created", "started",
                            "ended", "agent", "task_id", "task_title", "chat", "score", "benchmark_id")}
+    v.update({k: r.get(k) for k in ("agent_model", "agent_turns", "agent_turns_with_commands", "agent_commands")})
     v["terminal_active"] = bool(r.get("terminal", {}).get("active"))
     v["custom_prompt"] = r.get("custom_prompt")
     v["interactive"] = bool(r.get("interactive"))
@@ -917,6 +1003,7 @@ def create_vm_run(form):
          "memory_mb": int(form.get("memory_mb") or s["memory_mb"]), "cpus": int(form.get("cpus") or s["cpus"]),
          "created": time.time(), "started": None, "ended": None, "agent": agent, "task_id": task_id,
          "task_title": (task or {}).get("title"), "chat": f"vmbench-{rid}" if agent else None,
+         "agent_model": agent_model_id(load_meta(agent)) if agent else None,
          "custom_prompt": custom_prompt, "interactive": interactive, "idle_since": None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "ssh_port": None, "vm_log": "",
          "terminal": {"active": False, "port": None}}
@@ -1056,6 +1143,11 @@ def vm_run_runner(rid):
     finally:
         VM_FOLLOWUPS.pop(rid, None)
         VM_END.pop(rid, None)
+        if finished:
+            try:
+                record_model_evidence(r)
+            except Exception:  # noqa - evidence is a nice-to-have; never let it break teardown
+                pass
         try:
             if r.get("terminal", {}).get("active"):
                 stop_terminal(rid, quiet=True)
@@ -1089,8 +1181,9 @@ def detach_vm_agent(agent):
 
 def vm_agent_turn(r, message):
     t0 = time.time()
-    res = run_turn(r["agent"], r["chat"], message, {"via": "vmbench", "run": r["id"]}, lambda s: vm_log(r, s), timeout=1200)
-    vm_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']})")
+    res = counted_agent_turn(r, message, "vm-session.log", lambda: run_turn(
+        r["agent"], r["chat"], message, {"via": "vmbench", "run": r["id"]}, lambda s: vm_log(r, s), timeout=1200))
+    vm_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
     return res
 
 
@@ -1367,6 +1460,7 @@ def topo_run_view(r, full=False):
     v = {k: r[k] for k in ("id", "state", "reason", "keep", "memory_mb", "cpus", "created", "started", "ended",
                            "agent", "topology_id", "topology_title", "task_id", "task_title", "custom_prompt",
                            "chat", "score", "benchmark_id", "nodes")}
+    v.update({k: r.get(k) for k in ("agent_model", "agent_turns", "agent_turns_with_commands", "agent_commands")})
     v["interactive"] = bool(r.get("interactive"))
     v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
     if full:
@@ -1440,6 +1534,7 @@ def create_topo_run(form):
          "task_title": (task or {}).get("title"), "custom_prompt": custom_prompt,
          "interactive": interactive, "idle_since": None,
          "chat": f"vmtopo-{rid}" if agent else None,
+         "agent_model": agent_model_id(load_meta(agent)) if agent else None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": ""}
     TOPO_RUNS[rid] = r
     save_topo_run(r)
@@ -1604,6 +1699,11 @@ def topo_run_runner(rid):
     finally:
         TOPO_FOLLOWUPS.pop(rid, None)
         TOPO_END.pop(rid, None)
+        if finished:
+            try:
+                record_model_evidence(r)
+            except Exception:  # noqa
+                pass
         try:
             for name, node in r.get("nodes", {}).items():
                 if node.get("terminal", {}).get("active"):
@@ -1635,8 +1735,9 @@ def detach_topo_agent(agent):
 
 def topo_agent_turn(r, message):
     t0 = time.time()
-    res = run_turn(r["agent"], r["chat"], message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200)
-    topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']})")
+    res = counted_agent_turn(r, message, "vm-session-topo.log", lambda: run_turn(
+        r["agent"], r["chat"], message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200))
+    topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
     return res
 
 
@@ -2266,6 +2367,11 @@ def build_state():
         if OLLAMA_MODE == "cpu":
             shared_info["note"] = "CPU-only: prefer small models (for example a 4B-8B model)."
     insts = []
+    evidence = load_model_evidence()
+    try:
+        catalog_status = {f"ollama/{e['name']}": e.get("openclaw_tool_calling") for e in mi.load_catalog()[1]}
+    except Exception:  # noqa
+        catalog_status = {}
     for n in list_names():
         m = load_meta(n)
         svc = states.get(proj(n), {})
@@ -2276,7 +2382,9 @@ def build_state():
             status = "healthy" if "healthy" in gw.get("status", "") and "unhealthy" not in gw.get("status", "") else "starting"
         else:
             status = "stopped" if all(s["state"] != "running" for s in svc.values()) else "partial"
+        mid = agent_model_id(m)
         insts.append({"name": n, "port": m["port"], "token": m["token"], "model": m.get("model"),
+                      "modelId": mid, "evidence": evidence_view(mid, evidence, catalog_status.get(mid)),
                       "backend": m.get("backend", "local"), "provider": m.get("provider", "anthropic"),
                       "cloudModel": m.get("cloud_model", ""), "rate": m.get("rate", 30),
                       "upstream": m.get("upstream", ""), "tokenSet": has_token(n),
