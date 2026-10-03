@@ -51,6 +51,7 @@ class VmTopoBase(unittest.TestCase):
             mock.patch.object(vr, "destroy_after_cancel", lambda d, **k: self.calls.append(("destroy_after_cancel",)) or (0, "", "")),
             mock.patch.object(vr, "ssh_wait", lambda *a, **k: True),
             mock.patch.object(vr, "ssh_run", self.fake_ssh_run),
+            mock.patch.object(vr, "ssh_script", self.fake_ssh_script),
             mock.patch.object(app, "run", self.fake_run),
             mock.patch.object(app, "dc", self.fake_dc),
             mock.patch.object(app, "run_turn", self.fake_run_turn),
@@ -114,6 +115,13 @@ class VmTopoBase(unittest.TestCase):
         if args[0] == "up" and self.vagrant_fails:
             return 1, "", "boom"
         return 0, "ok", ""
+
+    def fake_ssh_script(self, port, priv, script, timeout=60):
+        """A node's SNAPSHOT_SCRIPT output; per-port text can be set in self.node_config, a port in self.ssh_down fails."""
+        if port in getattr(self, "ssh_down", set()):
+            return 255, "", "ssh: connect to host 127.0.0.1 port %d: Connection refused" % port
+        cfg = getattr(self, "node_config", {}).get(port, "")
+        return 0, f"### addresses\nlo UNKNOWN 127.0.0.1/8\n{cfg}\n### routes\n# ipv6\n", ""
 
     def fake_ssh_run(self, port, priv, command, timeout=120):
         self.calls.append(("ssh_run", port, command[:40]))
@@ -716,6 +724,111 @@ class AttachAgentTests(VmTopoBase):
             self.attach(rid2)                                    # VMs gone
         with self.assertRaises(KeyError):
             app.attach_agent_to_lab("deadbeef", {"agent": "alpha", "custom_prompt": "x"})
+
+
+class SnapshotTests(VmTopoBase):
+    """Config snapshots: every node's config captured on demand and after every agent turn, diffable, downloadable
+    as a zip, kept after the VMs are gone and deleted with the lab."""
+
+    def ready_lab(self):
+        rid = app.create_topo_run({"topology_id": "s1h2", "keep": True})
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))
+        return rid
+
+    def port(self, rid, node):
+        return app.TOPO_RUNS[rid]["nodes"][node]["ssh_port"]
+
+    def test_snapshot_captures_every_node_and_lists_it(self):
+        rid = self.ready_lab()
+        self.node_config = {self.port(rid, "h1"): "enp0s8 UP 10.0.0.1/24"}
+        snap = app.take_topo_snapshot(app.TOPO_RUNS[rid], "taken by you", "before routing")
+        self.assertEqual(set(snap["nodes"]), {"h1", "h2", "sw1"})
+        self.assertIn("10.0.0.1/24", snap["nodes"]["h1"]["addresses"])
+        listed = app.list_topo_snapshots(rid)
+        self.assertEqual([(s["id"], s["label"], s["errors"]) for s in listed], [(snap["id"], "before routing", [])])
+        self.assertEqual(app.load_topo_snapshot(rid, snap["id"])["nodes"], snap["nodes"])
+
+    def test_an_unreachable_node_is_recorded_not_fatal(self):
+        rid = self.ready_lab()
+        self.ssh_down = {self.port(rid, "h2")}
+        snap = app.take_topo_snapshot(app.TOPO_RUNS[rid], "taken by you")
+        self.assertIn("Connection refused", snap["nodes"]["h2"]["_error"])
+        self.assertIn("addresses", snap["nodes"]["h1"])
+        self.assertEqual(app.list_topo_snapshots(rid)[0]["errors"], ["h2"])
+
+    def test_diff_shows_only_what_changed(self):
+        rid = self.ready_lab()
+        r = app.TOPO_RUNS[rid]
+        a = app.take_topo_snapshot(r, "x")["id"]
+        self.node_config = {self.port(rid, "h1"): "enp0s8 UP 10.0.0.1/24"}
+        time.sleep(1.1)                                          # ids sort by time to the second
+        b = app.take_topo_snapshot(r, "y")["id"]
+        d = app.diff_topo_snapshots(rid, a, b)
+        self.assertEqual(d["changed"], 1)
+        self.assertEqual(list(d["nodes"]), ["h1"])
+        self.assertIn("+enp0s8 UP 10.0.0.1/24", d["nodes"]["h1"]["addresses"])
+        self.assertEqual(app.diff_topo_snapshots(rid, b, b)["changed"], 0)
+
+    def test_zip_has_a_file_per_node_and_section(self):
+        import io, zipfile
+        rid = self.ready_lab()
+        self.node_config = {self.port(rid, "h1"): "enp0s8 UP 10.0.0.1/24"}
+        sid = app.take_topo_snapshot(app.TOPO_RUNS[rid], "x", "for review")["id"]
+        name, data = app.topo_snapshot_zip(rid, sid)
+        self.assertEqual(name, f"lab-{rid}-{sid}.zip")
+        z = zipfile.ZipFile(io.BytesIO(data))
+        names = set(z.namelist())
+        self.assertIn(f"lab-{rid}-{sid}/h1/addresses.txt", names)
+        self.assertIn(f"lab-{rid}-{sid}/sw1/routes.txt", names)
+        self.assertIn("for review", z.read(f"lab-{rid}-{sid}/README.txt").decode())
+        self.assertIn("10.0.0.1/24", z.read(f"lab-{rid}-{sid}/h1/addresses.txt").decode())
+
+    def test_file_sections_get_safe_names_in_the_zip(self):
+        import io, zipfile
+        rid = self.ready_lab()
+        self.node_config = {self.port(rid, "h1"): "x\n### file /etc/nginx/conf.d/lb.conf\nupstream b {}"}
+        sid = app.take_topo_snapshot(app.TOPO_RUNS[rid], "x")["id"]
+        names = zipfile.ZipFile(io.BytesIO(app.topo_snapshot_zip(rid, sid)[1])).namelist()
+        self.assertIn(f"lab-{rid}-{sid}/h1/file_etc_nginx_conf.d_lb.conf.txt", names)
+
+    def test_only_the_newest_snapshots_are_kept(self):
+        rid = self.ready_lab()
+        with mock.patch.object(app, "TOPO_SNAP_KEEP", 3):
+            ids = []
+            for i in range(5):
+                with mock.patch.object(app.time, "strftime", lambda f, t=None, i=i: f"2026010{i}-000000"):
+                    ids.append(app.take_topo_snapshot(app.TOPO_RUNS[rid], "x")["id"])
+        self.assertEqual([s["id"] for s in app.list_topo_snapshots(rid)], ids[:1:-1])
+
+    def test_agent_turns_take_a_snapshot_each(self):
+        self.add_agent("alpha")
+        rid = app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "x", "keep": True})
+        self.assertTrue(self.finished(rid))
+        snaps = app.list_topo_snapshots(rid)
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["trigger"], "after alpha's turn 1")
+
+    def test_snapshots_outlive_the_vms_and_go_with_the_lab(self):
+        rid = self.ready_lab()
+        app.take_topo_snapshot(app.TOPO_RUNS[rid], "x")
+        app.stop_topo_run(rid)
+        shutil.rmtree(app.topo_run_dir(rid))                     # VMs gone
+        self.assertEqual(len(app.list_topo_snapshots(rid)), 1)
+        app.delete_topo_run(rid)
+        self.assertFalse(app.topo_snap_dir(rid).exists())
+
+    def test_refused_when_the_vms_are_not_running_and_bad_ids_rejected(self):
+        rid = self.ready_lab()
+        app.TOPO_RUNS[rid]["state"] = "saved"
+        with self.assertRaises(ValueError):
+            app.take_topo_snapshot(app.TOPO_RUNS[rid], "x")
+        with self.assertRaises(ValueError):
+            app.snapshot_topo_lab(rid)
+        for bad in ("../../etc", "x", ""):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                app.load_topo_snapshot(rid, bad)
+        with self.assertRaises(KeyError):
+            app.load_topo_snapshot(rid, "20260101-000000-abcd")
 
 
 class TaskWithAgentTests(VmTopoBase):
