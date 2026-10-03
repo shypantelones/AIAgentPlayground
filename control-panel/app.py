@@ -4,7 +4,7 @@
 Runs on the HOST (never inside a sandbox). Binds to 127.0.0.1 only. Every action maps to a fixed,
 validated docker command; there is no free-form shell. Standard library only.
 """
-import ipaddress, json, os, re, secrets, shutil, subprocess, sys, threading, time, urllib.request, uuid
+import ipaddress, json, os, queue, re, secrets, shutil, subprocess, sys, threading, time, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -767,8 +767,14 @@ VM_TERM_CREDS = {}       # run id -> current terminal credential; kept in memory
 VM_STOP = {}             # run id -> bool, polled by the runner thread at phase boundaries
 VM_RUN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
 VMB_SETTINGS_FILE = ROOT / "data" / "vmbench-settings.json"
-VM_LIVE_STATES = ("queued", "provisioning", "working", "scoring")     # a background thread is actively driving these
+# a background thread is actively driving these ("attached": an interactive session waiting for your next message)
+VM_LIVE_STATES = ("queued", "provisioning", "working", "attached", "scoring")
 VM_OCCUPYING_STATES = VM_LIVE_STATES + ("ready",)                     # the above, plus an idle VM still taking up a slot
+VM_FOLLOWUPS = {}        # run id -> queue.Queue of your follow-up messages for an interactive session
+VM_END = {}              # run id -> True once you end an interactive session (detach, score, finish normally)
+VM_SESSION_IDLE_S = 2 * 3600      # an interactive session with no new message for this long ends by itself
+VM_SESSION_POLL_S = 1.0
+VM_PROMPT_MAX = 20_000
 
 
 def stop_vm_runs_for(agent_name):
@@ -838,6 +844,10 @@ def load_vm_runs():
         except Exception:
             continue
         if r["state"] in VM_LIVE_STATES:
+            if r.get("agent") and r["state"] in ("working", "attached"):
+                # its relay container and the VM key in the agent's workspace outlived the thread that would have
+                # removed them; sweep them up so the agent isn't left holding a way into this VM
+                threading.Thread(target=detach_vm_agent, args=(r["agent"],), daemon=True).start()
             r.update(state="interrupted", reason=(r.get("reason") or "") or "the control panel was restarted")
             f.write_text(json.dumps(r, indent=1))
         VM_RUNS[r["id"]] = r
@@ -849,8 +859,14 @@ def vm_run_view(r, full=False):
     v = {k: r[k] for k in ("id", "vm_name", "state", "reason", "keep", "memory_mb", "cpus", "created", "started",
                            "ended", "agent", "task_id", "task_title", "chat", "score", "benchmark_id")}
     v["terminal_active"] = bool(r.get("terminal", {}).get("active"))
+    v["custom_prompt"] = r.get("custom_prompt")
+    v["interactive"] = bool(r.get("interactive"))
+    v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
     if full:
         v["transcript"] = r.get("vm_log", "")[-20000:]
+        if r.get("agent") and r.get("chat"):
+            msgs = load_chats(r["agent"]).get(r["chat"], {}).get("messages", [])[-100:]
+            v["conversation"] = [{"role": m.get("role"), "text": m.get("text", "")[-20000:], "ts": m.get("ts")} for m in msgs]
     return v
 
 
@@ -873,18 +889,32 @@ def create_vm_run(form):
     task_id = form.get("task_id") or None
     task = vr.get_task(task_id) if task_id else None
     agent = (form.get("agent") or "").strip().lower() or None
+    custom_prompt = str(form.get("custom_prompt") or "").strip() or None
+    interactive = bool(form.get("interactive"))
+    if custom_prompt and len(custom_prompt) > VM_PROMPT_MAX:
+        raise ValueError(f"the prompt is too long (max {VM_PROMPT_MAX} characters)")
     if agent:
         load_meta(agent)                         # raises KeyError if unknown
         if not agent_running(agent):
             raise ValueError(f"{agent} is not running; start it first")
-        if not task:
-            raise ValueError("pick a task for the agent to attempt")
+        if not task and not custom_prompt:
+            raise ValueError("pick a task or write a prompt for the agent")
+        if task and custom_prompt:
+            raise ValueError("pick a task or write your own prompt, not both")
+        # one VM per agent: both runs' relays are the same `vm-relay` service in the agent's compose project, so a
+        # second would silently replace the first one's
+        busy = [x for x in VM_RUNS.values() if x.get("agent") == agent and x["state"] in VM_OCCUPYING_STATES]
+        if busy:
+            raise ValueError(f"{agent} is already attached to VM run {busy[0]['id']}; end or stop that run first")
+    elif custom_prompt or interactive:
+        raise ValueError("attach an agent to give it a prompt or a session")
     s = vmb_settings()
     rid = uuid.uuid4().hex[:8]
     r = {"id": rid, "vm_name": f"aiagentplayground-vmbench-{rid}", "state": "queued", "reason": "", "keep": bool(form.get("keep", s["keep_default"])),
          "memory_mb": int(form.get("memory_mb") or s["memory_mb"]), "cpus": int(form.get("cpus") or s["cpus"]),
          "created": time.time(), "started": None, "ended": None, "agent": agent, "task_id": task_id,
          "task_title": (task or {}).get("title"), "chat": f"vmbench-{rid}" if agent else None,
+         "custom_prompt": custom_prompt, "interactive": interactive, "idle_since": None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "ssh_port": None, "vm_log": "",
          "terminal": {"active": False, "port": None}}
     VM_RUNS[rid] = r
@@ -987,26 +1017,27 @@ def vm_run_runner(rid):
            "cat > /home/node/.openclaw/workspace/vmrun && chmod +x /home/node/.openclaw/workspace/vmrun",
            input=wrapper, timeout=20)
         env = dict(os.environ, VM_SSH_PORT=str(port))
-        files = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay.compose.yml")]
         rc, out, err = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
-                           *files, "up", "-d", "--no-deps", "vm-relay"], timeout=60, env=env)
+                           *VM_RELAY_FILES, "up", "-d", "--no-deps", "vm-relay"], timeout=60, env=env)
         if rc != 0:
+            detach_vm_agent(r["agent"])
             return finish("error", "could not attach the agent's VM relay (see transcript)")
         prompt = (
-            f"{task['prompt']}\n\n"
+            f"{task['prompt'] if task else r['custom_prompt']}\n\n"
             "You have an executable command available in your current working directory called ./vmrun. "
             "It runs shell commands on a separate Linux machine set up for this task and returns their output - do "
             "all of this task's file creation and testing there, not in your own filesystem. For example: "
             "./vmrun 'cd /home/bench/work && ls -la'\n"
             + vr.VMRUN_HOWTO.format(cmd="./vmrun") + "\n"
             "Before you reply, run what you built on that machine and check that its output is what the task asks for."
+            + ("\nYour user may send you more guidance in this conversation after you reply; the machine stays "
+               "available to you until they end the session." if r.get("interactive") else "")
         )
-        t0 = time.time()
-        res = run_turn(r["agent"], r["chat"], prompt, {"via": "vmbench", "run": rid}, lambda s: vm_log(r, s), timeout=1200)
-        vm_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']})")
-        run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
-            *files, "rm", "-sf", "vm-relay"], timeout=30)
-        dc(r["agent"], "exec", "-T", "gateway", "rm", "-rf", "/home/node/.openclaw/workspace/.vmkey", timeout=20)
+        vm_agent_turn(r, prompt)
+        if r.get("interactive"):
+            vm_session_loop(r, stopped)
+        vm_log(r, f"detaching {r['agent']} from this VM...")
+        detach_vm_agent(r["agent"])
 
         if task and task.get("check") and not stopped():
             r["state"] = "scoring"
@@ -1019,6 +1050,8 @@ def vm_run_runner(rid):
     except Exception as e:  # noqa
         finish("error", str(e))
     finally:
+        VM_FOLLOWUPS.pop(rid, None)
+        VM_END.pop(rid, None)
         try:
             if r.get("terminal", {}).get("active"):
                 stop_terminal(rid, quiet=True)
@@ -1037,6 +1070,81 @@ def vm_run_runner(rid):
         VM_STOP.pop(rid, None)
 
 
+VM_RELAY_FILES = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay.compose.yml")]
+
+
+def detach_vm_agent(agent):
+    """Take an agent's way into a VM away: its vm-relay container and the VM key in its workspace. Best effort."""
+    try:
+        run([DOCKER, "compose", "-p", proj(agent), "--env-file", str(env_file(agent)), *VM_RELAY_FILES,
+             "rm", "-sf", "vm-relay"], timeout=30)
+        dc(agent, "exec", "-T", "gateway", "rm", "-rf", "/home/node/.openclaw/workspace/.vmkey", timeout=20)
+    except Exception:  # noqa
+        pass
+
+
+def vm_agent_turn(r, message):
+    t0 = time.time()
+    res = run_turn(r["agent"], r["chat"], message, {"via": "vmbench", "run": r["id"]}, lambda s: vm_log(r, s), timeout=1200)
+    vm_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']})")
+    return res
+
+
+def vm_session_loop(r, stopped):
+    """Interactive session: after the agent's first turn, keep it attached and relay your follow-up messages into the
+    same conversation, one turn at a time, until you end the session, Stop the run, or it sits idle too long."""
+    rid = r["id"]
+    q = VM_FOLLOWUPS.setdefault(rid, queue.Queue())
+    while True:
+        if stopped():
+            return
+        if VM_END.get(rid):
+            vm_log(r, "session ended by you.")
+            return
+        if r["state"] != "attached":
+            r.update(state="attached", idle_since=time.time())
+            save_vm_run(r)
+            vm_log(r, f"{r['agent']} stays attached: send it more guidance, or End session when you're done.")
+        try:
+            msg = q.get(timeout=VM_SESSION_POLL_S)
+        except queue.Empty:
+            if time.time() - r["idle_since"] > VM_SESSION_IDLE_S:
+                vm_log(r, f"no new message for {VM_SESSION_IDLE_S // 60} minutes; ending the session.")
+                return
+            continue
+        r["state"] = "working"
+        save_vm_run(r)
+        vm_log(r, "you: " + (msg if len(msg) <= 500 else msg[:500] + "..."))
+        vm_agent_turn(r, msg)
+
+
+def send_vm_followup(rid, text):
+    r = VM_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if not r.get("interactive"):
+        raise ValueError("this run isn't an interactive session")
+    if r["state"] not in ("attached", "working") or VM_END.get(rid):
+        raise ValueError("the session isn't open")
+    text = str(text or "")
+    if not text.strip():
+        raise ValueError("empty message")
+    if len(text) > 100_000:
+        raise ValueError("message too long")
+    VM_FOLLOWUPS.setdefault(rid, queue.Queue()).put(text)
+    return {"queued_behind_current_turn": r["state"] == "working"}
+
+
+def end_vm_session(rid):
+    """Detach the agent, score (if the task has a check), and finish - the VM is then destroyed unless "keep"."""
+    r = VM_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if not r.get("interactive") or r["state"] not in ("attached", "working"):
+        raise ValueError("there's no open session to end")
+    VM_END[rid] = True
+
+
 def score_run(port, priv, task):
     t0 = time.time()
     rc, out, err = vr.ssh_run(port, priv, task["check"], timeout=90)
@@ -1049,7 +1157,7 @@ def score_now(rid):
     r = VM_RUNS.get(rid)
     if not r:
         raise KeyError("unknown run")
-    if r["state"] not in ("ready", "done", "working"):
+    if r["state"] not in ("ready", "done", "working", "attached"):
         raise ValueError("the VM isn't ready yet")
     if not r.get("task_id"):
         raise ValueError("this run has no task attached, so there is nothing to score")
@@ -1062,7 +1170,7 @@ def score_now(rid):
     def job(log):
         log("scoring...")
         r["score"] = score_run(r["ssh_port"], priv, task)
-        if r["state"] != "working":
+        if r["state"] not in ("working", "attached"):        # never end a run an agent is still attached to
             r["state"] = "done"
         save_vm_run(r)
         log(f"score: {'PASS' if r['score']['passed'] else 'FAIL'}")
@@ -1115,7 +1223,7 @@ def start_terminal(rid):
     r = VM_RUNS.get(rid)
     if not r:
         raise KeyError("unknown run")
-    if r["state"] not in ("ready", "working", "scoring", "done"):
+    if r["state"] not in ("ready", "working", "attached", "scoring", "done"):
         raise ValueError("the VM isn't up yet")
     if r.get("terminal", {}).get("active"):
         if rid in VM_TERM_CREDS:
@@ -2244,6 +2352,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"ok": True})
                 if parts[4] == "score":
                     return self.send_json({"job": score_now(parts[3])})
+                if parts[4] == "message":
+                    return self.send_json(send_vm_followup(parts[3], b.get("text")))
+                if parts[4] == "end":
+                    end_vm_session(parts[3])
+                    return self.send_json({"ok": True})
                 if parts[4] == "terminal-start":
                     port, token = start_terminal(parts[3])
                     return self.send_json({"port": port, "cred": token})

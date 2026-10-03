@@ -29,6 +29,9 @@ class VmBenchBase(unittest.TestCase):
             mock.patch.object(app, "VMB_SETTINGS_FILE", self.tmp / "vmbench-settings.json"),
             mock.patch.object(app, "VM_RUNS", {}),
             mock.patch.object(app, "VM_STOP", {}),
+            mock.patch.object(app, "VM_FOLLOWUPS", {}),
+            mock.patch.object(app, "VM_END", {}),
+            mock.patch.object(app, "VM_SESSION_POLL_S", 0.02),
             mock.patch.object(app, "VM_TERM_CREDS", {}),
             mock.patch.object(app, "agent_running", lambda n: n not in self.down),
             mock.patch.object(vr, "allocate_port", lambda rng, taken: next(p for p in range(*rng) if p not in taken)),
@@ -250,6 +253,156 @@ class TaskWithAgentTests(VmBenchBase):
         r = app.VM_RUNS[rid]
         self.assertEqual(r["state"], "done", r.get("reason"))                          # a bad solution is still a completed run
         self.assertFalse(r["score"]["passed"])
+
+
+class AgentSessionTests(VmBenchBase):
+    """Your own prompt for an agent in a VM, and interactive sessions: the agent stays attached after its first turn
+    and you send it more guidance in the same conversation until you end the session."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_agent("alpha")
+        self.turns = []                                          # (chat_id, message) per agent turn
+        self.detached = []
+        p1 = mock.patch.object(app, "run_turn", self.record_turn)
+        p2 = mock.patch.object(app, "detach_vm_agent", lambda agent: self.detached.append(agent))
+        for p in (p1, p2):
+            p.start()
+            self.patches.append(p)
+
+    def record_turn(self, name, chat_id, message, meta=None, log=lambda s: None, title=None, timeout=700):
+        self.turns.append((chat_id, message))
+        return {"reply": "ok", "ok": True}
+
+    def state(self, rid):
+        return app.VM_RUNS[rid]["state"]
+
+    def destroys(self):
+        return [c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"]
+
+    # ---- your own prompt
+    def test_custom_prompt_is_sent_with_vmrun_instructions_and_not_scored(self):
+        rid = app.create_vm_run({"agent": "alpha", "custom_prompt": "Install nginx and serve hello on port 80."})
+        self.assertTrue(self.finished(rid))
+        r = app.VM_RUNS[rid]
+        self.assertEqual(r["state"], "done", r.get("reason"))
+        self.assertIsNone(r["score"])
+        self.assertEqual(len(self.turns), 1)
+        msg = self.turns[0][1]
+        self.assertTrue(msg.startswith("Install nginx and serve hello on port 80."))
+        self.assertIn("./vmrun <<'EOF'", msg)
+        self.assertNotIn("more guidance", msg)                   # not interactive
+        self.assertEqual(self.detached, ["alpha"])
+        self.assertFalse(any(c[0] == "ssh_run" for c in self.calls), "no check script to run for a custom prompt")
+        self.assertEqual(app.vm_run_view(r)["custom_prompt"], "Install nginx and serve hello on port 80.")
+
+    def test_prompt_validation(self):
+        for form, why in (({"agent": "alpha"}, "task or prompt"),
+                          ({"agent": "alpha", "task_id": "fizzbuzz-cli", "custom_prompt": "x"}, "not both"),
+                          ({"custom_prompt": "x"}, "prompt without an agent"),
+                          ({"interactive": True}, "session without an agent"),
+                          ({"agent": "alpha", "custom_prompt": "x" * (app.VM_PROMPT_MAX + 1)}, "too long")):
+            with self.subTest(why), self.assertRaises(ValueError):
+                app.create_vm_run(form)
+        self.assertEqual(app.VM_RUNS, {})
+
+    def test_an_agent_can_only_be_attached_to_one_vm_at_a_time(self):
+        rid = app.create_vm_run({"agent": "alpha", "custom_prompt": "first", "interactive": True})
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        with self.assertRaises(ValueError):
+            app.create_vm_run({"agent": "alpha", "custom_prompt": "second"})
+        app.end_vm_session(rid)
+        self.assertTrue(self.finished(rid))
+        rid2 = app.create_vm_run({"agent": "alpha", "custom_prompt": "second"})   # free again once it ended
+        self.assertTrue(self.finished(rid2))
+
+    # ---- interactive sessions
+    def test_session_relays_follow_ups_into_the_same_conversation_then_ends_cleanly(self):
+        rid = app.create_vm_run({"agent": "alpha", "custom_prompt": "Set up a Flask app.", "interactive": True})
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        self.assertIn("more guidance", self.turns[0][1])
+        self.assertEqual(self.detached, [], "the agent stays attached while the session is open")
+        self.assertIsNotNone(app.vm_run_view(app.VM_RUNS[rid])["idle_deadline"])
+
+        app.send_vm_followup(rid, "Use port 8080 instead.")
+        self.assertTrue(wait_for(lambda: len(self.turns) == 2))
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        self.assertEqual(self.turns[1], (f"vmbench-{rid}", "Use port 8080 instead."))
+        self.assertEqual(self.turns[0][0], self.turns[1][0], "follow-ups continue the same conversation")
+        self.assertIn("you: Use port 8080 instead.", app.VM_RUNS[rid]["vm_log"])
+
+        app.end_vm_session(rid)
+        self.assertTrue(self.finished(rid))
+        self.assertEqual(self.state(rid), "done")
+        self.assertEqual(self.detached, ["alpha"])
+        self.assertEqual(len(self.destroys()), 1, "not kept, so the VM is destroyed once the session ends")
+        with self.assertRaises(ValueError):
+            app.send_vm_followup(rid, "too late")
+
+    def test_session_on_a_catalog_task_is_scored_when_it_ends(self):
+        rid = app.create_vm_run({"agent": "alpha", "task_id": "fizzbuzz-cli", "interactive": True})
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        self.assertFalse(any(c[0] == "ssh_run" for c in self.calls), "not scored while the session is open")
+        app.end_vm_session(rid)
+        self.assertTrue(self.finished(rid))
+        self.assertTrue(app.VM_RUNS[rid]["score"]["passed"])
+
+    def test_score_now_during_a_session_keeps_it_open(self):
+        rid = app.create_vm_run({"agent": "alpha", "task_id": "fizzbuzz-cli", "interactive": True})
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        jid = app.score_now(rid)
+        self.assertTrue(wait_for(lambda: app.JOBS[jid]["done"]))
+        self.assertEqual(self.state(rid), "attached")
+
+    def test_stop_during_a_session_detaches_without_scoring(self):
+        rid = app.create_vm_run({"agent": "alpha", "task_id": "fizzbuzz-cli", "interactive": True})
+        self.assertTrue(wait_for(lambda: self.state(rid) == "attached"))
+        app.stop_vm_run(rid)
+        self.assertTrue(self.finished(rid))
+        self.assertEqual(self.state(rid), "stopped")
+        self.assertEqual(self.detached, ["alpha"])
+        self.assertIsNone(app.VM_RUNS[rid]["score"])
+
+    def test_idle_session_ends_by_itself(self):
+        with mock.patch.object(app, "VM_SESSION_IDLE_S", 0.2):
+            rid = app.create_vm_run({"agent": "alpha", "custom_prompt": "x", "interactive": True})
+            self.assertTrue(self.finished(rid))
+        self.assertEqual(self.state(rid), "done")
+        self.assertIn("ending the session", app.VM_RUNS[rid]["vm_log"])
+        self.assertEqual(self.detached, ["alpha"])
+
+    def test_follow_ups_and_end_are_refused_without_an_open_session(self):
+        rid = app.create_vm_run({"agent": "alpha", "custom_prompt": "x"})        # not interactive
+        self.assertTrue(self.finished(rid))
+        with self.assertRaises(ValueError):
+            app.send_vm_followup(rid, "hello")
+        with self.assertRaises(ValueError):
+            app.end_vm_session(rid)
+        rid2 = app.create_vm_run({"agent": "alpha", "custom_prompt": "x", "interactive": True})
+        self.assertTrue(wait_for(lambda: self.state(rid2) == "attached"))
+        for bad in ("", "   ", "x" * 100_001):
+            with self.subTest(len=len(bad)), self.assertRaises(ValueError):
+                app.send_vm_followup(rid2, bad)
+        with self.assertRaises(KeyError):
+            app.send_vm_followup("deadbeef", "hello")
+
+    def test_run_view_includes_the_conversation(self):
+        rid = app.create_vm_run({"agent": "alpha", "custom_prompt": "x"})
+        self.assertTrue(self.finished(rid))
+        app.append_message("alpha", f"vmbench-{rid}", "user", "x")
+        app.append_message("alpha", f"vmbench-{rid}", "agent", "done it")
+        conv = app.vm_run_view(app.VM_RUNS[rid], full=True)["conversation"]
+        self.assertEqual([(m["role"], m["text"]) for m in conv], [("user", "x"), ("agent", "done it")])
+
+    def test_restart_marks_open_sessions_interrupted_and_detaches_the_agent(self):
+        rec = {"id": "abcd1234", "state": "attached", "agent": "alpha", "reason": "", "created": 1.0}
+        app.vm_run_path("abcd1234").write_text(json.dumps(rec))
+        before = set(threading.enumerate())
+        app.load_vm_runs()
+        for t in set(threading.enumerate()) - before:
+            t.join(timeout=5)
+        self.assertEqual(app.VM_RUNS["abcd1234"]["state"], "interrupted")
+        self.assertEqual(self.detached, ["alpha"])
 
 
 class ConcurrencyTests(VmBenchBase):
