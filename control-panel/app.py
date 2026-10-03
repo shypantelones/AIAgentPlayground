@@ -1134,7 +1134,7 @@ def start_terminal(rid):
     env = dict(os.environ, TERM_PROJECT=project, KEY_PATH=str(priv), VM_SSH_PORT=str(r["ssh_port"]),
                TERM_PORT=str(term_port), TERM_CRED=f"bench:{token}")
     rc, out, err = run([DOCKER, "compose", "-p", project, "-f", str(TPL / "vm-terminal.compose.yml"), "up", "-d"],
-                       timeout=60, env=env, redact=token)
+                       timeout=300, env=env, redact=token)       # first use builds the terminal image (needs internet)
     if rc != 0:
         raise RuntimeError("could not start the terminal: " + (err or out).strip()[-300:])
     r["terminal"] = {"active": True, "port": term_port}
@@ -1563,7 +1563,7 @@ def start_topo_terminal(rid, node):
     env = dict(os.environ, TERM_PROJECT=project, KEY_PATH=str(priv), VM_SSH_PORT=str(n["ssh_port"]),
                TERM_PORT=str(term_port), TERM_CRED=f"bench:{token}")
     rc, out, err = run([DOCKER, "compose", "-p", project, "-f", str(TPL / "vm-terminal.compose.yml"), "up", "-d"],
-                       timeout=60, env=env, redact=token)
+                       timeout=300, env=env, redact=token)       # first use builds the terminal image (needs internet)
     if rc != 0:
         raise RuntimeError("could not start the terminal: " + (err or out).strip()[-300:])
     n["terminal"] = {"active": True, "port": term_port}

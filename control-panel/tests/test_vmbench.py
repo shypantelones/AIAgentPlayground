@@ -360,6 +360,17 @@ class TerminalTests(VmBenchBase):
         self.assertEqual(app.VM_TERM_CREDS[rid], cred)
         self.assertTrue(app.VM_RUNS[rid]["terminal"]["active"])
 
+    def test_terminal_image_has_ssh_and_never_hands_ssh_the_mounted_key(self):
+        """Regression: the terminal ran ttyd's official image, which has no ssh client ("execvp failed" in the
+        browser), and pointed ssh at the bind-mounted key, which Docker Desktop on Windows mounts 0777 and ssh
+        then refuses. Checked end to end against a real VM when fixed; this guards the compose file's shape."""
+        tpl = (app.TPL / "vm-terminal.compose.yml").read_text()
+        self.assertIn("apk add --no-cache openssh-client", tpl)
+        self.assertNotIn("image: tsl0922/ttyd", tpl)
+        self.assertIn("install -m 600 /keys/id_ed25519 /tmp/id_ed25519", tpl)
+        self.assertIn('"-i", "/tmp/id_ed25519"', tpl)
+        self.assertNotIn('"-i", "/keys/id_ed25519"', tpl)
+
     def test_stop_passes_env_so_compose_down_can_parse_the_file(self):
         """Regression: stop_terminal used to call `docker compose down` without the env vars the compose file's
         ${VAR} interpolation needs, so compose failed to even parse the file (empty volume/port spec) and the
