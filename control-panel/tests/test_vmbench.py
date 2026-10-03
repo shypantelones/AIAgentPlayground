@@ -173,6 +173,27 @@ class ScratchVmTests(VmBenchBase):
         self.assertEqual(app.VM_RUNS[rid]["state"], "error")
 
 
+class StopRaceTests(VmBenchBase):
+    def test_stop_right_after_ready_destroys_the_vm_once(self):
+        """Regression: a no-agent run's thread returns at "ready" and its `finally` used to tear down whenever the
+        state LOOKED finished. A Stop landing between that return and the `finally` (stop_vm_run destroys the VM
+        itself and marks it "stopped") made the thread destroy it a second time. Stopping from inside the runner's
+        "ready" log line hits that window every time instead of by chance (it surfaced as a flaky CI failure)."""
+        real_log = app.vm_log
+
+        def log_then_stop(r, line):
+            real_log(r, line)
+            if line.startswith("ready"):
+                app.stop_vm_run(r["id"])
+        with mock.patch.object(app, "vm_log", log_then_stop):
+            rid = app.create_vm_run({})
+            for t in set(threading.enumerate()) - self._threads_before:
+                t.join(timeout=8)
+        self.assertEqual(app.VM_RUNS[rid]["state"], "stopped")
+        destroy_calls = [c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"]
+        self.assertEqual(len(destroy_calls), 1, "Stop and the runner thread must not both destroy the VM")
+
+
 class TaskWithAgentTests(VmBenchBase):
     def test_agent_must_exist_and_be_running(self):
         with self.assertRaises(KeyError):

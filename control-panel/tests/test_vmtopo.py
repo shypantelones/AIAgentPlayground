@@ -423,6 +423,25 @@ class StopDeleteTests(VmTopoBase):
         self.assertEqual(len(destroy_calls), 1, "one vagrant destroy -f call must tear down every node in the group")
 
 
+class StopRaceTests(VmTopoBase):
+    def test_stop_right_after_ready_destroys_the_lab_once(self):
+        """Regression: same race as test_vmbench.StopRaceTests, for labs - it made
+        StopDeleteTests.test_stop_tears_down_the_whole_group_in_one_vagrant_call flaky on CI (2 != 1 destroy calls)."""
+        real_log = app.topo_log
+
+        def log_then_stop(r, line):
+            real_log(r, line)
+            if line.startswith("ready"):
+                app.stop_topo_run(r["id"])
+        with mock.patch.object(app, "topo_log", log_then_stop):
+            rid = app.create_topo_run({"topology_id": "r2s2h2"})
+            for t in set(threading.enumerate()) - self._threads_before:
+                t.join(timeout=8)
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "stopped")
+        destroy_calls = [c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"]
+        self.assertEqual(len(destroy_calls), 1, "Stop and the runner thread must not both destroy the lab")
+
+
 class AgentDeletionTests(VmTopoBase):
     def test_deleting_an_agent_stops_its_live_topo_runs(self):
         self.add_agent("alpha")

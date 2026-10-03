@@ -919,7 +919,11 @@ def vm_run_runner(rid):
     def stopped():
         return VM_STOP.get(rid, False)
 
+    finished = False                # set only when THIS thread ends the run (see the teardown in `finally`)
+
     def finish(state, reason):
+        nonlocal finished
+        finished = True
         r.update(state=state, reason=reason, ended=time.time())
         save_vm_run(r)
 
@@ -1025,7 +1029,9 @@ def vm_run_runner(rid):
             pass
         # Only tear down automatically once this thread actually finished the run. A no-agent run returns early
         # while still "ready" (waiting for you to use the terminal / Score now) and must NOT be destroyed here.
-        if r["state"] in ("done", "error", "stopped") and not r.get("keep"):
+        # Go by `finished`, not r["state"]: stop_vm_run() can tear a "ready" run down and mark it "stopped" between
+        # that early return and this block, and checking the state would then destroy it a second time.
+        if finished and not r.get("keep"):
             try:
                 vr.vagrant(d, "destroy", "-f", timeout=120)
             except Exception:
@@ -1313,7 +1319,11 @@ def topo_run_runner(rid):
     def stopped():
         return TOPO_STOP.get(rid, False)
 
+    finished = False                # set only when THIS thread ends the run (see the teardown in `finally`)
+
     def finish(state, reason):
+        nonlocal finished
+        finished = True
         r.update(state=state, reason=reason, ended=time.time())
         save_topo_run(r)
 
@@ -1450,7 +1460,9 @@ def topo_run_runner(rid):
             pass
         # Only tear down automatically once this thread actually finished the run. A no-agent run returns early
         # while still "ready" (waiting for you to use terminals / Score now) and must NOT be destroyed here.
-        if r["state"] in ("done", "error", "stopped") and not r.get("keep"):
+        # Go by `finished`, not r["state"]: stop_topo_run() can tear a "ready" run down and mark it "stopped" between
+        # that early return and this block, and checking the state would then destroy it a second time.
+        if finished and not r.get("keep"):
             try:
                 vr.vagrant(d, "destroy", "-f", timeout=180)
             except Exception:
