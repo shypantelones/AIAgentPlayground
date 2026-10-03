@@ -1844,7 +1844,8 @@ def diff_topo_snapshots(rid, a, b):
     for node in sorted(set(sa["nodes"]) | set(sb["nodes"])):
         na, nb = sa["nodes"].get(node, {}), sb["nodes"].get(node, {})
         for sec in sorted(set(na) | set(nb)):
-            ta, tb = na.get(sec, ""), nb.get(sec, "")
+            # re-cleaned here too, so snapshots stored before a volatile pattern was known still diff cleanly
+            ta, tb = (vr.SNAPSHOT_VOLATILE.sub("", x.get(sec, "")) for x in (na, nb))
             if ta != tb:
                 d = "".join(difflib.unified_diff(ta.splitlines(True), tb.splitlines(True),
                                                  f"{a}/{node}/{sec}", f"{b}/{node}/{sec}"))

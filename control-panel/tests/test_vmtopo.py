@@ -769,6 +769,15 @@ class SnapshotTests(VmTopoBase):
         self.assertIn("+enp0s8 UP 10.0.0.1/24", d["nodes"]["h1"]["addresses"])
         self.assertEqual(app.diff_topo_snapshots(rid, b, b)["changed"], 0)
 
+    def test_diff_ignores_volatile_countdowns_even_in_snapshots_stored_with_them(self):
+        rid = self.ready_lab()
+        d = app.topo_snap_dir(rid)
+        d.mkdir(parents=True)
+        for sid, secs in (("20260101-000000-aaaa", "default via fe80::2 dev enp0s3 proto ra expires 1600sec pref medium\n"),
+                          ("20260101-000005-bbbb", "default via fe80::2 dev enp0s3 proto ra expires 1597sec pref medium\n")):
+            (d / f"{sid}.json").write_text(json.dumps({"id": sid, "ts": 1, "nodes": {"h1": {"routes": secs}}}))
+        self.assertEqual(app.diff_topo_snapshots(rid, "20260101-000000-aaaa", "20260101-000005-bbbb")["changed"], 0)
+
     def test_zip_has_a_file_per_node_and_section(self):
         import io, zipfile
         rid = self.ready_lab()
