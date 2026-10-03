@@ -168,11 +168,21 @@ async function loadVTDetail() {
               Object.values(r.nodes).map(n => n.terminal.active).join(","), (r.conversation || []).length].join("|");
   if (key === vtSig.detail) return;
   vtSig.detail = key;
-  const live = ["queued", "provisioning", "working", "attached", "scoring"].includes(r.state);
+  const live = ["queued", "provisioning", "working", "attached", "scoring", "resuming"].includes(r.state);
   const canTerminal = ["ready", "working", "attached", "scoring", "done"].includes(r.state);
   const canScore = r.task_id && ["ready", "working", "attached", "done"].includes(r.state);
   const canStop = live || r.state === "ready";
-  const canDelete = !live;
+  const canDelete = !live && r.state !== "saving";
+  const canSave = r.has_vms && ["ready", "done", "stopped"].includes(r.state) && !(r.state === "ready" && r.agent && !r.resumed);
+  const labAction = (what, label) => async () => {
+    try { await api(`/api/vmtopo/runs/${r.id}/${what}`, {}); vtSig.runs = ""; vtSig.detail = ""; vtLoad(); }
+    catch (e) { alert(`${label}: ${e.message}`); }
+  };
+  const saveBtn = r.state === "saved"
+    ? h("button", { class: "primary", disabled: !r.has_vms, title: "Restore this lab's VMs exactly as they were when you saved it",
+        onclick: labAction("resume", "Resume") }, "Resume")
+    : h("button", { disabled: !canSave, title: "Suspend this lab's VMs to disk, running state and all, to resume later. A saved lab holds no VM slots; it uses disk space (about each VM's memory).",
+        onclick: labAction("save", "Save") }, r.state === "saving" ? "Saving..." : r.state === "resuming" ? "Resuming..." : "Save");
 
   const nodeRows = Object.entries(r.nodes).map(([name, n]) => h("div", { class: "row" },
     h("b", {}, name), `(${n.role})`, n.ssh_port ? `port ${n.ssh_port}` : "",
@@ -187,15 +197,18 @@ async function loadVTDetail() {
   const scoreBtn = h("button", { disabled: !canScore, onclick: () => action(`/api/vmtopo/runs/${r.id}/score`, `Score ${r.id}`, {}, () => { vtSig.detail = ""; vtLoad(); }) }, "Score now");
   const stopBtn = h("button", { class: "danger", disabled: !canStop, onclick: async () => { try { await api(`/api/vmtopo/runs/${r.id}/stop`, {}); vtSig.runs = ""; vtSig.detail = ""; vtLoad(); } catch (e) { alert(e.message); } } }, "Stop");
   const delBtn = h("button", { disabled: !canDelete, onclick: async () => {
-    if (!confirm("Delete this run's record? (its VMs, if any survive, are destroyed first unless you chose \"keep\")")) return;
+    if (!confirm(r.state === "saved" ? "Delete this saved lab? Its VMs, and everything configured on them, are destroyed."
+      : "Delete this run's record? (its VMs, if any survive, are destroyed first unless you chose \"keep\")")) return;
     try { await api(`/api/vmtopo/runs/${r.id}/delete`, {}); if (vtSelRun === r.id) { vtSelRun = null; VT.detail.replaceChildren(); } vtSig.runs = ""; vtLoad(); } catch (e) { alert(e.message); }
   } }, "Delete");
 
   const parts = [h("div", { class: "row" }, h("b", {}, `Lab ${r.id}`), h("span", { class: "chip " + r.state }, VB_STATE_LABEL[r.state] || r.state),
-    h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), scoreBtn, stopBtn, delBtn)];
+    h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), saveBtn, scoreBtn, stopBtn, delBtn)];
   const taskDesc = r.task_title ? " · task: " + r.task_title
     : r.custom_prompt ? " · custom prompt (no automated score)" : " · no task (scratch lab)";
   parts.push(h("div", { class: "hint" }, `${r.topology_title}${taskDesc}${r.agent ? ` · agent: ${r.agent} (${r.agent_model || "?"})` : " · no agent attached"}${r.agent_turns ? ` · ran ${r.agent_commands ?? "?"} commands in ${r.agent_turns} turn${r.agent_turns === 1 ? "" : "s"}` : ""}${r.interactive ? " · interactive session" : ""} · started ${vtFmtTime(r.started)} · elapsed ${vtElapsed(r)}`));
+  if (r.state === "saved") parts.push(h("div", { class: "hint" },
+    `Saved ${r.saved_at ? new Date(r.saved_at * 1000).toLocaleString() : ""}. Its VMs are suspended to disk and hold no VM slots; Resume restores them exactly as they were, including addresses, routes and rules you set. Delete destroys them.`));
   if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
   parts.push(...nodeRows);
   if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "lab"));

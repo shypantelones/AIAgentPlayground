@@ -97,16 +97,20 @@ class VmTopoBase(unittest.TestCase):
         self.calls.append(("vagrant", args))
         if args[0] == "up" and self.vagrant_fails:
             return 1, "", "boom"
+        if args[0] == "suspend" and getattr(self, "suspend_fails", False):
+            return 1, "", "suspend failed"
         return 0, "ok", ""
 
     def fake_vagrant_stream(self, run_dir, *args, on_line=None, timeout=120, cancel=None):
         self.calls.append(("vagrant", args))
         if on_line:
             on_line("==> fake: provisioning")
-        if args[0] == "up" and getattr(self, "up_blocks", False):     # a long build, until Stop cancels it
+        if args[0] in ("up", "resume") and getattr(self, "up_blocks", False):     # a long build, until Stop cancels it
             while not (cancel and cancel()):
                 time.sleep(0.02)
             return vr.CANCELLED_RC, "", "cancelled"
+        if args[0] == "resume" and getattr(self, "resume_fails", False):
+            return 1, "", "resume failed"
         if args[0] == "up" and self.vagrant_fails:
             return 1, "", "boom"
         return 0, "ok", ""
@@ -419,6 +423,161 @@ class LabModelEvidenceTests(VmTopoBase):
         e = app.load_model_evidence()[app.TOPO_RUNS[rid]["agent_model"]]
         self.assertEqual((e["runs"], e["turns"], e["turns_with_commands"]), (1, 1, 1))
         self.assertEqual(app.topo_run_view(app.TOPO_RUNS[rid])["agent_commands"], 3)
+
+
+class SaveResumeTests(VmTopoBase):
+    """Save suspends a lab's VMs (full running state to disk, no VM slots held); Resume restores them exactly. A saved
+    lab is never destroyed by anything but Delete - not by Stop, a failed resume, or a panel restart."""
+
+    def ready_lab(self, **form):
+        rid = app.create_topo_run(dict({"topology_id": "s1h2"}, **form))
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))
+        (app.topo_run_dir(rid) / "Vagrantfile").write_text("# fake")     # the real one is rendered by vagrant setup
+        return rid
+
+    def vagrant_calls(self, verb):
+        return [c[1] for c in self.calls if c[0] == "vagrant" and c[1][0] == verb]
+
+    def save(self, rid):
+        app.save_topo_lab(rid)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] in ("saved", "stopped")))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+
+    def resume(self, rid, want=("ready", "saved")):
+        app.resume_topo_lab(rid)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] in want))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+
+    def test_save_suspends_without_destroying_and_frees_the_slots(self):
+        rid = self.ready_lab()
+        self.assertEqual(app.count_occupying_slots(), 3)
+        self.calls.clear()
+        self.save(rid)
+        r = app.TOPO_RUNS[rid]
+        self.assertEqual(r["state"], "saved")
+        self.assertTrue(r["keep"], "a saved lab is always kept")
+        self.assertTrue(r["saved_at"])
+        self.assertEqual(len(self.vagrant_calls("suspend")), 1)
+        self.assertFalse(self.vagrant_calls("destroy"))
+        self.assertTrue(app.topo_run_dir(rid).exists())
+        self.assertEqual(app.count_occupying_slots(), 0, "a saved lab holds no VM slots")
+        self.assertTrue(app.topo_run_view(r)["has_vms"])
+
+    def test_resume_restores_the_suspended_vms_without_reprovisioning(self):
+        rid = self.ready_lab()
+        self.save(rid)
+        self.calls.clear()
+        self.resume(rid)
+        r = app.TOPO_RUNS[rid]
+        self.assertEqual(r["state"], "ready", r.get("reason"))
+        self.assertTrue(r["resumed"])
+        self.assertFalse(self.vagrant_calls("up"), "resumed from saved state, not booted fresh")
+        resume = self.vagrant_calls("resume")
+        self.assertEqual(len(resume), 1)
+        self.assertIn("--no-provision", resume[0])
+        self.assertFalse(self.vagrant_calls("destroy"))
+        self.assertIn("ready again", r["vm_log"])
+        port, cred = app.start_topo_terminal(rid, "h1")       # terminals work on the resumed lab
+        self.assertTrue(port and cred)
+
+    def test_stop_on_a_resumed_lab_keeps_its_vms_and_it_can_be_saved_again(self):
+        rid = self.ready_lab()
+        self.save(rid)
+        self.resume(rid)
+        self.calls.clear()
+        app.stop_topo_run(rid)
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "stopped")
+        self.assertFalse(self.vagrant_calls("destroy"), "Stop must not destroy a saved lab's VMs")
+        self.save(rid)
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "saved")
+
+    def test_stop_while_resuming_shuts_down_again_and_stays_saved(self):
+        rid = self.ready_lab()
+        self.save(rid)
+        self.calls.clear()
+        self.up_blocks = True
+        app.resume_topo_lab(rid)
+        self.assertTrue(wait_for(lambda: self.vagrant_calls("resume")))
+        app.stop_topo_run(rid)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "saved", timeout=5))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+        self.assertEqual(app.TOPO_RUNS[rid]["reason"], "resume stopped by you")
+        self.assertTrue(self.vagrant_calls("suspend"))
+        self.assertFalse(self.vagrant_calls("destroy"))
+
+    def test_failed_resume_stays_saved(self):
+        rid = self.ready_lab()
+        self.save(rid)
+        self.calls.clear()
+        self.resume_fails = True
+        self.resume(rid, want=("saved",))
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["reason"]))
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "saved")
+        self.assertIn("resume failed", app.TOPO_RUNS[rid]["reason"])
+        self.assertFalse(self.vagrant_calls("destroy"))
+
+    def test_failed_save_keeps_the_vms_and_can_be_retried(self):
+        rid = self.ready_lab()
+        self.suspend_fails = True
+        self.save(rid)
+        r = app.TOPO_RUNS[rid]
+        self.assertEqual(r["state"], "stopped")
+        self.assertIn("could not save", r["reason"])
+        self.assertTrue(r["keep"])
+        self.assertFalse(self.vagrant_calls("destroy"))
+        self.suspend_fails = False
+        self.save(rid)
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "saved")
+
+    def test_what_can_and_cannot_be_saved_or_resumed(self):
+        rid = self.ready_lab()
+        with self.assertRaises(ValueError):
+            app.resume_topo_lab(rid)                                     # not saved
+        (app.topo_run_dir(rid) / "Vagrantfile").unlink()
+        with self.assertRaises(ValueError):
+            app.save_topo_lab(rid)                                       # VMs gone
+        app.TOPO_RUNS[rid]["state"] = "provisioning"
+        with self.assertRaises(ValueError):
+            app.save_topo_lab(rid)
+        app.TOPO_RUNS[rid]["state"] = "ready"
+        with self.assertRaises(KeyError):
+            app.save_topo_lab("deadbeef")
+
+    def test_delete_destroys_a_saved_lab(self):
+        rid = self.ready_lab()
+        self.save(rid)
+        self.calls.clear()
+        app.delete_topo_run(rid)
+        self.assertEqual(len(self.vagrant_calls("destroy")), 1)
+        self.assertNotIn(rid, app.TOPO_RUNS)
+
+    def test_restart_during_save_or_resume_leaves_the_lab_saved(self):
+        for st in ("saving", "resuming"):
+            with self.subTest(state=st):
+                rec = {"id": "abcd1234", "state": st, "agent": None, "reason": "", "created": 1.0, "nodes": {}, "keep": True}
+                app.topo_run_path("abcd1234").write_text(json.dumps(rec))
+                app.load_topo_runs()
+                self.assertEqual(app.TOPO_RUNS["abcd1234"]["state"], "saved")
+                self.assertIn("Resume", app.TOPO_RUNS["abcd1234"]["reason"])
+
+    def test_a_resumed_lab_does_not_block_its_old_agent(self):
+        self.add_agent("alpha")
+        rid = app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "x", "keep": True})
+        self.assertTrue(self.finished(rid))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+        (app.topo_run_dir(rid) / "Vagrantfile").write_text("# fake")
+        self.save(rid)
+        self.resume(rid)
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "ready")
+        # creating doesn't raise "already attached"; the new lab then just queues for VM slots behind the resumed one
+        rid2 = app.create_topo_run({"topology_id": "s1h2", "agent": "alpha", "custom_prompt": "a new lab"})
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid2]["state"] == "queued"))
+        app.stop_topo_run(rid2)
+        self.assertTrue(self.finished(rid2))
 
 
 class TaskWithAgentTests(VmTopoBase):

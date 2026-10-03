@@ -198,16 +198,20 @@ def vagrant_stream(run_dir, *args, on_line=None, timeout=120, cancel=None):
     return p.returncode, "\n".join(lines), ""
 
 
-def destroy_after_cancel(run_dir, tries=3, delay=5, timeout=180):
-    """`vagrant destroy -f` right after an interrupted `up`: VirtualBox can still hold the session lock of the
-    operation that was killed for a few seconds, so retry a little before giving up."""
+def vagrant_retry(run_dir, *args, tries=3, delay=5, timeout=180):
+    """A vagrant command right after an interrupted `up`: VirtualBox can still hold the session lock of the operation
+    that was killed for a few seconds, so retry a little before giving up."""
     rc, out, err = 1, "", ""
     for i in range(tries):
-        rc, out, err = vagrant(run_dir, "destroy", "-f", timeout=timeout)
+        rc, out, err = vagrant(run_dir, *args, timeout=timeout)
         if rc == 0:
             break
         time.sleep(delay)
     return rc, out, err
+
+
+def destroy_after_cancel(run_dir, tries=3, delay=5, timeout=180):
+    return vagrant_retry(run_dir, "destroy", "-f", tries=tries, delay=delay, timeout=timeout)
 
 
 def write_seed_files(run_dir, seed):
