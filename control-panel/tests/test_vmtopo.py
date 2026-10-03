@@ -47,6 +47,7 @@ class VmTopoBase(unittest.TestCase):
             mock.patch.object(vr, "render_topology_vagrantfile", lambda *a, **k: None),
             mock.patch.object(vr, "vagrant", self.fake_vagrant),
             mock.patch.object(vr, "vagrant_stream", self.fake_vagrant_stream),
+            mock.patch.object(vr, "destroy_after_cancel", lambda d, **k: self.calls.append(("destroy_after_cancel",)) or (0, "", "")),
             mock.patch.object(vr, "ssh_wait", lambda *a, **k: True),
             mock.patch.object(vr, "ssh_run", self.fake_ssh_run),
             mock.patch.object(app, "run", self.fake_run),
@@ -97,10 +98,14 @@ class VmTopoBase(unittest.TestCase):
             return 1, "", "boom"
         return 0, "ok", ""
 
-    def fake_vagrant_stream(self, run_dir, *args, on_line=None, timeout=120):
+    def fake_vagrant_stream(self, run_dir, *args, on_line=None, timeout=120, cancel=None):
         self.calls.append(("vagrant", args))
         if on_line:
             on_line("==> fake: provisioning")
+        if args[0] == "up" and getattr(self, "up_blocks", False):     # a long build, until Stop cancels it
+            while not (cancel and cancel()):
+                time.sleep(0.02)
+            return vr.CANCELLED_RC, "", "cancelled"
         if args[0] == "up" and self.vagrant_fails:
             return 1, "", "boom"
         return 0, "ok", ""
@@ -564,6 +569,42 @@ class StopDeleteTests(VmTopoBase):
         app.stop_topo_run(rid)
         destroy_calls = [c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"]
         self.assertEqual(len(destroy_calls), 1, "one vagrant destroy -f call must tear down every node in the group")
+
+
+class InstantStopTests(VmTopoBase):
+    """Stop during a build used to wait for the whole `vagrant up` (every node, for a lab) to finish before
+    tearing down. Now the build is cancelled and the half-built lab is destroyed right away."""
+
+    def test_stop_mid_build_cancels_it_and_tears_down(self):
+        self.up_blocks = True
+        rid = app.create_topo_run({"topology_id": "r2s2h2"})
+        self.assertTrue(wait_for(lambda: any(c[0] == "vagrant" and c[1][0] == "up" for c in self.calls)))
+        t0 = time.time()
+        app.stop_topo_run(rid)
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "stopped", timeout=5))
+        self.assertLess(time.time() - t0, 3, "Stop should take effect within about a second, not after the build")
+        self.assertEqual(app.TOPO_RUNS[rid]["reason"], "stopped during setup")
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)
+        self.assertIn(("destroy_after_cancel",), self.calls)
+        self.assertFalse([c for c in self.calls if c[0] == "vagrant" and c[1][0] == "destroy"],
+                         "already torn down after the cancel; the runner's cleanup must not destroy a second time")
+        self.assertFalse(app.topo_run_dir(rid).exists(), "the run folder (Vagrantfile, SSH key) is still removed")
+
+    def test_stop_while_waiting_for_ssh_stops_instead_of_erroring(self):
+        waits = []
+
+        def slow_ssh_wait(port, key, tries=60, delay=2, on_attempt=None, cancel=None):
+            waits.append(port)
+            while not (cancel and cancel()):
+                time.sleep(0.02)
+            return False
+        with mock.patch.object(vr, "ssh_wait", slow_ssh_wait):
+            rid = app.create_topo_run({"topology_id": "r2s2h2"})
+            self.assertTrue(wait_for(lambda: waits))
+            app.stop_topo_run(rid)
+            self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] in ("stopped", "error"), timeout=5))
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "stopped")
 
 
 class StopRaceTests(VmTopoBase):

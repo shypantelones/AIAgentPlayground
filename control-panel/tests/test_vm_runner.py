@@ -145,6 +145,44 @@ class VagrantStreamTests(unittest.TestCase):
         self.assertIn("Vagrant", out)
 
 
+class VagrantStreamCancelTests(unittest.TestCase):
+    """vagrant_stream(cancel=...) must kill the whole process tree promptly - Vagrant's real work runs in child
+    processes, so killing only the launcher would leave the build going."""
+
+    @unittest.skipIf(sys.platform == "win32", "uses a POSIX shell script as a stand-in for vagrant")
+    def test_cancel_kills_the_process_tree_promptly(self):
+        import os, time
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            marker = tmp / "child-survived"
+            fake = tmp / "vagrant"
+            # the "launcher" starts a child that would write a marker after 3s, then waits for it
+            fake.write_text(f"#!/bin/sh\necho booting\n(sleep 3; touch {marker}) &\nwait\n")
+            fake.chmod(0o755)
+            env_path = f"{tmp}:{os.environ.get('PATH', '')}"
+            with mock.patch.dict(os.environ, {"PATH": env_path}):
+                t0 = time.time()
+                rc, out, err = vr.vagrant_stream(tmp, "up", timeout=60, cancel=lambda: time.time() - t0 > 0.5)
+            self.assertEqual(rc, vr.CANCELLED_RC)
+            self.assertIn("booting", out)
+            self.assertLess(time.time() - t0, 2.5)
+            time.sleep(3.5)
+            self.assertFalse(marker.exists(), "the child process outlived the cancel")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ssh_wait_stops_trying_once_cancelled(self):
+        with mock.patch.object(vr, "_run", side_effect=AssertionError("must not try once cancelled")):
+            self.assertFalse(vr.ssh_wait(22, "k", tries=5, delay=0, cancel=lambda: True))
+
+    def test_destroy_after_cancel_retries_until_destroy_succeeds(self):
+        results = iter([(1, "", "locked"), (1, "", "locked"), (0, "ok", "")])
+        with mock.patch.object(vr, "vagrant", side_effect=lambda *a, **k: next(results)) as v:
+            rc, _, _ = vr.destroy_after_cancel("d", tries=3, delay=0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(v.call_count, 3)
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to

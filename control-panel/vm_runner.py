@@ -10,10 +10,12 @@ Isolation posture for every VM this module creates:
   - Clipboard, drag-and-drop and audio are disabled (same as the original vm-sandbox/Vagrantfile).
 A VM never gets a route to the host, to another VM, or to any agent other than the one it was created for.
 """
-import json, os, re, secrets, shutil, socket, subprocess, sys, threading, time
+import json, os, re, secrets, shutil, signal, socket, subprocess, sys, threading, time
 from pathlib import Path
 
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+WINDOWS = sys.platform.startswith("win")
+CANCELLED_RC = 130     # returned by vagrant_stream() when its `cancel` check asked it to stop
 RUN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
 BOX = "ubuntu/jammy64"          # same box as vm-sandbox/Vagrantfile; Vagrant caches it once, shared across runs
 SSH_PORT_RANGE = (62200, 62299)  # host-side forwarded ports this feature uses, one per concurrently-provisioned VM
@@ -129,25 +131,54 @@ def vagrant(run_dir, *args, timeout=120):
     return _run(["vagrant", *args], cwd=str(run_dir), timeout=timeout)
 
 
-def vagrant_stream(run_dir, *args, on_line=None, timeout=120):
+def _kill_tree(p):
+    """Kill a process and everything it started. Vagrant runs as a launcher plus Ruby (and VBoxManage) children, so
+    killing only the top process leaves the real work running - on Windows taskkill /T walks the tree; elsewhere
+    the process was started in its own session/process group, which is killed as a whole."""
+    try:
+        if WINDOWS:
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=30,
+                           creationflags=NOWIN)
+        else:
+            os.killpg(p.pid, signal.SIGKILL)
+    except Exception:  # noqa - already gone, or no permission: fall back to the process itself
+        pass
+    try:
+        p.kill()
+    except Exception:  # noqa
+        pass
+
+
+def vagrant_stream(run_dir, *args, on_line=None, timeout=120, cancel=None):
     """Like vagrant(), but calls on_line(line) as each line of output is produced instead of only returning the
     full output once the command finishes - for a long multi-machine `up`, a caller that wants to show live
     progress (not just a post-hoc tail dump once everything has already finished or failed) needs this. A
     threading.Timer enforces the overall timeout independently of the read loop, so a single long-hanging line
-    (e.g. a \\r-only progress bar with no newline for a while) can't defeat it."""
+    (e.g. a \\r-only progress bar with no newline for a while) can't defeat it.
+    `cancel`, if given, is polled every second; when it returns True the whole vagrant process tree is killed and
+    CANCELLED_RC is returned - this is what makes Stop take effect mid-build instead of after it."""
     try:
         p = subprocess.Popen(["vagrant", *args], cwd=str(run_dir), stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                             creationflags=NOWIN)
+                             creationflags=NOWIN, start_new_session=not WINDOWS)
     except FileNotFoundError as e:
         return 127, "", str(e)
-    timed_out = threading.Event()
+    timed_out, cancelled, done = threading.Event(), threading.Event(), threading.Event()
 
     def kill_on_timeout():
         timed_out.set()
-        p.kill()
+        _kill_tree(p)
+
+    def watch_cancel():
+        while not done.wait(1.0):
+            if cancel():
+                cancelled.set()
+                _kill_tree(p)
+                return
     timer = threading.Timer(timeout, kill_on_timeout)
     timer.start()
+    if cancel:
+        threading.Thread(target=watch_cancel, daemon=True).start()
     lines = []
     try:
         for raw in p.stdout:
@@ -157,11 +188,26 @@ def vagrant_stream(run_dir, *args, on_line=None, timeout=120):
                 on_line(line)
         p.wait()
     finally:
+        done.set()
         timer.cancel()
         p.stdout.close()
+    if cancelled.is_set():
+        return CANCELLED_RC, "\n".join(lines), "cancelled"
     if timed_out.is_set():
         return 124, "\n".join(lines), "timed out"
     return p.returncode, "\n".join(lines), ""
+
+
+def destroy_after_cancel(run_dir, tries=3, delay=5, timeout=180):
+    """`vagrant destroy -f` right after an interrupted `up`: VirtualBox can still hold the session lock of the
+    operation that was killed for a few seconds, so retry a little before giving up."""
+    rc, out, err = 1, "", ""
+    for i in range(tries):
+        rc, out, err = vagrant(run_dir, "destroy", "-f", timeout=timeout)
+        if rc == 0:
+            break
+        time.sleep(delay)
+    return rc, out, err
 
 
 def write_seed_files(run_dir, seed):
@@ -194,13 +240,15 @@ def _ssh_base(port, key_path):
             "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
 
 
-def ssh_wait(port, key_path, tries=60, delay=2, on_attempt=None):
+def ssh_wait(port, key_path, tries=60, delay=2, on_attempt=None, cancel=None):
     """Poll until the VM accepts SSH (cloud-image boots can take a little while after VirtualBox reports 'running').
     `on_attempt(i, rc, err)`, if given, is called after every attempt (success or failure) so a caller can log
     *why* each attempt failed - the rc/stdout alone (what callers got before) discards the one piece of
     information (ssh's own stderr) that actually explains a failure, which made a real intermittent multi-VM
-    failure undiagnosable until this was added."""
+    failure undiagnosable until this was added. `cancel`, if given, is checked before each attempt (returns False)."""
     for i in range(tries):
+        if cancel and cancel():
+            return False
         rc, out, err = _run([*_ssh_base(port, key_path), "bench@127.0.0.1", "true"], timeout=8)
         if on_attempt:
             on_attempt(i, rc, err)
