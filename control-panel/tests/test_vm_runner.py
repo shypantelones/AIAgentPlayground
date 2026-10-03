@@ -183,6 +183,19 @@ class VagrantStreamCancelTests(unittest.TestCase):
         self.assertEqual(v.call_count, 3)
 
 
+class SnapshotParseTests(unittest.TestCase):
+    def test_sections_are_split_and_preamble_ignored(self):
+        out = vr.parse_snapshot("motd junk\n### addresses\nenp0s8 UP 10.0.0.1/24\n### routes\n10.0.0.0/24 dev enp0s8\n")
+        self.assertEqual(out, {"addresses": "enp0s8 UP 10.0.0.1/24\n", "routes": "10.0.0.0/24 dev enp0s8\n"})
+
+    def test_route_lifetimes_are_removed_so_unchanged_nodes_diff_clean(self):
+        # real output from a lab node, a few seconds apart (found in a live diff: every node "changed")
+        a = "### routes\ndefault via fe80::2 dev enp0s3 proto ra metric 100 expires 1600sec pref medium\n"
+        b = "### routes\ndefault via fe80::2 dev enp0s3 proto ra metric 100 expires 1597sec pref medium\n"
+        self.assertEqual(vr.parse_snapshot(a), vr.parse_snapshot(b))
+        self.assertEqual(vr.parse_snapshot(a)["routes"], "default via fe80::2 dev enp0s3 proto ra metric 100 pref medium\n")
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to

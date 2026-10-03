@@ -212,6 +212,7 @@ async function loadVTDetail() {
   if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
   parts.push(...nodeRows);
   if (r.state === "ready" && r.has_vms && !r.agent_holds) parts.push(vtAttachBox(r));
+  parts.push(vtSnapshots(r));
   if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "lab"));
   if (r.interactive && ["attached", "working"].includes(r.state))
     parts.push(sessionBox(r, "/api/vmtopo/runs", "lab", () => { vtSig.detail = ""; vtLoad(); }));
@@ -257,4 +258,78 @@ function vtAttachBox(r) {
     prompt,
     h("label", { class: "row" }, interactive, "interactive session"),
     msg, h("div", { class: "row" }, go));
+}
+
+/* Config snapshots: what's configured on every node, captured on demand and after every agent turn. View one,
+   download it as a zip, or compare any two. The picks and the open view survive the detail view's redraws. */
+let vtSnap = { rid: null, picks: [], view: null };
+const VT_SNAP_STATES = ["ready", "working", "attached", "scoring", "done", "stopped"];
+
+function vtSnapshots(r) {
+  if (vtSnap.rid !== r.id) vtSnap = { rid: r.id, picks: [], view: null };
+  const base = `/api/vmtopo/runs/${r.id}/snapshots`;
+  const list = h("div", { class: "col" }, h("p", { class: "hint" }, "Loading snapshots..."));
+  const out = h("div", { class: "col" });
+  const label = h("input", { placeholder: "label (optional), e.g. before OSPF", maxlength: 80, style: "max-width:260px" });
+  const take = h("button", { disabled: !(r.has_vms && VT_SNAP_STATES.includes(r.state)), onclick: async () => {
+    try {
+      const j = await api(`/api/vmtopo/runs/${r.id}/snapshot`, { label: label.value.trim() || null });
+      label.value = "";
+      trackJob(j.job, `Snapshot lab ${r.id}`, () => draw());
+    } catch (e) { alert(e.message); }
+  } }, "Take snapshot");
+  const compare = h("button", { onclick: () => show({ kind: "diff", a: vtSnap.picks[0], b: vtSnap.picks[1] }) }, "Compare selected");
+
+  async function show(view) {
+    vtSnap.view = view;
+    out.replaceChildren(h("p", { class: "hint" }, "Loading..."));
+    try {
+      if (view.kind === "view") {
+        const s = await api(`${base}/${view.id}`);
+        out.replaceChildren(h("div", { class: "row" }, h("b", {}, `Snapshot ${s.id}`), h("span", { class: "status" }, s.label || s.trigger),
+            h("span", { class: "sp" }), h("button", { onclick: () => { vtSnap.view = null; out.replaceChildren(); } }, "Close")),
+          ...Object.entries(s.nodes).map(([node, secs]) => h("details", {},
+            h("summary", {}, node, secs._error ? h("span", { class: "fail" }, " unreachable") : ""),
+            ...Object.entries(secs).map(([sec, text]) => h("div", { class: "col" }, h("div", { class: "hint" }, sec), h("pre", {}, text))))));
+      } else {
+        const [a, b] = [view.a, view.b].sort();                   // ids sort by time: older first
+        const d = await api(`${base}/${a}/diff/${b}`);
+        const colored = text => h("pre", { class: "diff" }, ...text.split("\n").map(l => h("span", {
+          class: l.startsWith("+") && !l.startsWith("+++") ? "add" : l.startsWith("-") && !l.startsWith("---") ? "del" : l.startsWith("@@") ? "hunk" : "" }, l + "\n")));
+        out.replaceChildren(h("div", { class: "row" }, h("b", {}, `Changes from ${a} to ${b}`),
+            h("span", { class: "status" }, d.changed ? `${d.changed} section${d.changed === 1 ? "" : "s"} changed` : "no changes"),
+            h("span", { class: "sp" }), h("button", { onclick: () => { vtSnap.view = null; out.replaceChildren(); } }, "Close")),
+          ...Object.entries(d.nodes).map(([node, secs]) => h("div", { class: "col" }, h("b", {}, node),
+            ...Object.entries(secs).map(([sec, text]) => h("div", { class: "col" }, h("div", { class: "hint" }, sec), colored(text))))));
+      }
+    } catch (e) { out.replaceChildren(h("p", { class: "fail" }, e.message)); }
+  }
+
+  async function draw() {
+    let snaps;
+    try { snaps = await api(base); } catch (e) { list.replaceChildren(h("p", { class: "fail" }, e.message)); return; }
+    vtSnap.picks = vtSnap.picks.filter(id => snaps.some(s => s.id === id));
+    compare.disabled = vtSnap.picks.length !== 2;
+    if (!snaps.length) { list.replaceChildren(h("p", { class: "hint" }, "No snapshots yet. One is taken after every agent turn, or take one now.")); return; }
+    list.replaceChildren(...snaps.map(s => {
+      const pick = h("input", { type: "checkbox", checked: vtSnap.picks.includes(s.id), title: "select two to compare" });
+      pick.addEventListener("change", () => {
+        vtSnap.picks = pick.checked ? [...vtSnap.picks, s.id].slice(-2) : vtSnap.picks.filter(id => id !== s.id);
+        draw();
+      });
+      return h("div", { class: "row snap" }, pick,
+        h("span", { class: "num" }, new Date(s.ts * 1000).toLocaleString()),
+        h("span", {}, s.label || s.trigger),
+        s.errors.length ? h("span", { class: "fail" }, `unreachable: ${s.errors.join(", ")}`) : "",
+        h("span", { class: "sp" }),
+        h("button", { onclick: () => show({ kind: "view", id: s.id }) }, "View"),
+        h("a", { href: `${base}/${s.id}/zip`, download: "" }, "Download"));
+    }));
+  }
+  draw();
+  if (vtSnap.view) show(vtSnap.view);
+  return h("div", { class: "col bench" },
+    h("div", { class: "row" }, h("b", {}, "Config snapshots"), h("span", { class: "sp" }), label, take, compare),
+    h("p", { class: "hint" }, "Every node's addresses, routes, forwarding, bridges and VLANs, firewall rules and service configs (netplan, FRR, nginx). Snapshots are kept after the lab's VMs are gone; Delete removes them."),
+    list, out);
 }

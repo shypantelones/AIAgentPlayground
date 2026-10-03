@@ -4,7 +4,7 @@
 Runs on the HOST (never inside a sandbox). Binds to 127.0.0.1 only. Every action maps to a fixed,
 validated docker command; there is no free-form shell. Standard library only.
 """
-import ipaddress, json, os, queue, re, secrets, shutil, subprocess, sys, threading, time, urllib.request, uuid
+import difflib, io, ipaddress, json, os, queue, re, secrets, shutil, subprocess, sys, threading, time, urllib.request, uuid, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -1770,6 +1770,120 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     return None
 
 
+# ---------------------------------------------------------------- config snapshots
+# What's configured on every node of a lab (addresses, routes, forwarding, bridges/VLANs, nftables/iptables, netplan,
+# FRR and nginx configs - see vr.SNAPSHOT_SCRIPT), captured on demand and after every agent turn, so you can review
+# exactly what changed and take the configs with you. Stored next to the lab's record (not in its VM folder), so they
+# outlive the VMs; deleted with the lab. The newest TOPO_SNAP_KEEP per lab are kept.
+TOPO_SNAP_KEEP = 50
+TOPO_SNAP_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-f0-9]{4}$")
+TOPO_SNAP_STATES = ("ready", "working", "attached", "scoring", "done", "stopped")     # states whose VMs may be up
+
+
+def topo_snap_dir(rid):
+    return TOPOR_DIR / f"{rid}.snapshots"
+
+
+def take_topo_snapshot(r, trigger, label=None):
+    """Capture every node's config now (nodes in parallel). A node that can't be reached is recorded with an error
+    instead of failing the whole snapshot."""
+    rid = r["id"]
+    if r["state"] not in TOPO_SNAP_STATES:
+        raise ValueError("the lab's VMs aren't running")
+    priv = topo_run_dir(rid) / "id_ed25519"
+    if not priv.exists():
+        raise ValueError("this lab's VMs are gone")
+    nodes, threads = {}, []
+
+    def grab(name, port):
+        rc, out, err = vr.ssh_script(port, priv, vr.SNAPSHOT_SCRIPT, timeout=60)
+        nodes[name] = vr.parse_snapshot(out) if rc == 0 else {"_error": (err or out or f"ssh exit {rc}").strip()[-500:]}
+    for name, node in r["nodes"].items():
+        t = threading.Thread(target=grab, args=(name, node["ssh_port"]), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=90)
+    now = time.time()
+    snap = {"id": time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + secrets.token_hex(2), "ts": now,
+            "trigger": trigger, "label": (str(label).strip()[:80] or None) if label else None,
+            "nodes": {n: nodes.get(n, {"_error": "timed out"}) for n in r["nodes"]}}
+    d = topo_snap_dir(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{snap['id']}.json").write_text(json.dumps(snap, indent=1))
+    for old in sorted(d.glob("*.json"))[:-TOPO_SNAP_KEEP]:
+        old.unlink()
+    return snap
+
+
+def list_topo_snapshots(rid):
+    out = []
+    for f in topo_snap_dir(rid).glob("*.json"):
+        try:
+            s = json.loads(f.read_text())
+        except Exception:  # noqa
+            continue
+        out.append({"id": s["id"], "ts": s["ts"], "trigger": s.get("trigger"), "label": s.get("label"),
+                    "nodes": sorted(s["nodes"]), "errors": sorted(n for n, v in s["nodes"].items() if "_error" in v)})
+    return sorted(out, key=lambda s: s["ts"], reverse=True)          # newest first
+
+
+def load_topo_snapshot(rid, sid):
+    if not TOPO_SNAP_ID_RE.match(sid or ""):
+        raise ValueError("bad snapshot id")
+    f = topo_snap_dir(rid) / f"{sid}.json"
+    if not f.exists():
+        raise KeyError("no such snapshot")
+    return json.loads(f.read_text())
+
+
+def diff_topo_snapshots(rid, a, b):
+    """Unified diff per node and section, from snapshot `a` (older) to `b` (newer). Unchanged sections are left out."""
+    sa, sb = load_topo_snapshot(rid, a), load_topo_snapshot(rid, b)
+    nodes = {}
+    for node in sorted(set(sa["nodes"]) | set(sb["nodes"])):
+        na, nb = sa["nodes"].get(node, {}), sb["nodes"].get(node, {})
+        for sec in sorted(set(na) | set(nb)):
+            # re-cleaned here too, so snapshots stored before a volatile pattern was known still diff cleanly
+            ta, tb = (vr.SNAPSHOT_VOLATILE.sub("", x.get(sec, "")) for x in (na, nb))
+            if ta != tb:
+                d = "".join(difflib.unified_diff(ta.splitlines(True), tb.splitlines(True),
+                                                 f"{a}/{node}/{sec}", f"{b}/{node}/{sec}"))
+                nodes.setdefault(node, {})[sec] = d
+    return {"from": a, "to": b, "changed": sum(len(v) for v in nodes.values()), "nodes": nodes}
+
+
+def topo_snapshot_zip(rid, sid):
+    """The snapshot as a zip: <lab>-<snapshot>/<node>/<section>.txt, plus a README with when and why it was taken."""
+    s = load_topo_snapshot(rid, sid)
+    root = f"lab-{rid}-{sid}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{root}/README.txt", f"Config snapshot {sid} of lab {rid}\nTaken: {time.ctime(s['ts'])}\n"
+                                          f"Why: {s.get('label') or s.get('trigger')}\n")
+        for node, secs in s["nodes"].items():
+            for sec, text in secs.items():
+                fname = re.sub(r"[^A-Za-z0-9._-]+", "_", sec.replace("file /", "file_")).strip("_") or "section"
+                z.writestr(f"{root}/{node}/{fname}.txt", text)
+    return f"{root}.zip", buf.getvalue()
+
+
+def snapshot_topo_lab(rid, label=None):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] not in TOPO_SNAP_STATES or not (topo_run_dir(rid) / "id_ed25519").exists():
+        raise ValueError("the lab's VMs aren't running")
+
+    def job(log):
+        log("capturing the config of every node...")
+        snap = take_topo_snapshot(r, "taken by you", label)
+        topo_log(r, f"config snapshot {snap['id']} taken" + (f" ({snap['label']})" if snap["label"] else ""))
+        log(f"snapshot {snap['id']} saved")
+        return {"id": snap["id"]}
+    return start_job(f"Snapshot lab {rid}", job)
+
+
 def detach_topo_agent(agent):
     """Take an agent's way into a lab away: its vm-relay-topo container and the lab key in its workspace. Best effort."""
     try:
@@ -1785,6 +1899,11 @@ def topo_agent_turn(r, message):
     res = counted_agent_turn(r, message, "vm-session-topo.log", lambda: run_turn(
         r["agent"], r["chat"], message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200))
     topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
+    try:                                    # what this turn left configured on the nodes, for review and diffs
+        snap = take_topo_snapshot(r, f"after {r['agent']}'s turn {r.get('agent_turns', '?')}")
+        topo_log(r, f"config snapshot {snap['id']} taken")
+    except Exception as e:  # noqa - a snapshot is a convenience; never let it break the agent's run
+        topo_log(r, f"config snapshot skipped: {e}")
     return res
 
 
@@ -2045,6 +2164,7 @@ def delete_topo_run(rid):
         vr.vagrant(d, "destroy", "-f", timeout=180)
         shutil.rmtree(d, ignore_errors=True)
     TOPO_RUNS.pop(rid, None)
+    shutil.rmtree(topo_snap_dir(rid), ignore_errors=True)
     try:
         topo_run_path(rid).unlink()
     except FileNotFoundError:
@@ -2646,6 +2766,15 @@ class Handler(BaseHTTPRequestHandler):
     def fail(self, code, msg):
         self.send_json({"error": msg}, code)
 
+    def send_download(self, filename, data, ctype="application/zip"):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def body(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 1_000_000:
@@ -2697,6 +2826,20 @@ class Handler(BaseHTTPRequestHandler):
             if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 4 and TOPO_RUN_ID_RE.match(parts[3]):
                 r = TOPO_RUNS.get(parts[3])
                 return self.send_json(topo_run_view(r, full=True)) if r else self.fail(404, "no such run")
+            if (parts[:3] == ["api", "vmtopo", "runs"] and len(parts) >= 5 and TOPO_RUN_ID_RE.match(parts[3])
+                    and parts[4] == "snapshots"):
+                rid = parts[3]
+                if rid not in TOPO_RUNS:
+                    return self.fail(404, "no such run")
+                if len(parts) == 5:                                   # .../snapshots
+                    return self.send_json(list_topo_snapshots(rid))
+                if len(parts) == 6:                                   # .../snapshots/<id>
+                    return self.send_json(load_topo_snapshot(rid, parts[5]))
+                if len(parts) == 7 and parts[6] == "zip":             # .../snapshots/<id>/zip
+                    name, data = topo_snapshot_zip(rid, parts[5])
+                    return self.send_download(name, data)
+                if len(parts) == 8 and parts[6] == "diff":            # .../snapshots/<a>/diff/<b>
+                    return self.send_json(diff_topo_snapshots(rid, parts[5], parts[7]))
             if parts == ["api", "peers"]:
                 links = [dict(l, risks=peer_risks(l["a"], l["b"])) for l in load_links()["links"]
                          if (DATA / l["a"] / "meta.json").exists() and (DATA / l["b"] / "meta.json").exists()]
@@ -2726,6 +2869,8 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(404, "not found")
         except KeyError as e:
             self.fail(404, str(e))
+        except ValueError as e:
+            self.fail(400, str(e))
         except Exception as e:  # noqa
             self.fail(500, str(e))
 
@@ -2797,6 +2942,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[4] == "attach":
                     attach_agent_to_lab(parts[3], b)
                     return self.send_json({"ok": True})
+                if parts[4] == "snapshot":
+                    return self.send_json({"job": snapshot_topo_lab(parts[3], b.get("label"))})
                 if parts[4] == "resume":
                     resume_topo_lab(parts[3])
                     return self.send_json({"ok": True})
