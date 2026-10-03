@@ -1412,7 +1412,9 @@ TOPO_LOCK = threading.RLock()
 TOPO_TERM_CREDS = {}     # "<run id>:<node>" -> current terminal credential; kept in memory only, never persisted
 TOPO_STOP = {}           # run id -> bool, polled by the runner thread at phase boundaries
 TOPO_RUN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
-TOPO_LIVE_STATES = ("queued", "provisioning", "working", "attached", "scoring")     # "attached": see VM_LIVE_STATES
+# "attached": see VM_LIVE_STATES. "saving"/"resuming": a saved lab's VMs being shut down or booted again (see
+# save_topo_lab); "saved" itself is neither live nor occupying - its VMs are off and hold no slot.
+TOPO_LIVE_STATES = ("queued", "provisioning", "working", "attached", "scoring", "saving", "resuming")
 TOPO_OCCUPYING_STATES = TOPO_LIVE_STATES + ("ready",)
 TOPO_FOLLOWUPS = {}      # run id -> queue.Queue of your follow-up messages for an interactive lab session
 TOPO_END = {}            # run id -> True once you end an interactive lab session
@@ -1421,9 +1423,16 @@ TOPO_FOLLOWUP_REMINDER = ("\n\n(Keep working on the lab nodes with their ./vmrun
 TOPO_RELAY_FILES = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay-topo.compose.yml")]
 
 
+def agent_holds_lab(r, agent):
+    """Is `agent` attached to (or about to work in) this lab? A resumed lab still names the agent that once worked in
+    it, for its conversation, but the agent has no access to it any more."""
+    return r.get("agent") == agent and r["state"] in TOPO_OCCUPYING_STATES and r["state"] not in ("saving", "resuming") \
+        and not r.get("resumed")
+
+
 def stop_topo_runs_for(agent_name):
     for r in list(TOPO_RUNS.values()):
-        if r.get("agent") == agent_name and r["state"] in TOPO_OCCUPYING_STATES:
+        if agent_holds_lab(r, agent_name):
             TOPO_STOP[r["id"]] = True
 
 
@@ -1459,7 +1468,11 @@ def load_topo_runs():
             r = json.loads(f.read_text())
         except Exception:
             continue
-        if r["state"] in TOPO_LIVE_STATES:
+        if r["state"] in ("saving", "resuming"):
+            # its VMs are kept either way (a saving lab is always "keep"); Resume brings it back from any of these
+            r.update(state="saved", reason=f"the control panel was restarted while {r['state']}; Resume to boot it again")
+            f.write_text(json.dumps(r, indent=1))
+        elif r["state"] in TOPO_LIVE_STATES:
             if r.get("agent") and r["state"] in ("working", "attached"):
                 threading.Thread(target=detach_topo_agent, args=(r["agent"],), daemon=True).start()   # see load_vm_runs
             r.update(state="interrupted", reason=(r.get("reason") or "") or "the control panel was restarted")
@@ -1476,6 +1489,8 @@ def topo_run_view(r, full=False):
     v.update({k: r.get(k) for k in ("agent_model", "agent_turns", "agent_turns_with_commands", "agent_commands")})
     v["interactive"] = bool(r.get("interactive"))
     v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
+    v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
+    v.update({k: r.get(k) for k in ("saved_at", "resumed")})
     if full:
         v["transcript"] = r.get("vm_log", "")[-20000:]
         if r.get("agent") and r.get("chat"):
@@ -1530,7 +1545,7 @@ def create_topo_run(form):
             raise ValueError("pick a task or write a custom prompt for the agent to attempt")
         # one lab per agent: every lab's relay is the same `vm-relay-topo` service and its node commands are named
         # vmrun-<node>, so a second lab would replace the first one's relay and could overwrite its commands
-        busy = [x for x in TOPO_RUNS.values() if x.get("agent") == agent and x["state"] in TOPO_OCCUPYING_STATES]
+        busy = [x for x in TOPO_RUNS.values() if agent_holds_lab(x, agent)]
         if busy:
             raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
     elif interactive:
@@ -1819,9 +1834,120 @@ def stop_topo_run(rid):
         r.update(state="stopped", reason="stopped by you", ended=time.time())
         save_topo_run(r)
         return
+    if r["state"] == "saving":
+        raise ValueError("the lab is being saved; wait a moment for it to finish")
     if r["state"] not in TOPO_LIVE_STATES:
         raise ValueError("this run isn't live")
     TOPO_STOP[rid] = True
+
+
+# ---------------------------------------------------------------- save / resume (labs you keep)
+# Save suspends a lab's VMs (`vagrant suspend`: VirtualBox writes each VM's full running state to disk and frees its
+# memory). The lab is "saved", holds no VM slots, and Resume restores the VMs exactly as they were. A shutdown
+# (`vagrant halt`) would not do: lab work is mostly runtime state - addresses and routes set with `ip`, sysctls, an
+# nftables ruleset not written to disk - and a reboot loses all of it. The cost is disk: about each VM's RAM.
+# A saved lab is always "keep", so nothing tears it down except Delete.
+TOPO_SAVABLE_STATES = ("ready", "done", "stopped")
+
+
+def save_topo_lab(rid):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] not in TOPO_SAVABLE_STATES:
+        raise ValueError("only a lab that's ready, done or stopped can be saved (end any session first)")
+    if r["state"] == "ready" and r.get("agent") and not r.get("resumed"):
+        raise ValueError("an agent is about to start working in this lab")
+    if not (topo_run_dir(rid) / "Vagrantfile").exists():
+        raise ValueError("this lab's VMs are gone, so there's nothing to save")
+    for name, node in r["nodes"].items():
+        if node.get("terminal", {}).get("active"):
+            stop_topo_terminal(rid, name, quiet=True)
+    r.update(state="saving", keep=True, reason="")
+    save_topo_run(r)
+    threading.Thread(target=topo_save_runner, args=(rid,), daemon=True).start()
+
+
+def topo_save_runner(rid):
+    r = TOPO_RUNS[rid]
+    d = topo_run_dir(rid)
+    try:
+        topo_log(r, "saving: suspending the lab's VMs (their full running state is written to disk; nothing is destroyed)...")
+        rc, out, err = vr.vagrant(d, "suspend", timeout=120 + 90 * len(r["nodes"]))
+        if rc != 0:
+            topo_log(r, (out or err)[-2000:])
+            r.update(state="stopped", reason="could not save the lab (see transcript); its VMs are kept, so Save can be retried")
+        else:
+            r.update(state="saved", saved_at=time.time(), reason="")
+            topo_log(r, "saved. Resume brings the VMs back exactly as they were, including addresses, routes and rules you set.")
+    except Exception as e:  # noqa
+        r.update(state="stopped", reason=f"could not save the lab: {e}")
+    finally:
+        save_topo_run(r)
+        TOPO_STOP.pop(rid, None)
+
+
+def resume_topo_lab(rid):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] != "saved":
+        raise ValueError("only a saved lab can be resumed")
+    if not (topo_run_dir(rid) / "Vagrantfile").exists():
+        raise ValueError("this lab's VMs are gone, so it can't be resumed")
+    r.update(state="resuming", reason="")
+    save_topo_run(r)
+    threading.Thread(target=topo_resume_runner, args=(rid,), daemon=True).start()
+
+
+def topo_resume_runner(rid):
+    """Restore a saved lab's VMs. Any way this ends other than "ready", the VMs are suspended again and the lab goes
+    back to "saved" - never destroyed, since that's the work you saved."""
+    r = TOPO_RUNS[rid]
+    d = topo_run_dir(rid)
+
+    def stopped():
+        return TOPO_STOP.get(rid, False)
+
+    def back_to_saved(reason):
+        topo_log(r, "suspending the VMs again; the lab stays saved...")
+        vr.vagrant_retry(d, "suspend", timeout=120 + 90 * len(r["nodes"]))
+        r.update(state="saved", reason=reason)
+
+    my_slots = len(r["nodes"])
+    try:
+        while count_occupying_slots() > max(vmb_settings()["max_concurrent"], my_slots):   # see topo_run_runner
+            if stopped():
+                r.update(state="saved", reason="resume cancelled while waiting for free VM slots")
+                return
+            time.sleep(1)
+        topo_log(r, f"resuming: restoring the {my_slots} saved VMs...")
+
+        def on_vagrant_line(line):
+            idx = line.find("==>")
+            if idx != -1:
+                topo_log(r, line[idx:])
+        rc, out, err = vr.vagrant_stream(d, "resume", "--no-provision", timeout=300 + 120 * my_slots,
+                                         on_line=on_vagrant_line, cancel=stopped)
+        if stopped():
+            return back_to_saved("resume stopped by you")
+        if rc != 0:
+            topo_log(r, (out or err)[-2000:])
+            return back_to_saved("resume failed (see transcript)")
+        priv = d / "id_ed25519"
+        for name, node in r["nodes"].items():
+            if not vr.ssh_wait(node["ssh_port"], priv, tries=90, delay=2, cancel=stopped):
+                return back_to_saved("resume stopped by you" if stopped() else f"node '{name}' booted but never accepted SSH")
+        r.update(state="ready", resumed=True, ended=None, reason="")
+        topo_log(r, "ready again: your saved lab is back as it was. Open a terminal on any node, or Save it again when you're done.")
+    except Exception as e:  # noqa
+        try:
+            back_to_saved(f"resume failed: {e}")
+        except Exception:  # noqa
+            r.update(state="saved", reason=f"resume failed: {e}")
+    finally:
+        save_topo_run(r)
+        TOPO_STOP.pop(rid, None)
 
 
 def delete_topo_run(rid):
@@ -2584,6 +2710,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"job": topo_score_now(parts[3])})
                 if parts[4] == "message":
                     return self.send_json(send_topo_followup(parts[3], b.get("text")))
+                if parts[4] == "save":
+                    save_topo_lab(parts[3])
+                    return self.send_json({"ok": True})
+                if parts[4] == "resume":
+                    resume_topo_lab(parts[3])
+                    return self.send_json({"ok": True})
                 if parts[4] == "end":
                     end_topo_session(parts[3])
                     return self.send_json({"ok": True})

@@ -40,7 +40,8 @@ let VB = null;
 const vbSig = {};
 const vbDrafts = {};          // "<api base>/<run id>" -> unsent follow-up text, kept across the detail views' 2-second redraws
 const VB_STATE_LABEL = { queued: "queued", provisioning: "starting VM", ready: "ready", working: "agent working", attached: "session open",
-  scoring: "scoring", done: "done", error: "error", stopped: "stopped", interrupted: "interrupted (panel restarted)" };
+  scoring: "scoring", done: "done", error: "error", stopped: "stopped", interrupted: "interrupted (panel restarted)",
+  saving: "saving", saved: "saved", resuming: "resuming" };
 const vbFmtTime = t => t ? new Date(t * 1000).toLocaleTimeString() : "";
 const vbElapsed = r => { const end = r.ended || Date.now() / 1000; const s = Math.max(0, Math.round(end - (r.started || r.created))); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`; };
 
@@ -51,7 +52,7 @@ async function refreshVBBadge() {
       if (typeof vtData !== "undefined") vtData = await api("/api/vmtopo").catch(() => vtData);
     }
     const busy = vbData.runs.filter(r => ["provisioning", "working", "attached", "scoring"].includes(r.state)).length +
-      (typeof vtData !== "undefined" ? vtData.runs.filter(r => ["provisioning", "working", "attached", "scoring"].includes(r.state)).length : 0);
+      (typeof vtData !== "undefined" ? vtData.runs.filter(r => ["provisioning", "working", "attached", "scoring", "saving", "resuming"].includes(r.state)).length : 0);
     vbBtn.textContent = busy ? `VM Labs (${busy} running)` : "VM Labs";
   } catch { /* panel may be restarting */ }
 }
