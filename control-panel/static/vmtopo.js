@@ -69,17 +69,45 @@ function vtBuildSection() {
   const taskRow = h("div", { class: "row" }, "Task", VT.newTask);
   const promptRow = h("label", { class: "row" }, VT.promptOn, "write a custom prompt instead of picking a task",
     " (no automated score)");
+  // -- or a lab file: a lab exported from a snapshot (topology + every node's config), rebuilt with its configs --
+  VT.fileOn = h("input", { type: "checkbox" });
+  VT.fileInput = h("input", { type: "file", accept: ".json,application/json" });
+  VT.fileInfo = h("div", { class: "hint" }, "Choose a lab file exported from a lab's snapshots.");
+  VT.labfile = null;
+  VT.fileInput.addEventListener("change", async () => {
+    VT.labfile = null;
+    const f = VT.fileInput.files[0];
+    if (!f) { VT.fileInfo.textContent = "Choose a lab file exported from a lab's snapshots."; return; }
+    try {
+      const lf = JSON.parse(await f.text());
+      if (lf.format !== "aiagentplayground-lab") throw new Error("this isn't an AI Agent Playground lab file");
+      VT.labfile = lf;
+      const nodes = (lf.topology?.nodes || []).map(n => `${n.name} (${n.role})`);
+      const cfg = Object.keys(lf.configs || {});
+      VT.fileInfo.className = "hint";
+      VT.fileInfo.textContent = `"${lf.title}": ${nodes.length} nodes (${nodes.join(", ")}), ${(lf.topology?.links || []).length} links; ` +
+        (cfg.length ? `configs for ${cfg.join(", ")} are applied once the VMs are up, then checked.` : "no configs in the file.") +
+        (lf.source?.exported ? ` Exported ${lf.source.exported}.` : "");
+    } catch (e) { VT.fileInfo.className = "fail"; VT.fileInfo.textContent = `Can't read that file: ${e.message}`; }
+  });
+  const fileBox = h("div", { class: "col" }, VT.fileInput, VT.fileInfo);
+  const customRow = h("label", { class: "row" }, VT.customOn, "build a custom topology instead");
   const syncCustomModes = () => {
-    topoRow.hidden = VT.customOn.checked;
-    custBuilder.hidden = !VT.customOn.checked;
-    taskRow.hidden = VT.customOn.checked;
-    VT.newTaskInfo.hidden = VT.customOn.checked;
-    promptRow.hidden = VT.customOn.checked;              // a custom topology has no catalog task - always prompt mode
-    VT.customPrompt.hidden = !(VT.customOn.checked || VT.promptOn.checked);
-    if (VT.customOn.checked) refreshCustomHint();
+    if (VT.fileOn.checked) VT.customOn.checked = false;
+    const fromFile = VT.fileOn.checked, custom = VT.customOn.checked;
+    topoRow.hidden = custom || fromFile;
+    customRow.hidden = fromFile;
+    custBuilder.hidden = !custom;
+    fileBox.hidden = !fromFile;
+    taskRow.hidden = custom || fromFile;
+    VT.newTaskInfo.hidden = custom || fromFile;
+    promptRow.hidden = custom || fromFile;               // custom topologies and lab files have no catalog task
+    VT.customPrompt.hidden = !(custom || fromFile || VT.promptOn.checked);
+    if (custom) refreshCustomHint();
   };
   VT.customOn.addEventListener("change", syncCustomModes);
   VT.promptOn.addEventListener("change", syncCustomModes);
+  VT.fileOn.addEventListener("change", syncCustomModes);
 
   VT.newAgents = h("div", { class: "col" }, ...vbAgentCheckboxes());
   VT.newKeep = h("input", { type: "checkbox" });
@@ -90,7 +118,11 @@ function vtBuildSection() {
     const agents = [...VT.newAgents.querySelectorAll("input:checked")].map(x => x.value);
     if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
     const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked };
-    if (VT.customOn.checked) {
+    if (VT.fileOn.checked) {
+      if (!VT.labfile) { VT.newMsg.textContent = "Choose a lab file first."; return; }
+      body.labfile = VT.labfile;
+      body.custom_prompt = VT.customPrompt.value.trim() || null;
+    } else if (VT.customOn.checked) {
       const counts = Object.fromEntries(Object.entries(VT.custCounts).map(([k, el]) => [k, +el.value || 0]));
       const wiring = VT.custWiring.value;
       const links = wiring === "manual"
@@ -125,7 +157,8 @@ function vtBuildSection() {
     h("h5", {}, "New lab"),
     h("div", { class: "col" },
       topoRow,
-      h("label", { class: "row" }, VT.customOn, "build a custom topology instead"),
+      customRow,
+      h("label", { class: "row" }, VT.fileOn, "build from a lab file"), fileBox,
       custBuilder,
       taskRow, VT.newTaskInfo, promptRow, VT.customPrompt,
       h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
@@ -209,6 +242,13 @@ async function loadVTDetail() {
   parts.push(h("div", { class: "hint" }, `${r.topology_title}${taskDesc}${r.agent ? ` · agent: ${r.agent} (${r.agent_model || "?"})` : " · no agent attached"}${r.agent_turns ? ` · ran ${r.agent_commands ?? "?"} commands in ${r.agent_turns} turn${r.agent_turns === 1 ? "" : "s"}` : ""}${r.interactive ? " · interactive session" : ""} · started ${vtFmtTime(r.started)} · elapsed ${vtElapsed(r)}`));
   if (r.state === "saved") parts.push(h("div", { class: "hint" },
     `Saved ${r.saved_at ? new Date(r.saved_at * 1000).toLocaleString() : ""}. Its VMs are suspended to disk and hold no VM slots; Resume restores them exactly as they were, including addresses, routes and rules you set. Delete destroys them.`));
+  if (r.from_labfile) {
+    const c = r.labfile_check;
+    const bad = c ? Object.entries(c.mismatches) : [];
+    parts.push(h("div", { class: c && !bad.length ? "pass" : "hint" }, `Built from lab file "${r.from_labfile}". ` +
+      (!c ? "Its configs are applied once the VMs are up." : !bad.length ? "Every node matches the file."
+        : `Differs from the file in ${bad.map(([n, m]) => `${n}: ${m.join(", ")}`).join("; ")} (see the transcript).`)));
+  }
   if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
   parts.push(...nodeRows);
   if (r.state === "ready" && r.has_vms && !r.agent_holds) parts.push(vtAttachBox(r));
@@ -323,13 +363,15 @@ function vtSnapshots(r) {
         s.errors.length ? h("span", { class: "fail" }, `unreachable: ${s.errors.join(", ")}`) : "",
         h("span", { class: "sp" }),
         h("button", { onclick: () => show({ kind: "view", id: s.id }) }, "View"),
-        h("a", { href: `${base}/${s.id}/zip`, download: "" }, "Download"));
+        h("a", { href: `${base}/${s.id}/zip`, download: "" }, "Download"),
+        h("a", { href: `${base}/${s.id}/labfile`, download: "", title: "Export a lab file with this snapshot's configs" }, "Lab file"));
     }));
   }
   draw();
   if (vtSnap.view) show(vtSnap.view);
   return h("div", { class: "col bench" },
-    h("div", { class: "row" }, h("b", {}, "Config snapshots"), h("span", { class: "sp" }), label, take, compare),
+    h("div", { class: "row" }, h("b", {}, "Config snapshots"), h("span", { class: "sp" }), label, take, compare,
+      h("a", { href: `/api/vmtopo/runs/${r.id}/labfile`, download: "", title: "This lab's topology and the newest snapshot's configs, as a file you can rebuild the lab from" }, "Export lab file")),
     h("p", { class: "hint" }, "Every node's addresses, routes, forwarding, bridges and VLANs, firewall rules and service configs (netplan, FRR, nginx). Snapshots are kept after the lab's VMs are gone; Delete removes them."),
     list, out);
 }

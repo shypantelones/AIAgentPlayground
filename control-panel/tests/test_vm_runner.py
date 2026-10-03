@@ -196,6 +196,81 @@ class SnapshotParseTests(unittest.TestCase):
         self.assertEqual(vr.parse_snapshot(a)["routes"], "default via fe80::2 dev enp0s3 proto ra metric 100 pref medium\n")
 
 
+class LabFileTests(unittest.TestCase):
+    """Lab files: format validation (a file may come from someone else), the apply script that puts a node's saved
+    config back, and the check that a rebuilt node matches its file."""
+
+    TOPO = {"nodes": [{"name": "h1", "role": "host"}, {"name": "r1", "role": "router"}], "links": [{"a": "h1", "b": "r1"}]}
+
+    def lf(self, **over):
+        return dict(vr.build_labfile("Two nodes", self.TOPO, {"h1": {"addresses": "enp0s8 UP 10.0.0.1/24\n"}}), **over)
+
+    def test_round_trip(self):
+        title, topo, configs, intents = vr.parse_labfile(self.lf())
+        self.assertEqual(title, "Two nodes")
+        self.assertEqual([n["name"] for n in topo["nodes"]], ["h1", "r1"])
+        self.assertEqual(topo["links"], [{"a": "h1", "b": "r1"}])
+        self.assertEqual(configs["h1"]["addresses"], "enp0s8 UP 10.0.0.1/24\n")
+        self.assertEqual(intents, [])
+
+    def test_bad_files_are_refused(self):
+        too_many = {"nodes": [{"name": f"h{i}", "role": "host"} for i in range(vr.MAX_CUSTOM_NODES + 1)], "links": []}
+        for why, obj in (("not a lab file", {"format": "x"}), ("wrong version", self.lf(version=99)),
+                         ("no topology", self.lf(topology=None)), ("bad role", self.lf(topology={"nodes": [{"name": "h1", "role": "toaster"}, {"name": "r1", "role": "router"}], "links": []})),
+                         ("bad node name", self.lf(topology={"nodes": [{"name": "H 1", "role": "host"}, {"name": "r1", "role": "router"}], "links": []})),
+                         ("too many nodes", self.lf(topology=too_many)), ("unknown link", self.lf(topology=dict(self.TOPO, links=[{"a": "h1", "b": "zz"}]))),
+                         ("configs for unknown node", self.lf(configs={"zz": {}})), ("config not text", self.lf(configs={"h1": {"routes": 5}})),
+                         ("not even a dict", "hello")):
+            with self.subTest(why), self.assertRaises(ValueError):
+                vr.parse_labfile(obj)
+
+    def test_apply_script_restores_lab_config_and_leaves_the_system_alone(self):
+        secs = {"addresses": "lo UNKNOWN 127.0.0.1/8\nenp0s3 UP 10.0.2.15/24 fe80::1/64\nenp0s8 UP 10.20.0.10/24 fe80::a00:27ff:fe00:1/64\nbr0 UP 192.168.99.1/24\n",
+                "routes": "default via 10.0.2.2 dev enp0s3 proto dhcp src 10.0.2.15 metric 100\n"
+                          "10.20.0.0/24 dev enp0s8 proto kernel scope link src 10.20.0.10\n10.30.0.0/24 via 10.20.0.1 dev enp0s8\n"
+                          "# ipv6\nfe80::/64 dev enp0s8 proto kernel metric 256 pref medium\n2001:db8::/64 via 2001:db8:1::1 dev enp0s8\n",
+                "forwarding": "net.ipv4.ip_forward = 1\n", "nftables": "table ip filter {\n}\n",
+                "file /etc/nginx/conf.d/lb.conf": "upstream b {}\n", "file /etc/netplan/50-cloud-init.yaml": "network: {}\n"}
+        script, skipped = vr.render_apply_script(secs)
+        self.assertIn("ip addr replace 10.20.0.10/24 dev enp0s8", script)
+        self.assertIn("ip addr replace 192.168.99.1/24 dev br0", script)
+        self.assertIn("ip route replace 10.30.0.0/24 via 10.20.0.1 dev enp0s8", script)
+        self.assertIn("ip -6 route replace 2001:db8::/64 via 2001:db8:1::1 dev enp0s8", script)
+        self.assertIn("sysctl -q -w net.ipv4.ip_forward=1", script)
+        self.assertIn("| sudo -n nft -f -", script)
+        self.assertIn("tee /etc/nginx/conf.d/lb.conf", script)
+        self.assertIn("systemctl reload nginx", script)
+        for system in ("enp0s3", "10.0.2.15", "fe80:", "proto kernel", "netplan", "127.0.0.1"):
+            self.assertNotIn(system, script, f"{system} is the system's own config, not the lab's")
+        self.assertEqual(skipped, [])
+        result = subprocess.run(["sh", "-n"], input=script, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_apply_script_cannot_be_used_to_inject_commands(self):
+        evil = {"addresses": "enp0s8 UP 10.0.0.1/24;reboot\n$(id)x UP 10.0.0.2/24\n",
+                "routes": "10.9.0.0/24 via 10.0.0.1 dev enp0s8 `touch /tmp/pwn`\n",
+                "forwarding": "net.ipv4.ip_forward = 1; rm -rf /\n",
+                "file /etc/passwd": "root::0:0::/root:/bin/sh\n", "file /etc/nginx/../shadow": "x\n",
+                "file /etc/nginx/x.conf": "'; reboot; echo '\n"}
+        script, skipped = vr.render_apply_script(evil)
+        for bad in (";reboot", "$(id)", "`touch", "rm -rf", "/etc/passwd", "shadow", "'; reboot"):
+            self.assertNotIn(bad, script)
+        self.assertIn("file /etc/passwd", skipped)
+        self.assertTrue(any(s.startswith("route:") for s in skipped))
+
+    def test_rebuild_check(self):
+        wanted = {"addresses": "lo UNKNOWN 127.0.0.1/8\nenp0s3 UP 10.0.2.15/24 fe80::1/64\nenp0s8 UP 10.20.0.10/24 fe80::aaaa/64\n",
+                  "routes": "default via 10.0.2.2 dev enp0s3 proto dhcp\n10.30.0.0/24 via 10.20.0.1 dev enp0s8\n",
+                  "forwarding": "net.ipv4.ip_forward = 1\n",
+                  "nftables": "table ip filter {\n\tchain F {\n\t\tcounter packets 9 bytes 99 drop\n\t}\n}\n"}
+        live = {"addresses": "lo UNKNOWN 127.0.0.1/8\nenp0s3 UP 10.0.2.15/24 fe80::2/64\nenp0s8 UP 10.20.0.10/24 fe80::bbbb/64\n",
+                "routes": "default via 10.0.2.2 dev enp0s3 proto dhcp metric 100\n10.30.0.0/24 via 10.20.0.1 dev enp0s8\n",
+                "forwarding": "net.ipv4.ip_forward = 1\n",
+                "nftables": "table ip filter {\n\tchain F {\n\t\tcounter packets 0 bytes 0 drop\n\t}\n}\n"}
+        self.assertEqual(vr.config_mismatches(wanted, live), [], "different MACs, setup NIC and counters are not mismatches")
+        self.assertEqual(vr.config_mismatches(wanted, dict(live, forwarding="net.ipv4.ip_forward = 0\n")), ["forwarding"])
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to

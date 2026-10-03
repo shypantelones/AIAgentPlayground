@@ -117,7 +117,11 @@ class VmTopoBase(unittest.TestCase):
         return 0, "ok", ""
 
     def fake_ssh_script(self, port, priv, script, timeout=60):
-        """A node's SNAPSHOT_SCRIPT output; per-port text can be set in self.node_config, a port in self.ssh_down fails."""
+        """A node's SNAPSHOT_SCRIPT output; per-port text can be set in self.node_config, a port in self.ssh_down fails.
+        Any other script (a lab file's apply script) is recorded in self.applied and succeeds."""
+        if script != vr.SNAPSHOT_SCRIPT:
+            self.applied = getattr(self, "applied", []) + [(port, script)]
+            return 0, "done\n", ""
         if port in getattr(self, "ssh_down", set()):
             return 255, "", "ssh: connect to host 127.0.0.1 port %d: Connection refused" % port
         cfg = getattr(self, "node_config", {}).get(port, "")
@@ -838,6 +842,97 @@ class SnapshotTests(VmTopoBase):
                 app.load_topo_snapshot(rid, bad)
         with self.assertRaises(KeyError):
             app.load_topo_snapshot(rid, "20260101-000000-abcd")
+
+
+class LabFileRunTests(VmTopoBase):
+    """Building a lab from a lab file: the file's topology, its configs applied before the lab is ready, a check of the
+    rebuild against the file, and exporting a lab as a file that builds the same lab again."""
+
+    TOPO = {"nodes": [{"name": "h1", "role": "host"}, {"name": "sw1", "role": "switch"}, {"name": "h2", "role": "host"}],
+            "links": [{"a": "h1", "b": "sw1"}, {"a": "h2", "b": "sw1"}]}
+    CFG = {"h1": {"addresses": "lo UNKNOWN 127.0.0.1/8\nenp0s8 UP 10.0.0.1/24\n", "forwarding": "net.ipv4.ip_forward = 0\n"},
+           "h2": {"addresses": "lo UNKNOWN 127.0.0.1/8\nenp0s8 UP 10.0.0.2/24\n"}}
+
+    def build(self, configs=None, **form):
+        lf = vr.build_labfile("Two hosts", self.TOPO, configs if configs is not None else self.CFG)
+        rid = app.create_topo_run(dict({"labfile": lf}, **form))
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] in ("ready", "error")))
+        return rid
+
+    def port(self, rid, node):
+        return app.TOPO_RUNS[rid]["nodes"][node]["ssh_port"]
+
+    def test_configs_are_applied_before_ready_and_the_rebuild_is_checked(self):
+        # the rebuilt nodes report exactly the file's config, so the check finds no differences
+        self.node_config = {}
+        orig = self.fake_ssh_script
+
+        def fake(port, priv, script, timeout=60):
+            if script == vr.SNAPSHOT_SCRIPT:
+                node = next(n for n, x in app.TOPO_RUNS[rid_box[0]]["nodes"].items() if x["ssh_port"] == port)
+                text = "".join(f"### {s}\n{t}" for s, t in self.CFG.get(node, {}).items())
+                return 0, text, ""
+            return orig(port, priv, script, timeout)
+        rid_box = [None]
+        with mock.patch.object(vr, "ssh_script", fake):
+            lf = vr.build_labfile("Two hosts", self.TOPO, self.CFG)
+            rid_box[0] = rid = app.create_topo_run({"labfile": lf})
+            self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))
+        r = app.TOPO_RUNS[rid]
+        self.assertEqual(r["topology_title"], "From file: Two hosts")
+        self.assertEqual(list(r["nodes"]), ["h1", "sw1", "h2"])
+        applied = {next(n for n, x in r["nodes"].items() if x["ssh_port"] == port): script for port, script in self.applied}
+        self.assertEqual(set(applied), {"h1", "h2"}, "only nodes with configs get an apply script")
+        self.assertIn("ip addr replace 10.0.0.1/24 dev enp0s8", applied["h1"])
+        self.assertEqual(r["labfile_check"]["mismatches"], {})
+        self.assertIn("every node matches the lab file", r["vm_log"])
+        self.assertEqual(app.list_topo_snapshots(rid)[0]["trigger"], "applied from lab file")
+        self.assertEqual(app.topo_run_view(r)["from_labfile"], "Two hosts")
+
+    def test_a_rebuild_that_differs_is_reported(self):
+        rid = self.build()                      # the default fake snapshot has no 10.0.0.x addresses
+        check = app.TOPO_RUNS[rid]["labfile_check"]["mismatches"]
+        self.assertEqual(check, {"h1": ["addresses", "forwarding"], "h2": ["addresses"]})
+        self.assertIn("differs from the lab file", app.TOPO_RUNS[rid]["vm_log"])
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "ready", "a mismatch is reported, not fatal")
+
+    def test_export_round_trips_into_the_same_lab(self):
+        app.update_vmb_settings({"max_concurrent": 6})           # room for the original and the rebuilt lab at once
+        rid = app.create_topo_run({"topology_id": "s1h2", "keep": True})
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] == "ready"))
+        with self.assertRaises(ValueError):
+            app.labfile_for_lab(rid)                              # no snapshot yet
+        self.node_config = {self.port(rid, "h1"): "enp0s8 UP 10.5.0.1/24"}
+        sid = app.take_topo_snapshot(app.TOPO_RUNS[rid], "x", "for export")["id"]
+        name, data = app.labfile_for_lab(rid)
+        self.assertEqual(name, f"lab-{rid}-{sid}.json")
+        lf = json.loads(data)
+        self.assertEqual(lf["source"]["snapshot"], sid)
+        title, topo, configs, _ = vr.parse_labfile(lf)
+        cat = vr.get_topology("s1h2")
+        self.assertEqual([n["name"] for n in topo["nodes"]], [n["name"] for n in cat["nodes"]], "node order kept: it sets NIC order")
+        self.assertEqual(topo["links"], [{"a": l["a"], "b": l["b"]} for l in cat["links"]])
+        self.assertIn("10.5.0.1/24", configs["h1"]["addresses"])
+        self.applied = []
+        rid2 = app.create_topo_run({"labfile": lf})
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid2]["state"] == "ready"))
+        self.assertTrue(any("ip addr replace 10.5.0.1/24 dev enp0s8" in s for _, s in self.applied))
+
+    def test_a_lab_from_a_file_has_no_catalog_task_and_bad_files_are_refused(self):
+        lf = vr.build_labfile("x", self.TOPO, {})
+        with self.assertRaises(ValueError):
+            app.create_topo_run({"labfile": lf, "task_id": "s1h2-connectivity"})
+        with self.assertRaises(ValueError):
+            app.create_topo_run({"labfile": {"format": "nope"}})
+        self.assertEqual(app.TOPO_RUNS, {})
+
+    def test_an_agent_can_work_in_a_lab_built_from_a_file(self):
+        self.add_agent("alpha")
+        rid = app.create_topo_run({"labfile": vr.build_labfile("Two hosts", self.TOPO, self.CFG), "agent": "alpha",
+                                   "custom_prompt": "add a route"})
+        self.assertTrue(self.finished(rid))
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "done")
+        self.assertTrue(self.applied, "configs were applied before the agent's turn")
 
 
 class TaskWithAgentTests(VmTopoBase):
