@@ -93,3 +93,5 @@ select{max-width:100%}
 /* `hidden` must win over the flex/grid display rules above (.row, .col ...), or toggled sections stay visible */
 [hidden]{display:none!important}
 .chip.saved{background:#e3ecfb;color:#1d4f91}.chip.saving,.chip.resuming{background:#fff1cf;color:#7a5200}
+.snap{gap:10px}.snap .num{font-variant-numeric:tabular-nums;color:var(--mute)}
+pre.diff span.add{color:var(--ok)}pre.diff span.del{color:var(--bad)}pre.diff span.hunk{color:var(--mute)}

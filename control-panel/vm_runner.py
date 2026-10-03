@@ -266,6 +266,54 @@ def ssh_run(port, key_path, command, timeout=120):
     return _run([*_ssh_base(port, key_path), "bench@127.0.0.1", command], timeout=timeout)
 
 
+def ssh_script(port, key_path, script, timeout=60):
+    """Run a multi-line script on the VM: sent on stdin to `bash -s`, so nothing in it is reinterpreted by a local
+    shell or by command-line quoting (see vmrun_script for the same reason)."""
+    return _run([*_ssh_base(port, key_path), "bench@127.0.0.1", "bash -s"], input=script, timeout=timeout)
+
+
+# ---------------------------------------------------------------- config snapshots (what's configured on a lab node)
+# One section per thing a network engineer would want to review or diff. Output that changes on its own is left out
+# so a diff between two snapshots shows only real changes: no full `ip addr` (DHCP lease countdowns on the setup NIC),
+# no iptables-save comment lines (timestamps). Service configs are read only if the file exists on that node.
+SNAPSHOT_SECTION = "### "
+SNAPSHOT_SCRIPT = r"""
+sec() { echo "### $1"; }
+sec addresses; ip -br addr
+sec links; ip -br link
+sec routes; ip route show; echo "# ipv6"; ip -6 route show
+sec forwarding; sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding 2>/dev/null
+if command -v bridge >/dev/null; then sec bridge; bridge link 2>/dev/null; echo "# vlans"; bridge vlan show 2>/dev/null; fi
+if command -v nft >/dev/null; then sec nftables; sudo -n nft list ruleset 2>&1; fi
+if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save 2>&1 | grep -v '^#'; fi
+for f in /etc/netplan/*.yaml /etc/frr/frr.conf /etc/frr/daemons /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf          /etc/nginx/sites-enabled/* /etc/nginx/streams-enabled/*; do
+  [ -f "$f" ] && { sec "file $f"; sudo -n cat "$f" 2>&1; }
+done
+true
+"""
+
+
+# Countdowns the kernel prints and decrements on its own, e.g. on IPv6 routes learned from router advertisements on
+# the setup NIC ("... proto ra metric 100 expires 86197sec"). Left in, every node would show a change in every diff.
+SNAPSHOT_VOLATILE = re.compile(r" expires \d+sec")
+
+
+def parse_snapshot(text):
+    """SNAPSHOT_SCRIPT output -> {section: text}. Anything before the first section header is ignored; volatile
+    countdowns (SNAPSHOT_VOLATILE) are removed so two snapshots of an unchanged node are identical."""
+    sections, name, lines = {}, None, []
+    for line in (SNAPSHOT_VOLATILE.sub("", l) for l in text.splitlines()):
+        if line.startswith(SNAPSHOT_SECTION):
+            if name is not None:
+                sections[name] = "\n".join(lines).strip() + "\n"
+            name, lines = line[len(SNAPSHOT_SECTION):].strip(), []
+        elif name is not None:
+            lines.append(line.rstrip())
+    if name is not None:
+        sections[name] = "\n".join(lines).strip() + "\n"
+    return sections
+
+
 def scp_to(port, key_path, local_path, remote_path, timeout=60):
     return _run(["scp", "-i", str(key_path), "-P", str(port), "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=NUL" if sys.platform.startswith("win") else "/dev/null",
