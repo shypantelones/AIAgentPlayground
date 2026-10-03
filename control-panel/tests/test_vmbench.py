@@ -335,6 +335,8 @@ class AgentSessionTests(VmBenchBase):
 
         app.end_vm_session(rid)
         self.assertTrue(self.finished(rid))
+        for t in set(threading.enumerate()) - self._threads_before:
+            t.join(timeout=8)                # "done" is set before the runner's teardown (vagrant destroy) runs
         self.assertEqual(self.state(rid), "done")
         self.assertEqual(self.detached, ["alpha"])
         self.assertEqual(len(self.destroys()), 1, "not kept, so the VM is destroyed once the session ends")

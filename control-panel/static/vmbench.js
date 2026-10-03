@@ -37,7 +37,7 @@ function showTerminalLogin(what, t) {
 let vbData = { tasks: [], settings: {}, runs: [] }, vbSelRun = null, vbTimer = null;
 let VB = null;
 const vbSig = {};
-const vbDrafts = {};          // run id -> unsent follow-up text, kept across the detail view's 2-second redraws
+const vbDrafts = {};          // "<api base>/<run id>" -> unsent follow-up text, kept across the detail views' 2-second redraws
 const VB_STATE_LABEL = { queued: "queued", provisioning: "starting VM", ready: "ready", working: "agent working", attached: "session open",
   scoring: "scoring", done: "done", error: "error", stopped: "stopped", interrupted: "interrupted (panel restarted)" };
 const vbFmtTime = t => t ? new Date(t * 1000).toLocaleTimeString() : "";
@@ -50,7 +50,7 @@ async function refreshVBBadge() {
       if (typeof vtData !== "undefined") vtData = await api("/api/vmtopo").catch(() => vtData);
     }
     const busy = vbData.runs.filter(r => ["provisioning", "working", "attached", "scoring"].includes(r.state)).length +
-      (typeof vtData !== "undefined" ? vtData.runs.filter(r => ["provisioning", "working", "scoring"].includes(r.state)).length : 0);
+      (typeof vtData !== "undefined" ? vtData.runs.filter(r => ["provisioning", "working", "attached", "scoring"].includes(r.state)).length : 0);
     vbBtn.textContent = busy ? `VM Labs (${busy} running)` : "VM Labs";
   } catch { /* panel may be restarting */ }
 }
@@ -200,50 +200,60 @@ async function loadVBDetail() {
     h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), termBtn, scoreBtn, stopBtn, delBtn)];
   parts.push(h("div", { class: "hint" }, `${r.task_title ? "Task: " + r.task_title : r.custom_prompt ? "Your prompt" : "No task (scratch VM)"}${r.agent ? " · agent: " + r.agent : " · no agent attached"}${r.interactive ? " · interactive session" : ""} · started ${vbFmtTime(r.started)} · elapsed ${vbElapsed(r)}`));
   if (r.custom_prompt) parts.push(h("pre", { style: "max-height:12vh" }, r.custom_prompt));
-  if (r.conversation && r.conversation.length) parts.push(vbConversation(r));
-  if (r.interactive && ["attached", "working"].includes(r.state)) parts.push(vbSessionBox(r));
+  if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "VM"));
+  if (r.interactive && ["attached", "working"].includes(r.state))
+    parts.push(sessionBox(r, "/api/vmbench/runs", "VM", () => { vbSig.detail = ""; loadVB(); }));
   if (r.score) {
     parts.push(h("div", { class: r.score.passed ? "pass" : "fail" }, r.score.passed ? "PASS" : "FAIL", ` (${r.score.duration_s}s)`));
     parts.push(h("pre", {}, r.score.output));
   }
   parts.push(h("div", { class: "hint" }, "Live transcript:"));
   parts.push(h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)"));
-  const ta = VB.detail.querySelector("textarea.followup");
-  const caret = ta && document.activeElement === ta ? [ta.selectionStart, ta.selectionEnd] : null;
-  VB.detail.replaceChildren(...parts);
-  const ta2 = VB.detail.querySelector("textarea.followup");
-  if (ta2 && caret) { ta2.focus(); ta2.setSelectionRange(...caret); }   // redraws must not steal what you're typing
+  replaceKeepingFocus(VB.detail, parts);
 }
 
-function vbConversation(r) {
+/* Redraw a run's detail view without losing your place in the follow-up box. Shared with vmtopo.js. */
+function replaceKeepingFocus(container, parts) {
+  const ta = container.querySelector("textarea.followup");
+  const caret = ta && document.activeElement === ta ? [ta.selectionStart, ta.selectionEnd] : null;
+  container.replaceChildren(...parts);
+  const ta2 = container.querySelector("textarea.followup");
+  if (ta2 && caret) { ta2.focus(); ta2.setSelectionRange(...caret); }
+}
+
+/* Conversation and follow-up box for an interactive session; shared by single VMs and labs (vmtopo.js).
+   `what` names the machine(s) in the copy ("VM" or "lab"); `base` is the run type's API path. */
+function sessionConversation(r, what) {
   const box = h("div", { class: "msgs", style: "max-height:40vh;border:1px solid var(--line);border-radius:8px;padding:6px" },
     ...r.conversation.map(m => h("div", { class: "msg " + (m.role === "user" ? "user" : m.role === "error" ? "error" : "agent") },
       h("div", { class: "prov" }, m.role === "user" ? "you" : m.role === "error" ? "error" : r.agent), h("div", { class: "txt" }, m.text))));
-  if (r.state === "working") box.append(h("div", { class: "msg pending" }, `${r.agent} is working in the VM...`));
+  if (r.state === "working") box.append(h("div", { class: "msg pending" }, `${r.agent} is working in the ${what}...`));
   setTimeout(() => { box.scrollTop = box.scrollHeight; });
   return h("div", { class: "col" }, h("div", { class: "hint" }, "Conversation:"), box);
 }
 
-function vbSessionBox(r) {
+function sessionBox(r, base, what, reload) {
+  const draftKey = `${base}/${r.id}`;
   const ta = h("textarea", { class: "followup", placeholder: r.state === "working"
     ? `More guidance for ${r.agent} (sent once it finishes its current reply)` : `More guidance for ${r.agent} (Ctrl+Enter to send)` });
-  ta.value = vbDrafts[r.id] || "";
-  ta.addEventListener("input", () => { vbDrafts[r.id] = ta.value; });
+  ta.value = vbDrafts[draftKey] || "";
+  ta.addEventListener("input", () => { vbDrafts[draftKey] = ta.value; });
   const msg = h("div", { class: "fail" });
   const send = h("button", { class: "primary", onclick: async () => {
     const text = ta.value; if (!text.trim()) return;
     msg.textContent = ""; send.disabled = true;
-    try { await api(`/api/vmbench/runs/${r.id}/message`, { text }); delete vbDrafts[r.id]; ta.value = ""; vbSig.detail = ""; loadVB(); }
+    try { await api(`${base}/${r.id}/message`, { text }); delete vbDrafts[draftKey]; ta.value = ""; reload(); }
     catch (e) { msg.textContent = e.message; }
     finally { send.disabled = false; }
   } }, "Send");
   ta.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send.click(); } });
   const end = h("button", { onclick: async () => {
-    if (!confirm(`End the session? ${r.agent} is detached from the VM${r.task_id ? ", the task is scored" : ""}, and the VM is ${r.keep ? "kept" : "destroyed"}.`)) return;
-    try { await api(`/api/vmbench/runs/${r.id}/end`, {}); delete vbDrafts[r.id]; vbSig.detail = ""; loadVB(); } catch (e) { msg.textContent = e.message; }
+    const machines = what === "lab" ? "its VMs are" : "the VM is";
+    if (!confirm(`End the session? ${r.agent} is detached from the ${what}${r.task_id ? ", the task is scored" : ""}, and ${machines} ${r.keep ? "kept" : "destroyed"}.`)) return;
+    try { await api(`${base}/${r.id}/end`, {}); delete vbDrafts[draftKey]; reload(); } catch (e) { msg.textContent = e.message; }
   } }, "End session");
   const idle = r.idle_deadline ? ` Ends by itself at ${vbFmtTime(r.idle_deadline)} if you send nothing more.` : "";
   return h("div", { class: "col" },
     h("div", { class: "compose" }, ta, h("div", { class: "col" }, send, end)), msg,
-    h("div", { class: "hint" }, `${r.agent} stays attached to this VM until you end the session.${idle}`));
+    h("div", { class: "hint" }, `${r.agent} stays attached to this ${what} until you end the session.${idle}`));
 }

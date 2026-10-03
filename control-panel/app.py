@@ -1094,59 +1094,73 @@ def vm_agent_turn(r, message):
     return res
 
 
-def vm_session_loop(r, stopped):
-    """Interactive session: after the agent's first turn, keep it attached and relay your follow-up messages into the
-    same conversation, one turn at a time, until you end the session, Stop the run, or it sits idle too long."""
+def agent_session_loop(r, stopped, followups, ends, log, save, turn, reminder):
+    """Interactive session, shared by single VMs and topology labs: after the agent's first turn, keep it attached and
+    relay your follow-up messages into the same conversation, one turn at a time, until you end the session, Stop
+    the run, or it sits idle too long. `followups`/`ends` are that run type's queue and end-flag dicts."""
     rid = r["id"]
-    q = VM_FOLLOWUPS.setdefault(rid, queue.Queue())
+    q = followups.setdefault(rid, queue.Queue())
     while True:
         if stopped():
             return
-        if VM_END.get(rid):
-            vm_log(r, "session ended by you.")
+        if ends.get(rid):
+            log("session ended by you.")
             return
         if r["state"] != "attached":
             r.update(state="attached", idle_since=time.time())
-            save_vm_run(r)
-            vm_log(r, f"{r['agent']} stays attached: send it more guidance, or End session when you're done.")
+            save()
+            log(f"{r['agent']} stays attached: send it more guidance, or End session when you're done.")
         try:
             msg = q.get(timeout=VM_SESSION_POLL_S)
         except queue.Empty:
             if time.time() - r["idle_since"] > VM_SESSION_IDLE_S:
-                vm_log(r, f"no new message for {VM_SESSION_IDLE_S // 60} minutes; ending the session.")
+                log(f"no new message for {VM_SESSION_IDLE_S // 60} minutes; ending the session.")
                 return
             continue
         r["state"] = "working"
-        save_vm_run(r)
-        vm_log(r, "you: " + (msg if len(msg) <= 500 else msg[:500] + "..."))
-        vm_agent_turn(r, msg + VM_FOLLOWUP_REMINDER)
+        save()
+        log("you: " + (msg if len(msg) <= 500 else msg[:500] + "..."))
+        turn(msg + reminder)
 
 
-def send_vm_followup(rid, text):
-    r = VM_RUNS.get(rid)
-    if not r:
-        raise KeyError("unknown run")
+def queue_followup(r, followups, ends, text):
     if not r.get("interactive"):
         raise ValueError("this run isn't an interactive session")
-    if r["state"] not in ("attached", "working") or VM_END.get(rid):
+    if r["state"] not in ("attached", "working") or ends.get(r["id"]):
         raise ValueError("the session isn't open")
     text = str(text or "")
     if not text.strip():
         raise ValueError("empty message")
     if len(text) > 100_000:
         raise ValueError("message too long")
-    VM_FOLLOWUPS.setdefault(rid, queue.Queue()).put(text)
+    followups.setdefault(r["id"], queue.Queue()).put(text)
     return {"queued_behind_current_turn": r["state"] == "working"}
 
 
-def end_vm_session(rid):
-    """Detach the agent, score (if the task has a check), and finish - the VM is then destroyed unless "keep"."""
+def request_session_end(r, ends):
+    """Detach the agent, score (if the task has a check), and finish - VMs are then destroyed unless "keep"."""
+    if not r.get("interactive") or r["state"] not in ("attached", "working"):
+        raise ValueError("there's no open session to end")
+    ends[r["id"]] = True
+
+
+def vm_session_loop(r, stopped):
+    agent_session_loop(r, stopped, VM_FOLLOWUPS, VM_END, lambda line: vm_log(r, line), lambda: save_vm_run(r),
+                       lambda m: vm_agent_turn(r, m), VM_FOLLOWUP_REMINDER)
+
+
+def send_vm_followup(rid, text):
     r = VM_RUNS.get(rid)
     if not r:
         raise KeyError("unknown run")
-    if not r.get("interactive") or r["state"] not in ("attached", "working"):
-        raise ValueError("there's no open session to end")
-    VM_END[rid] = True
+    return queue_followup(r, VM_FOLLOWUPS, VM_END, text)
+
+
+def end_vm_session(rid):
+    r = VM_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    request_session_end(r, VM_END)
 
 
 def score_run(port, priv, task):
@@ -1292,8 +1306,13 @@ TOPO_LOCK = threading.RLock()
 TOPO_TERM_CREDS = {}     # "<run id>:<node>" -> current terminal credential; kept in memory only, never persisted
 TOPO_STOP = {}           # run id -> bool, polled by the runner thread at phase boundaries
 TOPO_RUN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
-TOPO_LIVE_STATES = ("queued", "provisioning", "working", "scoring")
+TOPO_LIVE_STATES = ("queued", "provisioning", "working", "attached", "scoring")     # "attached": see VM_LIVE_STATES
 TOPO_OCCUPYING_STATES = TOPO_LIVE_STATES + ("ready",)
+TOPO_FOLLOWUPS = {}      # run id -> queue.Queue of your follow-up messages for an interactive lab session
+TOPO_END = {}            # run id -> True once you end an interactive lab session
+TOPO_FOLLOWUP_REMINDER = ("\n\n(Keep working on the lab nodes with their ./vmrun-<node> commands as before, and check "
+                          "the results before you reply.)")
+TOPO_RELAY_FILES = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay-topo.compose.yml")]
 
 
 def stop_topo_runs_for(agent_name):
@@ -1335,6 +1354,8 @@ def load_topo_runs():
         except Exception:
             continue
         if r["state"] in TOPO_LIVE_STATES:
+            if r.get("agent") and r["state"] in ("working", "attached"):
+                threading.Thread(target=detach_topo_agent, args=(r["agent"],), daemon=True).start()   # see load_vm_runs
             r.update(state="interrupted", reason=(r.get("reason") or "") or "the control panel was restarted")
             f.write_text(json.dumps(r, indent=1))
         TOPO_RUNS[r["id"]] = r
@@ -1346,8 +1367,13 @@ def topo_run_view(r, full=False):
     v = {k: r[k] for k in ("id", "state", "reason", "keep", "memory_mb", "cpus", "created", "started", "ended",
                            "agent", "topology_id", "topology_title", "task_id", "task_title", "custom_prompt",
                            "chat", "score", "benchmark_id", "nodes")}
+    v["interactive"] = bool(r.get("interactive"))
+    v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
     if full:
         v["transcript"] = r.get("vm_log", "")[-20000:]
+        if r.get("agent") and r.get("chat"):
+            msgs = load_chats(r["agent"]).get(r["chat"], {}).get("messages", [])[-100:]
+            v["conversation"] = [{"role": m.get("role"), "text": m.get("text", "")[-20000:], "ts": m.get("ts")} for m in msgs]
     return v
 
 
@@ -1382,6 +1408,9 @@ def create_topo_run(form):
     if task and task["topology_id"] != topology_id:
         raise ValueError("that task is for a different topology")
     custom_prompt = (form.get("custom_prompt") or "").strip() or None
+    if custom_prompt and len(custom_prompt) > VM_PROMPT_MAX:
+        raise ValueError(f"the prompt is too long (max {VM_PROMPT_MAX} characters)")
+    interactive = bool(form.get("interactive"))
     agent = (form.get("agent") or "").strip().lower() or None
     if agent:
         load_meta(agent)                              # raises KeyError if unknown
@@ -1392,6 +1421,13 @@ def create_topo_run(form):
             # check above already rejected task_id+custom topology together), so `task` is already None there -
             # this just additionally requires custom_prompt for it, and requires either one for a catalog topology.
             raise ValueError("pick a task or write a custom prompt for the agent to attempt")
+        # one lab per agent: every lab's relay is the same `vm-relay-topo` service and its node commands are named
+        # vmrun-<node>, so a second lab would replace the first one's relay and could overwrite its commands
+        busy = [x for x in TOPO_RUNS.values() if x.get("agent") == agent and x["state"] in TOPO_OCCUPYING_STATES]
+        if busy:
+            raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
+    elif interactive:
+        raise ValueError("attach an agent to start a session")
     s = vmb_settings()
     rid = uuid.uuid4().hex[:8]
     nodes = {n["name"]: {"role": n["role"], "ssh_port": None, "terminal": {"active": False, "port": None}}
@@ -1402,6 +1438,7 @@ def create_topo_run(form):
          "topology_id": topology_id, "topology_title": topology["title"],
          "topology": topology if topology_id is None else None, "task_id": task_id,
          "task_title": (task or {}).get("title"), "custom_prompt": custom_prompt,
+         "interactive": interactive, "idle_since": None,
          "chat": f"vmtopo-{rid}" if agent else None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": ""}
     TOPO_RUNS[rid] = r
@@ -1529,10 +1566,10 @@ def topo_run_runner(rid):
                input=wrapper, timeout=20)
         relay_cmd = vr.relay_command(topology, node_ports)
         env = dict(os.environ, VM_RELAY_TOPO_CMD=relay_cmd)
-        files = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay-topo.compose.yml")]
         rc, out, err = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
-                           *files, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
+                           *TOPO_RELAY_FILES, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
         if rc != 0:
+            detach_topo_agent(r["agent"])
             return finish("error", "could not attach the agent's lab relay (see transcript)")
         node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} '<command>'" for name in r["nodes"])
         prompt = (
@@ -1543,13 +1580,15 @@ def topo_run_runner(rid):
             "Every node's first network interface is for setup only (already configured - leave it alone); its "
             "other interfaces are the lab links, with no address until you (or the task) configure them. A "
             "'switch' node is already working as a plain Ethernet switch and needs no configuration."
+            + ("\n\nYour user may send you more guidance in this conversation after you reply; the lab stays "
+               "available to you until they end the session." if r.get("interactive") else "")
         )
-        t0 = time.time()
-        res = run_turn(r["agent"], r["chat"], prompt, {"via": "vmtopo", "run": rid}, lambda s: topo_log(r, s), timeout=1200)
-        topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']})")
-        run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
-            *files, "rm", "-sf", "vm-relay-topo"], timeout=30)
-        dc(r["agent"], "exec", "-T", "gateway", "rm", "-rf", "/home/node/.openclaw/workspace/.vmkey-topo", timeout=20)
+        topo_agent_turn(r, prompt)
+        if r.get("interactive"):
+            agent_session_loop(r, stopped, TOPO_FOLLOWUPS, TOPO_END, lambda line: topo_log(r, line),
+                               lambda: save_topo_run(r), lambda m: topo_agent_turn(r, m), TOPO_FOLLOWUP_REMINDER)
+        topo_log(r, f"detaching {r['agent']} from this lab...")
+        detach_topo_agent(r["agent"])
 
         if task and task.get("check") and not stopped():
             r["state"] = "scoring"
@@ -1562,6 +1601,8 @@ def topo_run_runner(rid):
     except Exception as e:  # noqa
         finish("error", str(e))
     finally:
+        TOPO_FOLLOWUPS.pop(rid, None)
+        TOPO_END.pop(rid, None)
         try:
             for name, node in r.get("nodes", {}).items():
                 if node.get("terminal", {}).get("active"):
@@ -1581,12 +1622,43 @@ def topo_run_runner(rid):
         TOPO_STOP.pop(rid, None)
 
 
+def detach_topo_agent(agent):
+    """Take an agent's way into a lab away: its vm-relay-topo container and the lab key in its workspace. Best effort."""
+    try:
+        run([DOCKER, "compose", "-p", proj(agent), "--env-file", str(env_file(agent)), *TOPO_RELAY_FILES,
+             "rm", "-sf", "vm-relay-topo"], timeout=30)
+        dc(agent, "exec", "-T", "gateway", "rm", "-rf", "/home/node/.openclaw/workspace/.vmkey-topo", timeout=20)
+    except Exception:  # noqa
+        pass
+
+
+def topo_agent_turn(r, message):
+    t0 = time.time()
+    res = run_turn(r["agent"], r["chat"], message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200)
+    topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']})")
+    return res
+
+
+def send_topo_followup(rid, text):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    return queue_followup(r, TOPO_FOLLOWUPS, TOPO_END, text)
+
+
+def end_topo_session(rid):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    request_session_end(r, TOPO_END)
+
+
 def topo_score_now(rid):
     """On-demand scoring - lets a PERSON who did the task themselves via the terminals get scored too."""
     r = TOPO_RUNS.get(rid)
     if not r:
         raise KeyError("unknown run")
-    if r["state"] not in ("ready", "done", "working"):
+    if r["state"] not in ("ready", "done", "working", "attached"):
         raise ValueError("the lab isn't ready yet")
     if not r.get("task_id"):
         raise ValueError("this run has no task attached, so there is nothing to score")
@@ -1600,7 +1672,7 @@ def topo_score_now(rid):
     def job(log):
         log("scoring...")
         r["score"] = score_run(check_port, priv, task)
-        if r["state"] != "working":
+        if r["state"] not in ("working", "attached"):        # never end a lab an agent is still attached to
             r["state"] = "done"
         save_topo_run(r)
         log(f"score: {'PASS' if r['score']['passed'] else 'FAIL'}")
@@ -1657,7 +1729,7 @@ def start_topo_terminal(rid, node):
         raise KeyError("unknown run")
     if node not in r["nodes"]:
         raise KeyError("unknown node")
-    if r["state"] not in ("ready", "working", "scoring", "done"):
+    if r["state"] not in ("ready", "working", "attached", "scoring", "done"):
         raise ValueError("the lab isn't up yet")
     n = r["nodes"][node]
     if n.get("terminal", {}).get("active"):
@@ -2381,6 +2453,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"ok": True})
                 if parts[4] == "score":
                     return self.send_json({"job": topo_score_now(parts[3])})
+                if parts[4] == "message":
+                    return self.send_json(send_topo_followup(parts[3], b.get("text")))
+                if parts[4] == "end":
+                    end_topo_session(parts[3])
+                    return self.send_json({"ok": True})
             if (parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 7 and TOPO_RUN_ID_RE.match(parts[3])
                     and parts[4] == "nodes"):
                 node = parts[5]
