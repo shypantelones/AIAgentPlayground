@@ -10,7 +10,7 @@ Isolation posture for every VM this module creates:
   - Clipboard, drag-and-drop and audio are disabled (same as the original vm-sandbox/Vagrantfile).
 A VM never gets a route to the host, to another VM, or to any agent other than the one it was created for.
 """
-import json, os, re, secrets, shutil, signal, socket, subprocess, sys, threading, time
+import base64, json, os, re, secrets, shlex, shutil, signal, socket, subprocess, sys, threading, time
 from pathlib import Path
 
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -295,7 +295,8 @@ true
 
 # Countdowns the kernel prints and decrements on its own, e.g. on IPv6 routes learned from router advertisements on
 # the setup NIC ("... proto ra metric 100 expires 86197sec"). Left in, every node would show a change in every diff.
-SNAPSHOT_VOLATILE = re.compile(r" expires \d+sec")
+# nftables rule counters ("counter packets 12 bytes 1008") count traffic, so they're reduced to plain "counter".
+SNAPSHOT_VOLATILE = re.compile(r" expires \d+sec|(?<=counter) packets \d+ bytes \d+")
 
 
 def parse_snapshot(text):
@@ -312,6 +313,167 @@ def parse_snapshot(text):
     if name is not None:
         sections[name] = "\n".join(lines).strip() + "\n"
     return sections
+
+
+# ---------------------------------------------------------------- lab files (a lab you can save, share and rebuild)
+# {"format", "version", "title", "topology": {"nodes": [{name, role}], "links": [{a, b}]}, "configs": {node:
+# {snapshot section: text}}, "intents": [...]}. The node and link order is kept exactly: it decides each node's NIC
+# order, so interface names in the configs (enp0s8, enp0s9, ...) mean the same thing in the rebuilt lab.
+# "intents" is reserved for the verification work (reach/block checks) and carried through unchanged for now.
+LABFILE_FORMAT = "aiagentplayground-lab"
+LABFILE_VERSION = 1
+LABFILE_MAX_LINKS = 64
+LABFILE_MAX_TEXT = 200_000
+SETUP_IFACES = ("lo", "enp0s3")          # loopback and the NAT/setup NIC: never part of a lab's config
+APPLY_FILE_RE = re.compile(r"^/etc/(nginx|frr)/[A-Za-z0-9._/-]+$")     # service config files a lab file may restore
+APPLY_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:/@%-]+$")                  # one word of an `ip` address/route
+APPLY_SYSCTL_RE = re.compile(r"^(net\.[a-z0-9_.]+) = (-?\d+)$")
+APPLY_SKIP_PROTOS = ("kernel", "dhcp", "ra")                           # routes the system creates on its own
+
+
+def build_labfile(title, topology, configs, intents=None, source=None):
+    return {"format": LABFILE_FORMAT, "version": LABFILE_VERSION, "title": title,
+            "topology": {"nodes": [{"name": n["name"], "role": n["role"]} for n in topology["nodes"]],
+                         "links": [{"a": l["a"], "b": l["b"]} for l in topology["links"]]},
+            "configs": configs, "intents": list(intents or []), "source": source or {}}
+
+
+def parse_labfile(obj):
+    """Validate a lab file (it may come from someone else) -> (title, topology, configs, intents)."""
+    if not isinstance(obj, dict) or obj.get("format") != LABFILE_FORMAT:
+        raise ValueError("not an AI Agent Playground lab file")
+    if obj.get("version") != LABFILE_VERSION:
+        raise ValueError(f"unsupported lab file version {obj.get('version')!r} (this panel reads version {LABFILE_VERSION})")
+    t = obj.get("topology")
+    if not isinstance(t, dict) or not isinstance(t.get("nodes"), list) or not isinstance(t.get("links"), list):
+        raise ValueError("the lab file has no topology")
+    try:
+        nodes = [{"name": str(n["name"]), "role": str(n["role"])} for n in t["nodes"]]
+        links = [{"a": str(l["a"]), "b": str(l["b"])} for l in t["links"]]
+    except (KeyError, TypeError):
+        raise ValueError("the lab file's topology is malformed")
+    if not 2 <= len(nodes) <= MAX_CUSTOM_NODES:
+        raise ValueError(f"a lab needs 2 to {MAX_CUSTOM_NODES} nodes (the file has {len(nodes)})")
+    if len(links) > LABFILE_MAX_LINKS:
+        raise ValueError(f"too many links ({len(links)})")
+    title = str(obj.get("title") or "Lab from file")[:120]
+    topology = validate_topology({"id": "custom", "title": f"From file: {title}", "nodes": nodes, "links": links})
+    names = {n["name"] for n in nodes}
+    configs = obj.get("configs") or {}
+    if not isinstance(configs, dict) or not all(isinstance(v, dict) for v in configs.values()):
+        raise ValueError("the lab file's configs are malformed")
+    unknown = set(configs) - names
+    if unknown:
+        raise ValueError(f"configs for nodes not in the topology: {', '.join(sorted(unknown))}")
+    for node, secs in configs.items():
+        for sec, text in secs.items():
+            if not isinstance(text, str) or len(text) > LABFILE_MAX_TEXT:
+                raise ValueError(f"config section '{sec}' of {node} is not text or is too large")
+    intents = obj.get("intents") or []
+    if not isinstance(intents, list) or len(intents) > 500:
+        raise ValueError("the lab file's intents are malformed")
+    return title, topology, {n: {s: t for s, t in secs.items() if s != "_error"} for n, secs in configs.items()}, intents
+
+
+def _usable(text):
+    return text.strip() and not text.lstrip().startswith(("sudo:", "bash:")) and "command not found" not in text
+
+
+def render_apply_script(sections):
+    """A bash script that puts a node's saved config (snapshot sections) back: addresses and link state on lab
+    interfaces, static routes, forwarding sysctls, the nftables ruleset (or iptables rules) and nginx/FRR config
+    files. Everything the system creates by itself (setup NIC, kernel/DHCP/RA routes, link-local addresses) is left
+    alone. Every value is checked and quoted, and file and ruleset contents travel base64-encoded, so a lab file from
+    someone else can't inject shell commands. Returns (script, skipped lines)."""
+    q, cmds, skipped = shlex.quote, [], []
+    for line in sections.get("addresses", "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        iface = parts[0].split("@")[0]
+        if iface in SETUP_IFACES or not APPLY_TOKEN_RE.match(iface):
+            continue
+        for addr in parts[2:]:
+            if "/" not in addr or addr.lower().startswith("fe80:"):
+                continue
+            if APPLY_TOKEN_RE.match(addr):
+                cmds.append(f"sudo -n ip addr replace {q(addr)} dev {q(iface)}")
+            else:
+                skipped.append(f"address {addr} on {iface}")
+        if parts[1] in ("UP", "UNKNOWN"):
+            cmds.append(f"sudo -n ip link set {q(iface)} up")
+    v6 = False
+    for line in sections.get("routes", "").splitlines():
+        if line.startswith("# ipv6"):
+            v6 = True
+            continue
+        toks = line.split()
+        if not toks or line.startswith("#") or toks[0] in ("broadcast", "local", "multicast", "anycast"):
+            continue
+        if any(t in SETUP_IFACES for t in toks) or ("proto" in toks and toks.index("proto") + 1 < len(toks)
+                                                   and toks[toks.index("proto") + 1] in APPLY_SKIP_PROTOS):
+            continue
+        if not all(APPLY_TOKEN_RE.match(t) for t in toks):
+            skipped.append(f"route: {line.strip()}")
+            continue
+        cmds.append(f"sudo -n ip {'-6 ' if v6 else ''}route replace " + " ".join(q(t) for t in toks))
+    for line in sections.get("forwarding", "").splitlines():
+        m = APPLY_SYSCTL_RE.match(line.strip())
+        if m:
+            cmds.append(f"sudo -n sysctl -q -w {q(m.group(1) + '=' + m.group(2))}")
+    b64 = lambda text: base64.b64encode(text.encode()).decode()
+    nft, ipt = sections.get("nftables", ""), sections.get("iptables", "")
+    if _usable(nft):
+        cmds.append(f"echo {b64('flush ruleset' + chr(10) + nft)} | base64 -d | sudo -n nft -f -")
+    elif _usable(ipt):
+        cmds.append(f"echo {b64(ipt)} | base64 -d | sudo -n iptables-restore")
+    reload_nginx = restart_frr = False
+    for sec, text in sections.items():
+        if not sec.startswith("file "):
+            continue
+        path = sec[5:].strip()
+        if not APPLY_FILE_RE.match(path) or ".." in path:
+            if not path.startswith("/etc/netplan/"):           # netplan is setup NIC config: deliberately not restored
+                skipped.append(f"file {path}")
+            continue
+        cmds.append(f"sudo -n mkdir -p {q(os.path.dirname(path))} && echo {b64(text)} | base64 -d | sudo -n tee {q(path)} >/dev/null")
+        reload_nginx |= path.startswith("/etc/nginx/")
+        restart_frr |= path.startswith("/etc/frr/")
+    if reload_nginx:
+        cmds.append("sudo -n nginx -t -q && sudo -n systemctl reload nginx")
+    if restart_frr:
+        cmds.append("sudo -n systemctl restart frr")
+    body = "".join(f"{c} || echo {q('FAILED: ' + c[:200])}\n" for c in cmds)
+    return f"{body}echo done\n", skipped
+
+
+def _compare_view(sec, text):
+    """What has to match between the lab file and the rebuilt node: lab interfaces and static routes only (MACs,
+    link-local and setup-NIC addresses legitimately differ between two VMs)."""
+    lines = []
+    for line in SNAPSHOT_VOLATILE.sub("", text).splitlines():
+        toks = line.split()
+        if not toks:
+            continue
+        if sec == "addresses":
+            if toks[0].split("@")[0] in SETUP_IFACES:
+                continue
+            toks = [t for t in toks if not t.lower().startswith("fe80:")]
+        elif sec == "routes":
+            if any(t in SETUP_IFACES for t in toks) or "fe80::/64" in toks:
+                continue
+        lines.append(" ".join(toks))
+    return sorted(lines)
+
+
+def config_mismatches(wanted, live):
+    """Sections of a node's lab-file config that the rebuilt node doesn't match (addresses, routes, forwarding,
+    firewall). [] means the rebuild is faithful."""
+    out = []
+    for sec in ("addresses", "routes", "forwarding", "nftables"):
+        if sec in wanted and _usable(wanted[sec]) and _compare_view(sec, wanted[sec]) != _compare_view(sec, live.get(sec, "")):
+            out.append(sec)
+    return out
 
 
 def scp_to(port, key_path, local_path, remote_path, timeout=60):

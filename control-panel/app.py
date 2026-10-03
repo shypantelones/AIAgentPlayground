@@ -1490,6 +1490,8 @@ def topo_run_view(r, full=False):
     v["interactive"] = bool(r.get("interactive"))
     v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
     v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
+    v["from_labfile"] = (r.get("labfile") or {}).get("title")
+    v["labfile_check"] = r.get("labfile_check")
     v.update({k: r.get(k) for k in ("saved_at", "resumed", "agent_done")})
     v["agent_holds"] = bool(r.get("agent")) and agent_holds_lab(r, r["agent"])
     if full:
@@ -1519,7 +1521,12 @@ def create_topo_run(form):
     no topology_id (nothing to look up later), so its full dict is embedded on the run record as r["topology"]."""
     topology_id = form.get("topology_id") or None
     custom = form.get("custom")
-    if topology_id:
+    labfile = None
+    if form.get("labfile") is not None:
+        title, topology, configs, intents = vr.parse_labfile(form["labfile"])
+        labfile = {"title": title, "configs": configs, "intents": intents}
+        topology_id = None
+    elif topology_id:
         topology = vr.get_topology(topology_id)          # raises KeyError if unknown
     elif custom:
         topology = vr.build_custom_topology(custom.get("counts") or {}, custom.get("wiring"), custom.get("links"))
@@ -1559,7 +1566,7 @@ def create_topo_run(form):
          "memory_mb": int(form.get("memory_mb") or s["memory_mb"]), "cpus": int(form.get("cpus") or s["cpus"]),
          "created": time.time(), "started": None, "ended": None, "agent": agent,
          "topology_id": topology_id, "topology_title": topology["title"],
-         "topology": topology if topology_id is None else None, "task_id": task_id,
+         "topology": topology if topology_id is None else None, "task_id": task_id, "labfile": labfile,
          "task_title": (task or {}).get("title"), "custom_prompt": custom_prompt,
          "interactive": interactive, "idle_since": None,
          "chat": f"vmtopo-{rid}" if agent else None,
@@ -1668,6 +1675,8 @@ def topo_run_runner(rid):
                 if stopped():
                     return finish("stopped", "stopped during setup")
                 return finish("error", f"node '{name}' booted but never accepted SSH")
+        if r.get("labfile"):
+            apply_labfile(r, node_ports, priv)
         r["state"] = "ready"
         save_topo_run(r)
         task = vr.get_topology_task(r["task_id"]) if r["task_id"] else None
@@ -1805,27 +1814,38 @@ def take_topo_snapshot(r, trigger, label=None):
     for t in threads:
         t.join(timeout=90)
     now = time.time()
+    d = topo_snap_dir(rid)
+    existing = _snapshot_records(rid)
+    # seq orders snapshots taken within one clock tick (time.time() only advances every ~15 ms on Windows)
     snap = {"id": time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + secrets.token_hex(2), "ts": now,
+            "seq": max((x.get("seq", 0) for _, x in existing), default=0) + 1,
             "trigger": trigger, "label": (str(label).strip()[:80] or None) if label else None,
             "nodes": {n: nodes.get(n, {"_error": "timed out"}) for n in r["nodes"]}}
-    d = topo_snap_dir(rid)
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{snap['id']}.json").write_text(json.dumps(snap, indent=1))
-    for old in sorted(d.glob("*.json"))[:-TOPO_SNAP_KEEP]:
-        old.unlink()
+    for f, _ in sorted(existing, key=lambda fx: _snap_order(fx[1]))[:max(0, len(existing) + 1 - TOPO_SNAP_KEEP)]:
+        f.unlink()                                       # keep the newest TOPO_SNAP_KEEP, this one included
     return snap
 
 
-def list_topo_snapshots(rid):
+def _snap_order(s):
+    return (s.get("ts", 0), s.get("seq", 0))
+
+
+def _snapshot_records(rid):
     out = []
     for f in topo_snap_dir(rid).glob("*.json"):
         try:
-            s = json.loads(f.read_text())
+            out.append((f, json.loads(f.read_text())))
         except Exception:  # noqa
             continue
-        out.append({"id": s["id"], "ts": s["ts"], "trigger": s.get("trigger"), "label": s.get("label"),
-                    "nodes": sorted(s["nodes"]), "errors": sorted(n for n, v in s["nodes"].items() if "_error" in v)})
-    return sorted(out, key=lambda s: s["ts"], reverse=True)          # newest first
+    return out
+
+
+def list_topo_snapshots(rid):
+    recs = sorted((s for _, s in _snapshot_records(rid)), key=_snap_order, reverse=True)     # newest first
+    return [{"id": s["id"], "ts": s["ts"], "trigger": s.get("trigger"), "label": s.get("label"),
+             "nodes": sorted(s["nodes"]), "errors": sorted(n for n, v in s["nodes"].items() if "_error" in v)} for s in recs]
 
 
 def load_topo_snapshot(rid, sid):
@@ -1882,6 +1902,55 @@ def snapshot_topo_lab(rid, label=None):
         log(f"snapshot {snap['id']} saved")
         return {"id": snap["id"]}
     return start_job(f"Snapshot lab {rid}", job)
+
+
+# ---------------------------------------------------------------- lab files
+def labfile_for_lab(rid, sid=None):
+    """Export a lab as a lab file: its topology and the configs from snapshot `sid` (default: the newest)."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if not sid:
+        snaps = list_topo_snapshots(rid)
+        if not snaps:
+            raise ValueError("take a snapshot first: a lab file's configs come from a snapshot")
+        sid = snaps[0]["id"]
+    snap = load_topo_snapshot(rid, sid)
+    topology = vr.get_topology(r["topology_id"]) if r["topology_id"] else r["topology"]
+    title = (r.get("labfile") or {}).get("title") or r["topology_title"]
+    intents = (r.get("labfile") or {}).get("intents") or []
+    lf = vr.build_labfile(title, topology, {n: {s: t for s, t in secs.items() if s != "_error"} for n, secs in snap["nodes"].items()},
+                          intents, {"lab": rid, "snapshot": sid, "snapshot_label": snap.get("label") or snap.get("trigger"),
+                                    "exported": time.strftime("%Y-%m-%d %H:%M:%S")})
+    return f"lab-{rid}-{sid}.json", json.dumps(lf, indent=1).encode()
+
+
+def apply_labfile(r, node_ports, priv):
+    """Put a lab file's configs on the freshly booted nodes, then snapshot and check the rebuild against the file."""
+    configs = r["labfile"]["configs"]
+    topo_log(r, f"applying the lab file's configs to {len(configs)} node(s)...")
+    for name in r["nodes"]:
+        if name not in configs:
+            continue
+        script, skipped = vr.render_apply_script(configs[name])
+        rc, out, err = vr.ssh_script(node_ports[name], priv, script, timeout=120)
+        failed = [l for l in (out or "").splitlines() if l.startswith("FAILED:")]
+        topo_log(r, f"  {name}: " + ("applied" if rc == 0 and not failed else f"applied with {len(failed)} failure(s)")
+                 + (f"; skipped {len(skipped)}: {', '.join(skipped)}" if skipped else ""))
+        for l in failed[:10]:
+            topo_log(r, f"    {l[:200]}")
+        if rc != 0:
+            topo_log(r, f"    ssh exit {rc}: {(err or out).strip()[-300:]}")
+    try:
+        snap = take_topo_snapshot(dict(r, state="ready"), "applied from lab file")
+    except Exception as e:  # noqa
+        topo_log(r, f"could not check the rebuild: {e}")
+        return
+    mism = {n: vr.config_mismatches(configs[n], snap["nodes"].get(n, {})) for n in configs}
+    mism = {n: m for n, m in mism.items() if m}
+    topo_log(r, f"config snapshot {snap['id']} taken: " + ("every node matches the lab file." if not mism else
+             "differs from the lab file in " + "; ".join(f"{n}: {', '.join(m)}" for n, m in mism.items())))
+    r["labfile_check"] = {"snapshot": snap["id"], "mismatches": mism}
 
 
 def detach_topo_agent(agent):
@@ -2826,6 +2895,10 @@ class Handler(BaseHTTPRequestHandler):
             if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 4 and TOPO_RUN_ID_RE.match(parts[3]):
                 r = TOPO_RUNS.get(parts[3])
                 return self.send_json(topo_run_view(r, full=True)) if r else self.fail(404, "no such run")
+            if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 5 and TOPO_RUN_ID_RE.match(parts[3]) \
+                    and parts[4] == "labfile":                        # .../labfile: from the newest snapshot
+                name, data = labfile_for_lab(parts[3])
+                return self.send_download(name, data, "application/json")
             if (parts[:3] == ["api", "vmtopo", "runs"] and len(parts) >= 5 and TOPO_RUN_ID_RE.match(parts[3])
                     and parts[4] == "snapshots"):
                 rid = parts[3]
@@ -2838,6 +2911,9 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts) == 7 and parts[6] == "zip":             # .../snapshots/<id>/zip
                     name, data = topo_snapshot_zip(rid, parts[5])
                     return self.send_download(name, data)
+                if len(parts) == 7 and parts[6] == "labfile":         # .../snapshots/<id>/labfile
+                    name, data = labfile_for_lab(rid, parts[5])
+                    return self.send_download(name, data, "application/json")
                 if len(parts) == 8 and parts[6] == "diff":            # .../snapshots/<a>/diff/<b>
                     return self.send_json(diff_topo_snapshots(rid, parts[5], parts[7]))
             if parts == ["api", "peers"]:
