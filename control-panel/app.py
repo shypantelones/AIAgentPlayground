@@ -1814,27 +1814,38 @@ def take_topo_snapshot(r, trigger, label=None):
     for t in threads:
         t.join(timeout=90)
     now = time.time()
+    d = topo_snap_dir(rid)
+    existing = _snapshot_records(rid)
+    # seq orders snapshots taken within one clock tick (time.time() only advances every ~15 ms on Windows)
     snap = {"id": time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + secrets.token_hex(2), "ts": now,
+            "seq": max((x.get("seq", 0) for _, x in existing), default=0) + 1,
             "trigger": trigger, "label": (str(label).strip()[:80] or None) if label else None,
             "nodes": {n: nodes.get(n, {"_error": "timed out"}) for n in r["nodes"]}}
-    d = topo_snap_dir(rid)
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{snap['id']}.json").write_text(json.dumps(snap, indent=1))
-    for old in sorted(d.glob("*.json"))[:-TOPO_SNAP_KEEP]:
-        old.unlink()
+    for f, _ in sorted(existing, key=lambda fx: _snap_order(fx[1]))[:max(0, len(existing) + 1 - TOPO_SNAP_KEEP)]:
+        f.unlink()                                       # keep the newest TOPO_SNAP_KEEP, this one included
     return snap
 
 
-def list_topo_snapshots(rid):
+def _snap_order(s):
+    return (s.get("ts", 0), s.get("seq", 0))
+
+
+def _snapshot_records(rid):
     out = []
     for f in topo_snap_dir(rid).glob("*.json"):
         try:
-            s = json.loads(f.read_text())
+            out.append((f, json.loads(f.read_text())))
         except Exception:  # noqa
             continue
-        out.append({"id": s["id"], "ts": s["ts"], "trigger": s.get("trigger"), "label": s.get("label"),
-                    "nodes": sorted(s["nodes"]), "errors": sorted(n for n, v in s["nodes"].items() if "_error" in v)})
-    return sorted(out, key=lambda s: s["ts"], reverse=True)          # newest first
+    return out
+
+
+def list_topo_snapshots(rid):
+    recs = sorted((s for _, s in _snapshot_records(rid)), key=_snap_order, reverse=True)     # newest first
+    return [{"id": s["id"], "ts": s["ts"], "trigger": s.get("trigger"), "label": s.get("label"),
+             "nodes": sorted(s["nodes"]), "errors": sorted(n for n, v in s["nodes"].items() if "_error" in v)} for s in recs]
 
 
 def load_topo_snapshot(rid, sid):

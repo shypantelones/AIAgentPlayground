@@ -804,6 +804,13 @@ class SnapshotTests(VmTopoBase):
         names = zipfile.ZipFile(io.BytesIO(app.topo_snapshot_zip(rid, sid)[1])).namelist()
         self.assertIn(f"lab-{rid}-{sid}/h1/file_etc_nginx_conf.d_lb.conf.txt", names)
 
+    def test_snapshots_in_the_same_clock_tick_keep_their_order(self):
+        # regression: on Windows time.time() only advances every ~15 ms, so quick snapshots shared a timestamp
+        rid = self.ready_lab()
+        with mock.patch.object(app.time, "time", lambda: 1_800_000_000.0):
+            ids = [app.take_topo_snapshot(app.TOPO_RUNS[rid], f"x{i}")["id"] for i in range(4)]
+        self.assertEqual([s["id"] for s in app.list_topo_snapshots(rid)], ids[::-1])
+
     def test_only_the_newest_snapshots_are_kept(self):
         rid = self.ready_lab()
         with mock.patch.object(app, "TOPO_SNAP_KEEP", 3):
