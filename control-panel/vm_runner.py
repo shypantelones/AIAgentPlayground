@@ -793,13 +793,17 @@ def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None, de
     # agent shares this workspace, so it isn't a security boundary.
     budget = ""
     if budget_file:
+        # Agents run commands in parallel within a turn: the read and the write are one step under a lock, and the
+        # count is written to a temporary file and renamed into place, so no two commands can read the same count.
         budget = (f"if [ -f \"{budget_file}\" ]; then\n"
-                  f"  n=$(cat \"{budget_file}\" 2>/dev/null || echo 0)\n"
+                  f"  exec 9>\"{budget_file}.lock\"; flock 9\n"
+                  f"  n=$(cat \"{budget_file}\" 2>/dev/null)\n"
+                  "  case \"$n\" in ''|*[!0-9]*) n=0;; esac\n"
                   "  if [ \"$n\" -le 0 ]; then\n"
                   "    echo \"command budget used up for this agent in this lab: stop and tell the user what is left to do\" >&2\n"
                   "    exit 3\n"
                   "  fi\n"
-                  f"  echo $((n - 1)) > \"{budget_file}\"\n"
+                  f"  echo $((n - 1)) > \"{budget_file}.tmp\" && mv \"{budget_file}.tmp\" \"{budget_file}\"\n"
                   "fi\n")
     # A role guard (see lab_roles): a command matching one of the role's patterns is refused and logged as refused.
     # Patterns are ERE for grep; none may contain a single quote.

@@ -93,9 +93,33 @@ class ModelPriceListTests(unittest.TestCase):
         self.assertLess(by_id["claude-opus-5-5"], by_id["claude-haiku-4-5"])
 
 
+class WrapperBudgetRaceTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform.startswith("win"), "runs the wrapper with sh, flock and a fake ssh")
+    def test_parallel_commands_spend_exactly_the_budget(self):
+        import os, subprocess
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            b = tmp / "bin"; b.mkdir()
+            (b / "ssh").write_text("#!/bin/sh\ncat >/dev/null 2>&1\necho ran\n"); (b / "ssh").chmod(0o755)
+            budget = tmp / "budget"; budget.write_text("5")
+            w = tmp / "vmrun-h1"
+            w.write_text(vr.vmrun_script("/k", 1, "h", str(tmp / "log"), node="h1", budget_file=str(budget)))
+            env = dict(os.environ, PATH=f"{b}{os.pathsep}{os.environ['PATH']}")
+            procs = [subprocess.Popen(["sh", str(w), f"echo {i}"], env=env, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in range(20)]
+            codes = [p.wait() for p in procs]
+            self.assertEqual(codes.count(0), 5, codes)
+            self.assertEqual(codes.count(3), 15, codes)
+            self.assertEqual(budget.read_text().strip(), "0")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class WrapperBudgetTests(unittest.TestCase):
     def test_the_wrapper_takes_one_from_the_budget_and_refuses_at_zero(self):
-        self.assertIn('echo $((n - 1)) > "/w/.vmrun-budget"', vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
+        self.assertIn('echo $((n - 1)) > "/w/.vmrun-budget.tmp" && mv "/w/.vmrun-budget.tmp" "/w/.vmrun-budget"',
+                      vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
+        self.assertIn("flock 9", vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
         self.assertIn('"$n" -le 0', vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
 
     def test_a_wrapper_without_a_budget_file_is_unchanged(self):
