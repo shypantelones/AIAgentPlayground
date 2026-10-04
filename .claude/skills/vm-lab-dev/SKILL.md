@@ -454,7 +454,11 @@ generated shell in each node's provision script.
   command and refuses at zero. It's a runaway guard: the agent shares the workspace.
 - **Gotcha:** a model id with no price made every local-agent lab fail at creation until local agents were skipped. Test
   budgets with priced cloud ids and local ids both.
-- **Not yet done:** the Model-tab warning, and a per-turn cap separate from the lab total.
+- **Per-turn cap:** `budget["per_turn"]` (form `command_cap`, 5-200, default 40). `topo_agent_turn` writes
+  `min(budget_left, per_turn)` to the file, so one turn can't spend the whole budget.
+- **Model picker:** `cloud_models_with_cost()` adds `commands_per_50c` to each cloud model in the state payload;
+  `cloudFields` in `static/app.js` shows it and warns below half the cheapest model's count.
+- **Not yet done:** the same warning on the lab form, and a live check of the per-turn cap on a real turn.
 
 ## Recording changes (required in every PR)
 

@@ -51,6 +51,37 @@ class LabBudgetTests(unittest.TestCase):
         self.assertEqual(app.budget_left(r, "alpha"), 0)         # never negative
 
 
+class PerTurnCapTests(unittest.TestCase):
+    def test_the_per_turn_cap_defaults_and_is_recorded(self):
+        self.assertEqual(app.lab_budget({"budget_usd": 0.5}, [("alpha", HAIKU)])["per_turn"], app.TOPO_COMMAND_CAP_DEFAULT)
+        self.assertEqual(app.lab_budget({"budget_usd": 0.5, "command_cap": "12"}, [("alpha", HAIKU)])["per_turn"], 12)
+
+    def test_the_cap_must_be_within_range(self):
+        for bad in ["4", "201", "many"]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                app.lab_budget({"budget_usd": 0.5, "command_cap": bad}, [("alpha", HAIKU)])
+
+    def test_a_turn_gets_the_lower_of_the_budget_left_and_the_cap(self):
+        captured = []
+        r = {"id": "c1", "agent": "alpha", "chat": "c", "nodes": {}, "agent_turns": 0,
+             "budget": {"usd": 1, "per_turn": 10, "commands": {"alpha": 100}, "used": {}}}
+        with mock.patch.object(app, "dc", side_effect=lambda *a, **k: captured.append(a[-1]) or (0, "", "")), \
+                mock.patch.object(app, "read_agent_log", return_value=""), \
+                mock.patch.object(app, "counted_agent_turn", side_effect=lambda r_, m, log, turn: {"ok": True}), \
+                mock.patch.object(app, "snapshot_lab_vms", return_value=True), \
+                mock.patch.object(app, "take_topo_snapshot", return_value={"id": "s"}):
+            app.topo_agent_turn(r, "go")
+        self.assertIn(f"echo 10 > {app.TOPO_BUDGET_FILE}", captured[0])
+
+
+class ModelPriceListTests(unittest.TestCase):
+    def test_every_cloud_model_says_what_fifty_cents_buys(self):
+        models = app.cloud_models_with_cost()["anthropic"]
+        by_id = {m["id"]: m["commands_per_50c"] for m in models}
+        self.assertEqual(by_id["claude-haiku-4-5"], ac.commands_for_budget(0.5, HAIKU))
+        self.assertLess(by_id["claude-opus-5-5"], by_id["claude-haiku-4-5"])
+
+
 class WrapperBudgetTests(unittest.TestCase):
     def test_the_wrapper_takes_one_from_the_budget_and_refuses_at_zero(self):
         self.assertIn('echo $((n - 1)) > "/w/.vmrun-budget"', vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))

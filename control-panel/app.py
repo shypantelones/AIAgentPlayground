@@ -2475,6 +2475,21 @@ TOPO_BUDGET_FILE = "/home/node/.openclaw/workspace/.vmrun-budget"   # read by th
 TOPO_BUDGET_MAX_USD = 20.0
 
 
+def cloud_models_with_cost():
+    """CLOUD_MODELS, each model with how many commands $0.50 buys on it (None if its price is unknown)."""
+    out = {}
+    for provider, models in CLOUD_MODELS.items():
+        out[provider] = []
+        for m in models:
+            per = ac.cost_per_command(f"{provider}/{m['id']}")
+            out[provider].append(dict(m, commands_per_50c=int(0.5 // per) if per else None))
+    return out
+
+
+TOPO_COMMAND_CAP_DEFAULT = 40                # commands one agent may run in one turn, whatever the budget left
+TOPO_COMMAND_CAP_RANGE = (5, 200)
+
+
 def lab_budget(form, members):
     """The lab's command budget: each agent gets `budget_usd`, which buys a number of commands on its own model.
     `members` is [(agent, model_id)]. Local (Ollama) agents cost no dollars, so they aren't budgeted. Returns
@@ -2488,7 +2503,15 @@ def lab_budget(form, members):
         raise ValueError("the budget has to be a dollar amount, e.g. 0.50")
     if not 0 < usd <= TOPO_BUDGET_MAX_USD:
         raise ValueError(f"the budget has to be more than $0 and at most ${TOPO_BUDGET_MAX_USD:.0f}")
-    return {"usd": usd, "commands": {agent: ac.commands_for_budget(usd, model) for agent, model in members}, "used": {}}
+    try:
+        per_turn = int(form.get("command_cap") or TOPO_COMMAND_CAP_DEFAULT)
+    except (TypeError, ValueError):
+        raise ValueError("the command cap has to be a whole number")
+    lo, hi = TOPO_COMMAND_CAP_RANGE
+    if not lo <= per_turn <= hi:
+        raise ValueError(f"the command cap has to be {lo} to {hi} commands per turn")
+    return {"usd": usd, "per_turn": per_turn,
+            "commands": {agent: ac.commands_for_budget(usd, model) for agent, model in members}, "used": {}}
 
 
 def budget_left(r, agent):
@@ -2589,6 +2612,8 @@ def topo_agent_turn(r, message, member=None):
     before = read_agent_log(agent, TOPO_CHANGE_LOG)
     if r.get("budget"):                                  # the wrapper's allowance for this agent, from what's left
         left = budget_left(r, agent)
+        if left is not None:                              # the budget left, or the per-turn cap if that's lower
+            left = min(left, r["budget"]["per_turn"])
         # An unbudgeted agent clears the file: its workspace may still hold a count from an earlier lab.
         cmd = f"echo {left} > {TOPO_BUDGET_FILE}" if left is not None else f"rm -f {TOPO_BUDGET_FILE}"
         dc(agent, "exec", "-T", "gateway", "sh", "-c", cmd, timeout=20)
@@ -3711,7 +3736,7 @@ def build_state():
     return {"docker": True, "shared": shared_info, "instances": insts,
             "platform": {"os": ps.OS_NAME, "secretStore": STORE.label, "secretKind": STORE.kind},
             "legacy": "openclaw-sandbox" in states and any(s["state"] == "running" for s in states["openclaw-sandbox"].values()),
-            "panelPort": PANEL_PORT, "cloudModels": CLOUD_MODELS}
+            "panelPort": PANEL_PORT, "cloudModels": cloud_models_with_cost()}
 
 
 # ---------------------------------------------------------------- HTTP

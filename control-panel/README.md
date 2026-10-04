@@ -159,8 +159,11 @@ commands is refused before anything is built.
   so the real spend can be higher or lower. The agent shares its workspace, so it could edit the counter or reach the lab
   through its own SSH: this stops runaway loops, not a deliberate bypass. Set a spend limit with your provider as the hard cap.
 - **Local agents** (Ollama) aren't budgeted: they cost no dollars.
-- **Not yet done:** a warning in the agent's Model tab when a pricier model is picked, and a per-turn cap separate from the
-  lab total.
+- **Per-turn cap:** an agent may run at most N commands in one turn (form field "At most N commands per turn", default
+  40, range 5 to 200), even if the budget has more left. It stops one runaway turn from using the whole budget.
+- **Model picker:** the Model tab says what $0.50 buys on the chosen model, and warns when it buys less than half what the
+  cheapest model buys.
+- **Not yet done:** the same warning on the lab form, and a live check of the cap on a real turn.
 
 #### Teams: several agents in one lab
 A lab can take a **team** instead of one agent (the "Team" group in the new-lab form, one member per line:

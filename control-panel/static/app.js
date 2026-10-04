@@ -74,6 +74,17 @@ function cloudFields(cur = {}) {
     if (!claude.some(m => m.id === cur.cloudModel)) modelSel.append(h("option", { value: cur.cloudModel }, `${cur.cloudModel} (current; not in the list)`));
     modelSel.value = cur.cloudModel;
   }
+  // A pricier model is a choice worth seeing: say what $0.50 buys on it, and what the cheapest model buys.
+  const costWarn = h("div", { class: "hint" });
+  const showCost = () => {
+    const pick = claude.find(m => m.id === modelSel.value);
+    const cheapest = Math.max(0, ...claude.map(m => m.commands_per_50c || 0));
+    if (!pick || pick.commands_per_50c == null) { costWarn.textContent = ""; return; }
+    costWarn.className = pick.commands_per_50c < cheapest / 2 ? "fail" : "hint";
+    costWarn.textContent = `$0.50 buys about ${pick.commands_per_50c} commands on this model` +
+      (pick.commands_per_50c < cheapest / 2 ? ` (the cheapest buys ${cheapest}). A lab's budget covers fewer commands with it.` : ".");
+  };
+  modelSel.addEventListener("change", showCost);
   const modelTxt = h("input", { placeholder: "model name, exactly as your provider spells it", value: provider !== "anthropic" ? cur.cloudModel || "" : "", autocomplete: "off", spellcheck: "false" });
   const up = h("input", { placeholder: "https://openrouter.ai/api", value: cur.upstream || "", autocomplete: "off" });
   const rate = h("input", { type: "number", min: 1, max: 600, value: cur.rate || 30, style: "max-width:90px;flex:none" });
@@ -83,9 +94,9 @@ function cloudFields(cur = {}) {
     modelSel.style.display = claudeOn ? "" : "none"; modelTxt.style.display = claudeOn ? "none" : "";
     upRow.style.display = prov.value === "openai-compatible" ? "" : "none";
   };
-  prov.addEventListener("change", sync); sync();
+  prov.addEventListener("change", sync); sync(); showCost();
   return {
-    rows: [h("div", { class: "row" }, "Provider", prov), h("div", { class: "row" }, "Model", modelSel, modelTxt), upRow,
+    rows: [h("div", { class: "row" }, "Provider", prov), h("div", { class: "row" }, "Model", modelSel, modelTxt), costWarn, upRow,
            h("div", { class: "row" }, "Max requests/min", rate, h("span", { class: "hint" }, "cost guard: the relay throttles the agent"))],
     read: () => ({ provider: prov.value, model: prov.value === "anthropic" ? modelSel.value : modelTxt.value.trim(), upstream: up.value.trim(), rate: +rate.value }),
   };

@@ -139,6 +139,7 @@ function vtBuildSection() {
   VT.newKeep = h("input", { type: "checkbox" });
   VT.newInteractive = h("input", { type: "checkbox" });
   VT.newPlanFirst = h("input", { type: "checkbox" });
+  VT.newCap = h("input", { type: "number", min: 5, max: 200, step: 1, value: "40", style: "width:5em" });
   VT.newBudget = h("input", { type: "number", min: 0.01, max: 20, step: 0.01, value: "0.50", style: "width:6em" });
   VT.newTeam = h("textarea", { rows: 3, placeholder: "alpha | h1,r1 | 1 | network admin: builds the routing\nbeta | h2 | 2 | web server: serves the feed" });
   VT.newDomains = h("textarea", { rows: 2, placeholder: "e.g. docs.example.org (one per line, for a niche tool)" });
@@ -149,7 +150,7 @@ function vtBuildSection() {
     if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
     const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked, intents: VT.newIntents.value,
                    plan_first: VT.newPlanFirst.checked, extra_domains: VT.newDomains.value,
-                   budget_usd: VT.newBudget.value };
+                   budget_usd: VT.newBudget.value, command_cap: VT.newCap.value };
     if (VT.fileOn.checked) {
       if (!VT.labfile) { VT.newMsg.textContent = "Choose a lab file first."; return; }
       body.labfile = VT.labfile;
@@ -219,7 +220,8 @@ function vtBuildSection() {
       vtGroup("5. Internet", "The lab's VMs reach documentation and package sites for their roles, through a proxy that checks each hostname. Add a site here if a niche tool needs one.",
         VT.newDomains),
       vtGroup("6. Budget per paid agent", "Each cloud agent gets this many dollars of model calls in the lab. The model decides how many commands that buys: a bigger model buys fewer. Local agents aren't budgeted. Set a spend limit with your provider as well: this is a guard against runaway loops, not a hard cap.",
-        h("label", { class: "row" }, "$", VT.newBudget)),
+        h("label", { class: "row" }, "$", VT.newBudget),
+        h("label", { class: "row" }, "At most", VT.newCap, "commands per turn (stops one turn running away, whatever the budget left)")),
       vtGroup("7. Keep the VMs?", null,
         h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection")),
       VT.newMsg, h("div", { class: "row" }, create)),

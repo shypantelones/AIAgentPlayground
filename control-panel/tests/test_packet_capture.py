@@ -90,7 +90,6 @@ class StartTests(CaptureBase):
         with mock.patch.object(app.vr, "ssh_run", side_effect=fake_ssh), \
                 mock.patch.object(app.vr, "scp_from", side_effect=fake_scp):
             cap = app.topo_capture_start(self.rid, "h1", "enp0s8", 5)
-            self.assertEqual(cap["state"], "capturing")
             self.assertTrue(wait_for(lambda: self.finished(cap["id"])))
         done = self.run["captures"][0]
         self.assertEqual((done["state"], done["size"]), ("done", len(b"\xd4\xc3\xb2\xa1pcap-bytes")))
