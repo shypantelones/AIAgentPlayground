@@ -588,6 +588,24 @@ def scp_to(port, key_path, local_path, remote_path, timeout=60):
                 "-r", str(local_path), f"bench@127.0.0.1:{remote_path}"], timeout=timeout)
 
 
+def scp_from(port, key_path, remote_path, local_path, timeout=60):
+    return _run(["scp", "-i", str(key_path), "-P", str(port), "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=NUL" if sys.platform.startswith("win") else "/dev/null",
+                f"bench@127.0.0.1:{remote_path}", str(local_path)], timeout=timeout)
+
+
+CAPTURE_MAX_PACKETS = 20000
+
+
+def capture_command(iface, seconds, remote_file):
+    """The shell that captures `iface` for `seconds` into `remote_file` on a node. tcpdump gets SIGINT from timeout so
+    it flushes the file; the file is then made readable for scp, and the caller copies it out. The caller checks the
+    interface exists first (see the capture code in app.py), so `iface` here is already a safe name."""
+    return (f"sudo -n rm -f {remote_file}; "
+            f"sudo -n timeout -s INT {int(seconds)} tcpdump -i {iface} -nn -s 0 -c {CAPTURE_MAX_PACKETS} "
+            f"-w {remote_file} >/dev/null 2>&1; sudo -n chmod 644 {remote_file} 2>/dev/null; test -s {remote_file}")
+
+
 # ---------------------------------------------------------------- task catalog
 TASK_FILE = Path(__file__).resolve().parent / "vm_tasks.json"
 TASK_ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")

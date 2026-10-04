@@ -1501,6 +1501,8 @@ def topo_run_view(r, full=False):
     v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
     if full:
         v["diagram"] = topo_run_diagram(r)
+    v["captures"] = [{k: c.get(k) for k in ("id", "node", "iface", "seconds", "state", "size", "reason", "ts")}
+                     for c in r.get("captures") or []]
     v["intents"] = [i["text"] for i in r.get("intents") or []]
     v["intent_results"] = r.get("intent_results")
     v["from_labfile"] = (r.get("labfile") or {}).get("title")
@@ -1883,6 +1885,88 @@ def intent_feedback(failing):
     return ("These intents still fail, checked from the source node just now:\n"
             + "\n".join(f"- {x['text']}: {x['detail']}" for x in failing)
             + "\nFix them, then say what you changed.")
+
+
+# ---------------------------------------------------------------- packet captures
+# tcpdump on one node's interface for a set time; the .pcap is kept with the lab's record (outliving its VMs, like
+# snapshots) and downloaded for Wireshark. One capture per node at a time. Read-only, so an agent can keep working.
+CAPTURE_MAX_S = 120
+CAPTURE_IFACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,14}$")
+CAPTURE_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def topo_captures_dir(rid):
+    return TOPOR_DIR / f"{rid}.captures"
+
+
+def topo_capture_start(rid, node, iface, seconds):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if node not in r["nodes"]:
+        raise KeyError(f"no node called '{node}' in this lab")
+    if r["state"] not in ("ready", "working", "attached", "done"):
+        raise ValueError("the lab's VMs aren't running")
+    if not CAPTURE_IFACE_RE.match(iface or ""):
+        raise ValueError("the interface name looks wrong (e.g. enp0s8)")
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        raise ValueError("seconds has to be a whole number")
+    if not 1 <= seconds <= CAPTURE_MAX_S:
+        raise ValueError(f"capture for 1 to {CAPTURE_MAX_S} seconds")
+    if any(c["node"] == node and c["state"] == "capturing" for c in r.get("captures") or []):
+        raise ValueError(f"{node} is already capturing")
+    priv = topo_run_dir(rid) / "id_ed25519"
+    if not priv.exists():
+        raise ValueError("this run's lab is gone")
+    cap = {"id": uuid.uuid4().hex[:8], "node": node, "iface": iface, "seconds": seconds, "state": "capturing",
+           "ts": time.time(), "size": None, "reason": ""}
+    r.setdefault("captures", []).append(cap)
+    save_topo_run(r)
+    port = r["nodes"][node]["ssh_port"]
+    remote = f"/tmp/capture-{cap['id']}.pcap"
+    local = topo_captures_dir(rid) / f"{cap['id']}.pcap"
+
+    def job(log):
+        log(f"capturing {iface} on {node} for {seconds}s...")
+        try:
+            rc, out, err = vr.ssh_run(port, priv, f"ip -o link show dev {iface} >/dev/null", timeout=20)
+            if rc == 255:
+                raise ValueError(f"could not reach {node} over SSH")
+            if rc != 0:
+                raise ValueError(f"{node} has no interface {iface}")
+            rc, out, err = vr.ssh_run(port, priv, vr.capture_command(iface, seconds, remote), timeout=seconds + 60)
+            if rc != 0:
+                raise ValueError(f"no packets were captured (is the link up? {(err or out).strip()[-200:]})")
+            local.parent.mkdir(parents=True, exist_ok=True)
+            rc, out, err = vr.scp_from(port, priv, remote, local, timeout=120)
+            if rc != 0:
+                raise ValueError(f"could not copy the capture off {node}: {err.strip()[-200:]}")
+            cap.update(state="done", size=local.stat().st_size, reason="")
+            log(f"capture ready: {local.stat().st_size} bytes")
+        except Exception as e:  # noqa - a failed capture is recorded on the run, never silently dropped
+            cap.update(state="failed", reason=str(e))
+            log(f"capture failed: {e}")
+        finally:
+            vr.ssh_run(port, priv, f"sudo -n rm -f {remote}", timeout=20)
+            save_topo_run(r)
+        return {k: cap[k] for k in ("id", "node", "state", "size", "reason")}
+    start_job(f"Capture {node} in {rid}", job)
+    return cap
+
+
+def topo_capture_file(rid, cid):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if not CAPTURE_ID_RE.match(cid or ""):
+        raise KeyError("no such capture")
+    cap = next((c for c in r.get("captures") or [] if c["id"] == cid and c["state"] == "done"), None)
+    if not cap:
+        raise KeyError("no such capture")
+    data = (topo_captures_dir(rid) / f"{cid}.pcap").read_bytes()
+    return f"lab-{rid}-{cap['node']}-{cid}.pcap", data
 
 
 # ---------------------------------------------------------------- config snapshots
@@ -2362,6 +2446,7 @@ def delete_topo_run(rid):
         shutil.rmtree(d, ignore_errors=True)
     TOPO_RUNS.pop(rid, None)
     shutil.rmtree(topo_snap_dir(rid), ignore_errors=True)
+    shutil.rmtree(topo_captures_dir(rid), ignore_errors=True)
     try:
         topo_run_path(rid).unlink()
     except FileNotFoundError:
@@ -3027,6 +3112,10 @@ class Handler(BaseHTTPRequestHandler):
                     and parts[4] == "labfile":                        # .../labfile: from the newest snapshot
                 name, data = labfile_for_lab(parts[3])
                 return self.send_download(name, data, "application/json")
+            if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 6 and TOPO_RUN_ID_RE.match(parts[3]) \
+                    and parts[4] == "captures":                        # .../captures/<id>: the .pcap for Wireshark
+                name, data = topo_capture_file(parts[3], parts[5])
+                return self.send_download(name, data, "application/vnd.tcpdump.pcap")
             if (parts[:3] == ["api", "vmtopo", "runs"] and len(parts) >= 5 and TOPO_RUN_ID_RE.match(parts[3])
                     and parts[4] == "snapshots"):
                 rid = parts[3]
@@ -3165,6 +3254,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[6] == "terminal-stop":
                     stop_topo_terminal(parts[3], node)
                     return self.send_json({"ok": True})
+                if parts[6] == "capture":
+                    return self.send_json(topo_capture_start(parts[3], node, b.get("iface"), b.get("seconds")))
             if parts[:2] == ["api", "peers"]:
                 if parts == ["api", "peers", "links"]:
                     link = create_link(b)
