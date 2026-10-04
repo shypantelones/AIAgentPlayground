@@ -278,3 +278,86 @@ ephemeral builder run, see the separate
 real catalog entry (with a real `check` script) to
 `vm_topologies.json`/`vm_topology_tasks.json` by hand, which then shows up
 in the UI exactly like a built-in template.
+
+## Network workbench features (implemented)
+
+Everything below lives on the topology side (`TOPO_RUNS`, `/api/vmtopo`,
+`static/vmtopo.js`) and is listed in the user-facing README under "Network
+workbench". The design choices that aren't obvious from the code are noted
+here.
+
+**Modules.** Pure logic is kept out of `app.py` so it's testable without
+mocks: `lab_intents.py` (parse and check intents), `lab_changes.py` (parse
+the agent's session log into per-command entries). `app.py` wires them to
+SSH, Vagrant and the lab record. `vm_runner.py` has `capture_command`,
+`scp_from` (VM to host; `scp_to` is the other way), and `vmrun_script(...,
+node=)`.
+
+**Run record fields** (on top of the topology fields above):
+- `intents`: parsed dicts, from the form or a lab file. `intent_results`:
+  last check's `[{text, passed, detail}]`.
+- `captures`: `[{id, node, iface, seconds, state, size, reason, ts}]`. Files
+  live in `TOPOR_DIR/<rid>.captures/<cid>.pcap`, deleted with the lab.
+- `changes`: one entry per agent turn, `{turn, point, rolled_back, commands,
+  command_count}`. `point` is the snapshot name, or None if not every node
+  snapshotted.
+- `change_seq`: the lab's own turn counter. Use it for snapshot names, not
+  `agent_turns`: attach resets `agent_turns` to 0, so names would collide.
+- `restoring`: true during a rollback. Attach and another rollback are refused.
+- `plan_first`, `plan`, `plan_approved`, and `pending_opening` (transient: the
+  approval message, consumed by the next `topo_agent_phase`).
+
+**Routes** (all under `/api/vmtopo/runs/<id>`): `POST .../intents` (check
+now), `POST .../nodes/<node>/capture` `{iface, seconds}`, `GET
+.../captures/<cid>` (the .pcap), `POST .../rollback` `{turn}`, `POST
+.../approve-plan` `{interactive}`. Each runs as a `start_job` job except the
+capture POST, which returns the capture record while its job runs.
+
+**Intents** (`lab_intents.py`). Grammar: `src -> dst icmp|tcp/<port>
+reach|block` and `src -> dst path via n1, n2`. `run_intent_checks(intents,
+nodes, run_on)` takes an injected `run_on(node, cmd, timeout)`, so tests use a
+fake. The app's `intent_run_on` turns SSH status 255 into `OSError`, so an
+unreachable node fails its intents with a reason, not a failed probe (a
+failed probe is a non-zero rc from the command itself). Path checks run
+`traceroute -n` and require the via nodes' addresses in order, ending at the
+destination; hosts and routers have `traceroute` from the provision script. A
+block passes on any probe failure, so a firewall drop and a refusal both
+count. UDP is refused at parse time: a closed and a filtered UDP port look the
+same to a probe, so a result would be unreliable.
+
+**Change log and rollback** (`lab_changes.py`, `topo_agent_turn`,
+`topo_rollback`). `vmrun_script` writes `=== <ts> <node> $ <cmd>`. The
+`=== ` prefix is what `count_vm_commands` greps, so keep it. A turn reads
+the session log before and after, and `new_entries` gives its commands.
+Rollback runs `vagrant snapshot restore --no-provision <node> <point>` for
+each node, then `vagrant up --no-provision`, then `ssh_wait` on each node. A
+failed restore marks nothing rolled back and sets `reason`. The lab may be
+half-restored after a failure, and the reason says so.
+
+**Packet captures** (`topo_capture_start`, `vr.capture_command`). `timeout -s
+INT N tcpdump ... -c 20000` so tcpdump flushes on stop, then `chmod 644` and
+`test -s` (a header-only file counts as a capture; an empty one fails).
+Interface names are checked against a regex before anything runs. The
+interface must exist (`ip -o link show dev`).
+
+**Plan first** (`write_plan`, `topo_approve_plan`). The first turn runs with
+nothing attached: no key copied into the agent, no relay, no vmrun wrapper.
+`topo_agent_phase` returns `PLAN_WAITING`, and `topo_run_runner` returns
+*without* `finish()`, so `finished` stays False and the `finally` block
+doesn't tear the lab down. Approval sets `plan_approved` and calls
+`attach_agent_to_lab` with `pending_opening`. A failed attach reverts the
+approval. `attach_agent_to_lab` refuses a plan-first lab until it's approved.
+
+**Testing notes:**
+- `tests/test_lab_intents.py`, `test_packet_capture.py`, `test_change_log.py`,
+  `test_plan_first.py`. The change-log tests run the real wrapper through
+  `sh` with a fake `ssh` on PATH (skipped on Windows).
+- Don't depend on local state. `test_plan_first` once passed only on a
+  machine with an agent named `alpha`: it runs `env_file`, which calls
+  `load_meta`. Mock `env_file` and `proj` when a test reaches
+  `topo_agent_phase`.
+- Mocked tests can't catch wrong `vagrant snapshot` / `restore` / `up`
+  arguments, or a wrong `tcpdump` invocation. Do a real boot before calling
+  rollback, captures or plan-first done.
+- The static JS (`vmtopo.js`) isn't syntax-checked by CI (CI runs Python
+  only). Load a lab's view in a browser after UI changes.

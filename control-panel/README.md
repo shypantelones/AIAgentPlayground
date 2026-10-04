@@ -110,6 +110,44 @@ switch (a real Linux bridge, not a simulated device), a firewall (`nftables`, no
 - Every node gets its own web terminal (same on-demand, credentialed-per-session pattern as the single-VM
   benchmarks); the live build-out (which VM, which phase) streams into the run's transcript as it happens.
 
+### Network workbench
+Topology labs are built to be worked in and kept, not only run once. From a lab's view:
+
+- **Interactive sessions.** With *interactive session* ticked, the agent keeps its access to every node after
+  each reply, and you can send it more guidance until you press **End session** (or Stop, or 2 hours pass with no
+  new message). A lab can also take its own prompt instead of a task.
+- **Intents.** Say what the lab must and must not do, one per line, in the new-lab form:
+  `h1 -> h2 icmp reach`, `h2 -> web1 tcp/22 block`, `h1 -> 10.2.0.10 path via r1, r2`. Each check runs over SSH from
+  its source node, so it sees what that node sees. Names are checked against the lab's nodes when you create it.
+  Agents get the intents in their prompt, and failures go back to an interactive agent once, in the same
+  conversation. **Check intents** runs them on demand, with or without an agent. A lab with intents and no task
+  check is scored by them. UDP intents aren't supported yet, and a destination has to be one node or one address.
+- **Plan first.** Tick *plan first* (needs an agent) and the agent writes its plan with **no access to the nodes**:
+  the commands it intends to run per node, why, and how it'll check. Nothing runs until you press **Approve plan
+  and apply** on the lab's page.
+- **Change log and rollback.** Each agent turn starts with a VirtualBox snapshot of every node. The lab's view lists
+  the commands each turn ran, per node, with their output. **Roll back to before turn N** restores every node to
+  that snapshot and marks turn N and later as rolled back. Rolling back needs the lab ready with no agent in it. The
+  agent's conversation still remembers the rolled-back turns. Each turn adds a snapshot per node, which uses disk
+  (VirtualBox live snapshots save memory too), so check the space on long sessions.
+- **Packet captures.** Pick a node, an interface and up to 2 minutes; tcpdump records it, and the `.pcap` downloads
+  for Wireshark. One capture per node at a time. Captures stay with the lab's record, so they outlive its VMs.
+- **Config snapshots.** Each node's addresses, routes, forwarding, bridges and VLANs, nftables and iptables rules,
+  netplan, and FRR and nginx configs. Taken on demand and after every agent turn; diff any two, or download as a zip.
+- **Save and resume.** Save shuts a lab's VMs down with their state kept, so the lab holds no VM slots. Resume brings
+  them back exactly as they were, including addresses and rules you set.
+- **Lab files.** Export a lab as a JSON file (topology, configs from a snapshot, and intents), then build a new lab
+  from one. The new lab's configs are applied at boot and checked against the file.
+- **Routing and switching.** Routers run FRR, so OSPF and BGP are configured through `vtysh`. Switches can run VLANs
+  (access and trunk ports). A **service** role runs dnsmasq as a DHCP and DNS server, and an **upstream** role stands
+  in for the internet at the edge of a lab.
+- **Topology diagram.** A lab's nodes and links are drawn with their interface names and addresses from the latest
+  snapshot.
+- **Lab from a diagram.** Upload an image, a draw.io file, Mermaid or a text description, and an agent drafts a lab
+  file from it. You check the draft, revise it, then build it. (The agent step hasn't yet been run against a live
+  agent; the drafting, checking and building around it have.)
+- **Attach an agent to a lab that already exists**, and benchmark several agents on the same topology task.
+
 ## Data
 `data/instances/<name>/` holds each agent's `.env` (dashboard token), proxy allowlist and chat history.
 Agent memory/workspace live in Docker volumes and are removed by "Delete agent".

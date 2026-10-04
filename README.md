@@ -28,6 +28,11 @@ firewalls, wired together and left unconfigured so an agent or a person has to a
 [control-panel/README.md](control-panel/README.md#vm-labs) for the full writeup, including the built-in topology
 templates, the custom-topology builder, and how to add your own template.
 
+Topology labs can also be worked in and kept: an agent or a person can check a lab against **intents** (reach, block
+and path checks run from each node), write a **plan** that waits for approval before it touches anything, roll the
+lab back to any earlier turn, record **packet captures** for Wireshark, save and resume, and export the lab as a
+file. These are in the [Network workbench](control-panel/README.md#network-workbench) section.
+
 ## Layout
 ```
 aiagentplayground/
