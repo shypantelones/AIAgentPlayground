@@ -844,6 +844,7 @@ def store_token(name, token):
 #     click "Open terminal", published to 127.0.0.1 only, with a fresh random credential each time.
 import vm_runner as vr  # noqa: E402  (Vagrant/VirtualBox lifecycle; pure logic is testable without Docker/VirtualBox)
 import lab_intents as li  # noqa: E402  (intent lines -> checks run from each source node; pure logic, tested alone)
+import lab_changes as lc  # noqa: E402  (a lab's change log: the agent's commands per node and turn; pure logic)
 
 VMR_DIR = ROOT / "data" / "vm-runs"
 VMR_DIR.mkdir(parents=True, exist_ok=True)
@@ -1503,6 +1504,8 @@ def topo_run_view(r, full=False):
         v["diagram"] = topo_run_diagram(r)
     v["captures"] = [{k: c.get(k) for k in ("id", "node", "iface", "seconds", "state", "size", "reason", "ts")}
                      for c in r.get("captures") or []]
+    v["changes"] = r.get("changes") or []
+    v["restoring"] = bool(r.get("restoring"))
     v["intents"] = [i["text"] for i in r.get("intents") or []]
     v["intent_results"] = r.get("intent_results")
     v["from_labfile"] = (r.get("labfile") or {}).get("title")
@@ -1786,7 +1789,7 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     for name in r["nodes"]:
         relay_port = vr.relay_port_for_node(topology, name)
         wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", relay_port,
-                                  "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log")
+                                  "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log", node=name)
         dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
            f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
            input=wrapper, timeout=20)
@@ -2153,10 +2156,97 @@ def detach_topo_agent(agent):
         pass
 
 
+TOPO_CHANGE_LOG = "vm-session-topo.log"
+
+
+def read_agent_log(agent, log_name):
+    """The whole session log as text, or None if it can't be read."""
+    rc, out, _ = dc(agent, "exec", "-T", "gateway", "sh", "-c",
+                    f"cat /home/node/.openclaw/workspace/{log_name} 2>/dev/null || true", timeout=30)
+    return out if rc == 0 else None
+
+
+def snapshot_lab_vms(r, label):
+    """A VirtualBox snapshot of every node, so the lab can be rolled back to this point. True only if all of them
+    were taken; a partial set can't roll the lab back as a whole, so it's recorded as not usable."""
+    d = topo_run_dir(r["id"])
+    for name in r["nodes"]:
+        rc, out, err = vr.vagrant(d, "snapshot", "save", name, label, timeout=900)
+        if rc != 0:
+            topo_log(r, f"rollback point '{label}' not taken for {name}: {(err or out).strip()[-200:]}")
+            return False
+    return True
+
+
+def topo_rollback(rid, turn):
+    """Put every node back to how it was before agent turn `turn` (VirtualBox snapshots taken at the turn's start).
+    Later turns are marked rolled back. The agent's conversation still remembers them: attach it again to go on."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] != "ready" or r.get("restoring") or (r.get("agent") and agent_holds_lab(r, r["agent"])):
+        raise ValueError("roll back only a lab that's ready, with no agent in it")
+    try:
+        turn = int(turn)
+    except (TypeError, ValueError):
+        raise ValueError("turn has to be a turn number")
+    ch = next((c for c in r.get("changes") or [] if c["turn"] == turn), None)
+    if not ch:
+        raise ValueError(f"this lab has no turn {turn}")
+    if not ch.get("point"):
+        raise ValueError(f"no rollback point was taken before turn {turn}")
+    if ch.get("rolled_back"):
+        raise ValueError(f"turn {turn} is already rolled back")
+    d = topo_run_dir(rid)
+    if not (d / "Vagrantfile").exists():
+        raise ValueError("this lab's VMs are gone")
+    r["restoring"] = True
+    save_topo_run(r)
+
+    def job(log):
+        log(f"rolling back to before turn {turn}...")
+        try:
+            for name in r["nodes"]:
+                rc, out, err = vr.vagrant(d, "snapshot", "restore", "--no-provision", name, ch["point"], timeout=900)
+                if rc != 0:
+                    raise ValueError(f"could not restore {name}: {(err or out).strip()[-200:]}")
+            rc, out, err = vr.vagrant(d, "up", "--no-provision", timeout=900)
+            if rc != 0:
+                raise ValueError(f"could not bring the lab back up: {(err or out).strip()[-200:]}")
+            for name, node in r["nodes"].items():
+                if not vr.ssh_wait(node["ssh_port"], d / "id_ed25519", tries=30, delay=2):
+                    raise ValueError(f"{name} doesn't answer SSH after the rollback")
+            for c in r["changes"]:
+                if c["turn"] >= turn:
+                    c["rolled_back"] = True
+            log("rolled back.")
+            try:
+                snap = take_topo_snapshot(r, f"rolled back to before turn {turn}")
+                log(f"config snapshot {snap['id']} taken")
+            except Exception as e:  # noqa - a snapshot is a convenience, not part of the rollback
+                log(f"config snapshot skipped: {e}")
+        except Exception as e:  # noqa - the lab may be half-restored: say so, don't mark anything rolled back
+            log(f"rollback failed: {e}")
+            r["reason"] = f"rollback to turn {turn} failed: {e}"
+        finally:
+            r["restoring"] = False
+            save_topo_run(r)
+    return start_job(f"Roll back {rid} to turn {turn}", job)
+
+
 def topo_agent_turn(r, message):
     t0 = time.time()
-    res = counted_agent_turn(r, message, "vm-session-topo.log", lambda: run_turn(
+    n = (r.get("agent_turns") or 0) + 1                  # this turn's number, as counted_agent_turn will record it
+    point = f"before-turn-{n}"
+    usable = snapshot_lab_vms(r, point)                  # rollback point: the lab as this turn found it
+    before = read_agent_log(r["agent"], TOPO_CHANGE_LOG)
+    res = counted_agent_turn(r, message, TOPO_CHANGE_LOG, lambda: run_turn(
         r["agent"], r["chat"], message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200))
+    after = read_agent_log(r["agent"], TOPO_CHANGE_LOG)
+    commands = lc.new_entries(before, after) if before is not None and after is not None else []   # unknown: none listed
+    r.setdefault("changes", []).append({"turn": n, "point": point if usable else None, "rolled_back": False,
+                                        "commands": commands[:lc.MAX_PER_TURN], "command_count": len(commands)})
+    save_topo_run(r)
     topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
     try:                                    # what this turn left configured on the nodes, for review and diffs
         snap = take_topo_snapshot(r, f"after {r['agent']}'s turn {r.get('agent_turns', '?')}")
@@ -2370,7 +2460,7 @@ def attach_agent_to_lab(rid, form):
     r = TOPO_RUNS.get(rid)
     if not r:
         raise KeyError("unknown run")
-    if r["state"] != "ready" or (r.get("agent") and agent_holds_lab(r, r["agent"])):
+    if r["state"] != "ready" or r.get("restoring") or (r.get("agent") and agent_holds_lab(r, r["agent"])):
         raise ValueError("an agent can only be attached to a lab that's ready, with no agent at work in it")
     d = topo_run_dir(rid)
     if not (d / "Vagrantfile").exists() or not (d / "id_ed25519").exists():
@@ -3229,6 +3319,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"job": topo_score_now(parts[3])})
                 if parts[4] == "intents":
                     return self.send_json({"job": topo_intents_now(parts[3])})
+                if parts[4] == "rollback":
+                    return self.send_json({"job": topo_rollback(parts[3], b.get("turn"))})
                 if parts[4] == "message":
                     return self.send_json(send_topo_followup(parts[3], b.get("text")))
                 if parts[4] == "save":
