@@ -620,7 +620,9 @@ class AttachAgentTests(VmTopoBase):
         app.attach_agent_to_lab(rid, dict({"agent": "alpha", "custom_prompt": "Address h1 and h2."}, **form))
 
     def back_to_ready(self, rid):
-        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid].get("agent_done") and app.TOPO_RUNS[rid]["state"] == "ready"))
+        # 20s, not the default 8s: on Windows (tests run over a slow \\wsl$ path there) every save_topo_run is slow,
+        # and this failed once on a run that took 41s instead of the usual 26s
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid].get("agent_done") and app.TOPO_RUNS[rid]["state"] == "ready", 20))
         for t in set(threading.enumerate()) - self._threads_before:
             t.join(timeout=8)
 
