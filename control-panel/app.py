@@ -1788,8 +1788,9 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         "vlan_filtering 1) and set each port with `bridge vlan` (an access port: bridge vlan add dev <port> vid <id> pvid "
         "untagged, then bridge vlan del dev <port> vid 1; a trunk: bridge vlan add dev <port> vid <id> for each VLAN)."
         + ("\n\nServer nodes have dnsmasq (DHCP and DNS) installed but not configured or running: put your settings in "
-           "a new file in /etc/dnsmasq.d/ (a defaults file there already keeps it off the setup interface), then "
-           "`systemctl enable --now dnsmasq`. Hosts can get an address with `dhclient <interface>`."
+           "a new file in /etc/dnsmasq.d/ (a defaults file there already keeps it off the setup interface and stops it "
+           "serving /etc/hosts, so define names with address= or host-record=), then `systemctl enable --now dnsmasq`. "
+           "Hosts can get an address with `dhclient <interface>`."
            if any(n["role"] == "server" for n in r["nodes"].values()) else "")
         + (f"\n\nUpstream nodes stand in for the internet: their first lab interface is already {vr.UPSTREAM_ADDR} "
            f"and they serve http://{vr.UPSTREAM_WEB}/. They have no route to your networks, so reaching them from "

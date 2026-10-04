@@ -862,6 +862,9 @@ cat > /etc/dnsmasq.d/00-lab-defaults.conf <<'CONF'
 bind-interfaces
 except-interface=lo
 except-interface=enp0s3
+# This node's /etc/hosts maps its own name to a loopback address (127.0.2.1); served over DNS (e.g. with
+# expand-hosts) that would answer srv1.lab with 127.0.2.1. Define lab names with address= or host-record= instead.
+no-hosts
 CONF
 apt-get install -y dnsmasq
 systemctl disable --now dnsmasq

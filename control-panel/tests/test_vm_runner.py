@@ -427,6 +427,9 @@ class ServiceNodeTests(unittest.TestCase):
                         "the defaults must exist before dnsmasq first starts")
         self.assertIn("except-interface=lo", p)
         self.assertIn("bind-interfaces", p)
+        # regression (found live): /etc/hosts maps the node's own name to 127.0.2.1, so with expand-hosts srv1.lab
+        # resolved to loopback instead of the lab address and the DHCP/DNS task could never pass
+        self.assertLess(p.index("no-hosts"), p.index("apt-get install -y dnsmasq"))
         self.assertIn("systemctl disable --now dnsmasq", p)
         self.sh_ok(p)
 
