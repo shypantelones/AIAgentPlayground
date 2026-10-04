@@ -64,12 +64,15 @@ class GuardTests(unittest.TestCase):
         try:
             priv = tmp / "id_ed25519"; priv.write_text("key")
             (tmp / "topo-runs").mkdir()
+            (tmp / "topo-runs").mkdir()
             topo = vr.get_topology("s1h2")
             m = {"agent": "beta", "nodes": ["h2"], "stage": 1, "brief": "x", "role": "web-admin", "chat": "c"}
             r = {"id": "rl", "nodes": {"h2": {"role": "host"}, "h1": {"role": "host"}, "sw1": {"role": "switch"}},
                  "custom_prompt": "go", "egress": {}, "intents": []}
             wrappers = []
-            with mock.patch.object(app, "dc", side_effect=lambda *a, **k: wrappers.append(k.get("input")) or (0, "", "")), \
+            with mock.patch.object(app, "TOPOR_DIR", tmp / "topo-runs"), \
+                    mock.patch.object(app.vr, "ssh_script", return_value=(0, "", "")), \
+                    mock.patch.object(app, "dc", side_effect=lambda *a, **k: wrappers.append(k.get("input")) or (0, "", "")), \
                     mock.patch.object(app, "run", return_value=(0, "", "")), \
                     mock.patch.object(app, "topo_agent_turn", return_value={"ok": True}), \
                     mock.patch.object(app, "detach_topo_agent"), \

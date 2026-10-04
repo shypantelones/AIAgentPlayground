@@ -140,7 +140,9 @@ class MemberRelayTests(unittest.TestCase):
         self.patches = [mock.patch.object(app, "TOPOR_DIR", self.tmp / "topo-runs"),
                         # no real agent is needed: the compose project and env file are only names here
                         mock.patch.object(app, "env_file", return_value=self.tmp / "agent.env"),
-                        mock.patch.object(app, "proj", return_value="proj")]
+                        mock.patch.object(app, "proj", return_value="proj"),
+                        # the member's key goes onto its nodes over ssh: not in these tests
+                        mock.patch.object(app.vr, "ssh_script", return_value=(0, "", ""))]
         for p in self.patches:
             p.start()
 
