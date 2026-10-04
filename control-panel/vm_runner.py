@@ -293,9 +293,13 @@ def ssh_script(port, key_path, script, timeout=60):
 SNAPSHOT_SECTION = "### "
 SNAPSHOT_SCRIPT = r"""
 sec() { echo "### $1"; }
-sec addresses; ip -br addr
-sec links; ip -br link
-sec routes; ip route show; echo "# ipv6"; ip -6 route show
+# The host-only adapter (the lab's link to its internet proxy, see lab_egress) belongs to the lab's infrastructure, not
+# its configuration: it's left out, so a lab file never pins a proxy address from this lab's slot.
+MGMT=$(ip -o -4 addr show | awk '/ 192\.168\.56\./{print $2; exit}')
+nomgmt() { if [ -n "$MGMT" ]; then grep -v -e "^$MGMT " -e "dev $MGMT " -e "192\.168\.56\."; else cat; fi; }
+sec addresses; ip -br addr | nomgmt
+sec links; ip -br link | nomgmt
+sec routes; ip route show | nomgmt; echo "# ipv6"; ip -6 route show
 sec forwarding; sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding 2>/dev/null
 if command -v bridge >/dev/null; then
   sec bridge
@@ -304,14 +308,15 @@ if command -v bridge >/dev/null; then
 fi
 sec "vlan interfaces"
 ip -o -d link show type vlan 2>/dev/null | sed -E 's/^[0-9]+: ([^:]+):.* vlan protocol ([^ ]+) id ([0-9]+).*/\1 \2 \3/'
-if command -v nft >/dev/null; then sec nftables; sudo -n nft list ruleset 2>&1; fi
-if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save 2>&1 | grep -v '^#'; fi
+if command -v nft >/dev/null; then sec nftables; sudo -n nft list ruleset 2>&1 | grep -v "192\.168\.56\."; fi
+if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save 2>&1 | grep -v '^#' | grep -v "192\.168\.56\."; fi
 if command -v vtysh >/dev/null; then
   sec frr; sudo -n vtysh -c 'show running-config' 2>&1 | grep -v -e '^Building configuration' -e '^Current configuration:'
 fi
 sec services
 for s in dnsmasq nginx frr; do systemctl cat "$s" >/dev/null 2>&1 && echo "$s $(systemctl is-active "$s")"; done
 for f in /etc/dnsmasq.conf /etc/dnsmasq.d/*.conf /etc/netplan/*.yaml /etc/frr/frr.conf /etc/frr/daemons /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf          /etc/nginx/sites-enabled/* /etc/nginx/streams-enabled/*; do
+  case "$f" in */50-vagrant.yaml) continue ;; esac     # Vagrant's own netplan: it carries the host-only address
   [ -f "$f" ] && { sec "file $f"; sudo -n cat "$f" 2>&1; }
 done
 true
