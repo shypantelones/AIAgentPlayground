@@ -588,6 +588,24 @@ def scp_to(port, key_path, local_path, remote_path, timeout=60):
                 "-r", str(local_path), f"bench@127.0.0.1:{remote_path}"], timeout=timeout)
 
 
+def scp_from(port, key_path, remote_path, local_path, timeout=60):
+    return _run(["scp", "-i", str(key_path), "-P", str(port), "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=NUL" if sys.platform.startswith("win") else "/dev/null",
+                f"bench@127.0.0.1:{remote_path}", str(local_path)], timeout=timeout)
+
+
+CAPTURE_MAX_PACKETS = 20000
+
+
+def capture_command(iface, seconds, remote_file):
+    """The shell that captures `iface` for `seconds` into `remote_file` on a node. tcpdump gets SIGINT from timeout so
+    it flushes the file; the file is then made readable for scp, and the caller copies it out. The caller checks the
+    interface exists first (see the capture code in app.py), so `iface` here is already a safe name."""
+    return (f"sudo -n rm -f {remote_file}; "
+            f"sudo -n timeout -s INT {int(seconds)} tcpdump -i {iface} -nn -s 0 -c {CAPTURE_MAX_PACKETS} "
+            f"-w {remote_file} >/dev/null 2>&1; sudo -n chmod 644 {remote_file} 2>/dev/null; test -s {remote_file}")
+
+
 # ---------------------------------------------------------------- task catalog
 TASK_FILE = Path(__file__).resolve().parent / "vm_tasks.json"
 TASK_ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
@@ -742,8 +760,10 @@ def vm_name_for_node(rid, name):
     return f"aiagentplayground-vmtopo-{rid}-{name}"
 
 
-def vmrun_script(key_path, port, host, log_path):
+def vmrun_script(key_path, port, host, log_path, node=None):
     """The `vmrun` wrapper put in an agent's workspace: runs commands on a VM through its relay and logs them.
+    With `node`, each log entry names the node too ("=== <time> <node> $ <command>"), so a lab's change log can say
+    which node a command ran on. Without it the entries are "=== <time> $ <command>", as before.
 
     Two ways to call it, because the agent's own shell expands $variables inside double quotes BEFORE the wrapper
     runs. A script passed as `./vmrun "echo $i"` arrives as `echo ` - found when an agent's FizzBuzz printed blank
@@ -754,11 +774,12 @@ def vmrun_script(key_path, port, host, log_path):
     """
     ssh = (f"ssh -i {key_path} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
            f"-o LogLevel=ERROR {host}")
+    label = f"{node} " if node else ""
     return ("#!/bin/sh\n"
             f"LOG={log_path}\n"
             "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
             "if [ $# -gt 0 ]; then\n"
-            "  echo \"=== $ts \\$ $*\" >> \"$LOG\"\n"
+            "  echo \"=== $ts " + label + "\\$ $*\" >> \"$LOG\"\n"
             f"  {ssh} \"$@\" 2>&1 | tee -a \"$LOG\"\n"
             "  exit 0\n"
             "fi\n"
@@ -769,7 +790,7 @@ def vmrun_script(key_path, port, host, log_path):
             "if [ -z \"$script\" ]; then\n"
             "  echo \"usage: $0 'command'   or   $0 <<'EOF' (script lines) EOF\" >&2; exit 2\n"
             "fi\n"
-            "printf '=== %s $ (script on stdin)\\n%s\\n' \"$ts\" \"$script\" >> \"$LOG\"\n"
+            "printf '=== %s " + label + "$ (script on stdin)\\n%s\\n' \"$ts\" \"$script\" >> \"$LOG\"\n"
             f"printf '%s\\n' \"$script\" | {ssh} 'bash -s' 2>&1 | tee -a \"$LOG\"\n")
 
 

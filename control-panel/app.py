@@ -844,6 +844,7 @@ def store_token(name, token):
 #     click "Open terminal", published to 127.0.0.1 only, with a fresh random credential each time.
 import vm_runner as vr  # noqa: E402  (Vagrant/VirtualBox lifecycle; pure logic is testable without Docker/VirtualBox)
 import lab_intents as li  # noqa: E402  (intent lines -> checks run from each source node; pure logic, tested alone)
+import lab_changes as lc  # noqa: E402  (a lab's change log: the agent's commands per node and turn; pure logic)
 
 VMR_DIR = ROOT / "data" / "vm-runs"
 VMR_DIR.mkdir(parents=True, exist_ok=True)
@@ -1501,6 +1502,13 @@ def topo_run_view(r, full=False):
     v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
     if full:
         v["diagram"] = topo_run_diagram(r)
+    v["captures"] = [{k: c.get(k) for k in ("id", "node", "iface", "seconds", "state", "size", "reason", "ts")}
+                     for c in r.get("captures") or []]
+    v["changes"] = r.get("changes") or []
+    v["plan_first"] = bool(r.get("plan_first"))
+    v["plan"] = r.get("plan")
+    v["plan_approved"] = bool(r.get("plan_approved"))
+    v["restoring"] = bool(r.get("restoring"))
     v["intents"] = [i["text"] for i in r.get("intents") or []]
     v["intent_results"] = r.get("intent_results")
     v["from_labfile"] = (r.get("labfile") or {}).get("title")
@@ -1581,6 +1589,9 @@ def create_topo_run(form):
             raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
     elif interactive:
         raise ValueError("attach an agent to start a session")
+    plan_first = bool(form.get("plan_first"))
+    if plan_first and not agent:
+        raise ValueError("a plan needs an agent to write it")
     # Intents are checked by name against this lab's nodes, so a typo fails here instead of as a red X later.
     intents = li.parse_intents(labfile["intents"] if labfile else form.get("intents"),
                                [n["name"] for n in topology["nodes"]])
@@ -1600,7 +1611,8 @@ def create_topo_run(form):
          "chat": f"vmtopo-{rid}" if agent else None,
          "agent_model": agent_model_id(load_meta(agent)) if agent else None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": "",
-         "intents": intents, "intent_results": None}
+         "intents": intents, "intent_results": None,
+         "plan_first": plan_first, "plan": None, "plan_approved": False}
     TOPO_RUNS[rid] = r
     save_topo_run(r)
     threading.Thread(target=topo_run_runner, args=(rid,), daemon=True).start()
@@ -1735,6 +1747,12 @@ def topo_run_runner(rid):
         if stopped():
             return finish("stopped", "stopped before the agent's turn")
         err = topo_agent_phase(r, topology, node_ports, priv, task, stopped)
+        if err == PLAN_WAITING:
+            # The plan is in; the lab stays up (not finished, so nothing is torn down) until you approve or delete it.
+            r.update(state="ready", agent_done=True)
+            save_topo_run(r)
+            topo_log(r, "the plan is ready: approve it to let the agent apply it, or delete the lab.")
+            return
         if err:
             return finish("error", err)
         finish("stopped" if stopped() else "done", r.get("reason", ""))
@@ -1768,11 +1786,60 @@ def topo_run_runner(rid):
         TOPO_STOP.pop(rid, None)
 
 
+PLAN_WAITING = "plan waiting for approval"
+PLAN_OPENING = ("Your plan is approved. Carry it out now, on the nodes, with ./vmrun-<node> as before. Then check "
+                "the result and tell me what you changed.")
+
+
+def write_plan(r, task):
+    """A plan-first lab's first turn: the agent writes its plan without any access to the nodes. Nothing has been
+    attached (no key, no relay, no vmrun commands), so it can't act on the lab until the plan is approved."""
+    node_lines = "\n".join(f"- {name} ({node['role']})" for name, node in r["nodes"].items())
+    goal = task["prompt"] if task else r["custom_prompt"]
+    prompt = (f"{goal}\n\nLab nodes:\n{node_lines}\n\nPlan first. You have no access to the nodes yet, so don't try to "
+              "run anything. Reply with the plan only: for each node, the commands you intend to run and why, and how "
+              "you'll check the result. Nothing is applied until the user approves the plan.")
+    r["state"] = "working"
+    save_topo_run(r)
+    topo_log(r, f"asking {r['agent']} for a plan (no access to the nodes until you approve it)...")
+    res = topo_agent_turn(r, prompt)
+    plan = (res.get("reply") or "").strip()
+    if not res.get("ok") or not plan:
+        return "the agent didn't return a plan (see the transcript)"
+    r["plan"] = plan[-6000:]
+    save_topo_run(r)
+    return PLAN_WAITING
+
+
+def topo_approve_plan(rid, form):
+    """Approve a plan-first lab's plan: the agent is attached (the same way as attach_agent_to_lab) and told to apply
+    it. Its conversation already holds the plan it wrote."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if not r.get("plan_first") or not r.get("plan") or r.get("plan_approved") or r["state"] != "ready":
+        raise ValueError("this lab has no plan waiting for approval")
+    r["plan_approved"] = True
+    r["pending_opening"] = PLAN_OPENING
+    try:
+        attach_agent_to_lab(rid, {"agent": r["agent"], "interactive": form.get("interactive", r.get("interactive")),
+                                  "use_task": bool(r.get("task_id")) and not r.get("custom_prompt"),
+                                  "custom_prompt": r.get("custom_prompt")})
+    except Exception:
+        r["plan_approved"] = False                 # nothing was attached: the plan is still waiting
+        r.pop("pending_opening", None)
+        raise
+    topo_log(r, "plan approved: the agent applies it now.")
+
+
 def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     """Attach r["agent"] to the lab, give it its prompt (the task's, or r["custom_prompt"]), run its turn (and the
     interactive session, if any), detach it, and score the task if it has a check. Shared by a lab created with an
     agent (topo_run_runner) and an agent attached to a lab that already exists (topo_attach_runner).
-    Returns an error message if the agent couldn't be attached, else None."""
+    Returns an error message if the agent couldn't be attached, else None, or PLAN_WAITING for a plan-first lab whose
+    plan is written but not yet approved (then the agent has never had access to the nodes)."""
+    if r.get("plan_first") and not r.get("plan_approved"):
+        return write_plan(r, task)
     r["state"] = "working"
     save_topo_run(r)
     topo_log(r, f"attaching {r['agent']} to this lab...")
@@ -1784,7 +1851,7 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     for name in r["nodes"]:
         relay_port = vr.relay_port_for_node(topology, name)
         wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", relay_port,
-                                  "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log")
+                                  "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log", node=name)
         dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
            f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
            input=wrapper, timeout=20)
@@ -1817,7 +1884,8 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     if r.get("intents"):
         hints.append("Your lab has to meet these intents. They're checked from the source node after each of your "
                      "turns:\n" + li.summary_for_prompt(r["intents"]))
-    prompt = (f"{task['prompt'] if task else r['custom_prompt']}\n\nLab nodes (commands run from your working "
+    opening = r.pop("pending_opening", None) or (task["prompt"] if task else r["custom_prompt"])
+    prompt = (f"{opening}\n\nLab nodes (commands run from your working "
               f"directory):\n{node_lines}\n" + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n"
               + "\n".join(h for h in hints if h))
     topo_agent_turn(r, prompt)
@@ -1883,6 +1951,88 @@ def intent_feedback(failing):
     return ("These intents still fail, checked from the source node just now:\n"
             + "\n".join(f"- {x['text']}: {x['detail']}" for x in failing)
             + "\nFix them, then say what you changed.")
+
+
+# ---------------------------------------------------------------- packet captures
+# tcpdump on one node's interface for a set time; the .pcap is kept with the lab's record (outliving its VMs, like
+# snapshots) and downloaded for Wireshark. One capture per node at a time. Read-only, so an agent can keep working.
+CAPTURE_MAX_S = 120
+CAPTURE_IFACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,14}$")
+CAPTURE_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def topo_captures_dir(rid):
+    return TOPOR_DIR / f"{rid}.captures"
+
+
+def topo_capture_start(rid, node, iface, seconds):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if node not in r["nodes"]:
+        raise KeyError(f"no node called '{node}' in this lab")
+    if r["state"] not in ("ready", "working", "attached", "done"):
+        raise ValueError("the lab's VMs aren't running")
+    if not CAPTURE_IFACE_RE.match(iface or ""):
+        raise ValueError("the interface name looks wrong (e.g. enp0s8)")
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        raise ValueError("seconds has to be a whole number")
+    if not 1 <= seconds <= CAPTURE_MAX_S:
+        raise ValueError(f"capture for 1 to {CAPTURE_MAX_S} seconds")
+    if any(c["node"] == node and c["state"] == "capturing" for c in r.get("captures") or []):
+        raise ValueError(f"{node} is already capturing")
+    priv = topo_run_dir(rid) / "id_ed25519"
+    if not priv.exists():
+        raise ValueError("this run's lab is gone")
+    cap = {"id": uuid.uuid4().hex[:8], "node": node, "iface": iface, "seconds": seconds, "state": "capturing",
+           "ts": time.time(), "size": None, "reason": ""}
+    r.setdefault("captures", []).append(cap)
+    save_topo_run(r)
+    port = r["nodes"][node]["ssh_port"]
+    remote = f"/tmp/capture-{cap['id']}.pcap"
+    local = topo_captures_dir(rid) / f"{cap['id']}.pcap"
+
+    def job(log):
+        log(f"capturing {iface} on {node} for {seconds}s...")
+        try:
+            rc, out, err = vr.ssh_run(port, priv, f"ip -o link show dev {iface} >/dev/null", timeout=20)
+            if rc == 255:
+                raise ValueError(f"could not reach {node} over SSH")
+            if rc != 0:
+                raise ValueError(f"{node} has no interface {iface}")
+            rc, out, err = vr.ssh_run(port, priv, vr.capture_command(iface, seconds, remote), timeout=seconds + 60)
+            if rc != 0:
+                raise ValueError(f"no packets were captured (is the link up? {(err or out).strip()[-200:]})")
+            local.parent.mkdir(parents=True, exist_ok=True)
+            rc, out, err = vr.scp_from(port, priv, remote, local, timeout=120)
+            if rc != 0:
+                raise ValueError(f"could not copy the capture off {node}: {err.strip()[-200:]}")
+            cap.update(state="done", size=local.stat().st_size, reason="")
+            log(f"capture ready: {local.stat().st_size} bytes")
+        except Exception as e:  # noqa - a failed capture is recorded on the run, never silently dropped
+            cap.update(state="failed", reason=str(e))
+            log(f"capture failed: {e}")
+        finally:
+            vr.ssh_run(port, priv, f"sudo -n rm -f {remote}", timeout=20)
+            save_topo_run(r)
+        return {k: cap[k] for k in ("id", "node", "state", "size", "reason")}
+    start_job(f"Capture {node} in {rid}", job)
+    return cap
+
+
+def topo_capture_file(rid, cid):
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if not CAPTURE_ID_RE.match(cid or ""):
+        raise KeyError("no such capture")
+    cap = next((c for c in r.get("captures") or [] if c["id"] == cid and c["state"] == "done"), None)
+    if not cap:
+        raise KeyError("no such capture")
+    data = (topo_captures_dir(rid) / f"{cid}.pcap").read_bytes()
+    return f"lab-{rid}-{cap['node']}-{cid}.pcap", data
 
 
 # ---------------------------------------------------------------- config snapshots
@@ -2069,10 +2219,98 @@ def detach_topo_agent(agent):
         pass
 
 
+TOPO_CHANGE_LOG = "vm-session-topo.log"
+
+
+def read_agent_log(agent, log_name):
+    """The whole session log as text, or None if it can't be read."""
+    rc, out, _ = dc(agent, "exec", "-T", "gateway", "sh", "-c",
+                    f"cat /home/node/.openclaw/workspace/{log_name} 2>/dev/null || true", timeout=30)
+    return out if rc == 0 else None
+
+
+def snapshot_lab_vms(r, label):
+    """A VirtualBox snapshot of every node, so the lab can be rolled back to this point. True only if all of them
+    were taken; a partial set can't roll the lab back as a whole, so it's recorded as not usable."""
+    d = topo_run_dir(r["id"])
+    for name in r["nodes"]:
+        rc, out, err = vr.vagrant(d, "snapshot", "save", name, label, timeout=900)
+        if rc != 0:
+            topo_log(r, f"rollback point '{label}' not taken for {name}: {(err or out).strip()[-200:]}")
+            return False
+    return True
+
+
+def topo_rollback(rid, turn):
+    """Put every node back to how it was before agent turn `turn` (VirtualBox snapshots taken at the turn's start).
+    Later turns are marked rolled back. The agent's conversation still remembers them: attach it again to go on."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] != "ready" or r.get("restoring") or (r.get("agent") and agent_holds_lab(r, r["agent"])):
+        raise ValueError("roll back only a lab that's ready, with no agent in it")
+    try:
+        turn = int(turn)
+    except (TypeError, ValueError):
+        raise ValueError("turn has to be a turn number")
+    ch = next((c for c in r.get("changes") or [] if c["turn"] == turn), None)
+    if not ch:
+        raise ValueError(f"this lab has no turn {turn}")
+    if not ch.get("point"):
+        raise ValueError(f"no rollback point was taken before turn {turn}")
+    if ch.get("rolled_back"):
+        raise ValueError(f"turn {turn} is already rolled back")
+    d = topo_run_dir(rid)
+    if not (d / "Vagrantfile").exists():
+        raise ValueError("this lab's VMs are gone")
+    r["restoring"] = True
+    save_topo_run(r)
+
+    def job(log):
+        log(f"rolling back to before turn {turn}...")
+        try:
+            for name in r["nodes"]:
+                rc, out, err = vr.vagrant(d, "snapshot", "restore", "--no-provision", name, ch["point"], timeout=900)
+                if rc != 0:
+                    raise ValueError(f"could not restore {name}: {(err or out).strip()[-200:]}")
+            rc, out, err = vr.vagrant(d, "up", "--no-provision", timeout=900)
+            if rc != 0:
+                raise ValueError(f"could not bring the lab back up: {(err or out).strip()[-200:]}")
+            for name, node in r["nodes"].items():
+                if not vr.ssh_wait(node["ssh_port"], d / "id_ed25519", tries=30, delay=2):
+                    raise ValueError(f"{name} doesn't answer SSH after the rollback")
+            for c in r["changes"]:
+                if c["turn"] >= turn:
+                    c["rolled_back"] = True
+            log("rolled back.")
+            try:
+                snap = take_topo_snapshot(r, f"rolled back to before turn {turn}")
+                log(f"config snapshot {snap['id']} taken")
+            except Exception as e:  # noqa - a snapshot is a convenience, not part of the rollback
+                log(f"config snapshot skipped: {e}")
+        except Exception as e:  # noqa - the lab may be half-restored: say so, don't mark anything rolled back
+            log(f"rollback failed: {e}")
+            r["reason"] = f"rollback to turn {turn} failed: {e}"
+        finally:
+            r["restoring"] = False
+            save_topo_run(r)
+    return start_job(f"Roll back {rid} to turn {turn}", job)
+
+
 def topo_agent_turn(r, message):
     t0 = time.time()
-    res = counted_agent_turn(r, message, "vm-session-topo.log", lambda: run_turn(
+    # The lab's own turn counter: agent_turns restarts at 0 on every attach, and snapshot names must stay unique.
+    n = r["change_seq"] = (r.get("change_seq") or 0) + 1
+    point = f"before-turn-{n}"
+    usable = snapshot_lab_vms(r, point)                  # rollback point: the lab as this turn found it
+    before = read_agent_log(r["agent"], TOPO_CHANGE_LOG)
+    res = counted_agent_turn(r, message, TOPO_CHANGE_LOG, lambda: run_turn(
         r["agent"], r["chat"], message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200))
+    after = read_agent_log(r["agent"], TOPO_CHANGE_LOG)
+    commands = lc.new_entries(before, after) if before is not None and after is not None else []   # unknown: none listed
+    r.setdefault("changes", []).append({"turn": n, "point": point if usable else None, "rolled_back": False,
+                                        "commands": commands[:lc.MAX_PER_TURN], "command_count": len(commands)})
+    save_topo_run(r)
     topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
     try:                                    # what this turn left configured on the nodes, for review and diffs
         snap = take_topo_snapshot(r, f"after {r['agent']}'s turn {r.get('agent_turns', '?')}")
@@ -2286,8 +2524,10 @@ def attach_agent_to_lab(rid, form):
     r = TOPO_RUNS.get(rid)
     if not r:
         raise KeyError("unknown run")
-    if r["state"] != "ready" or (r.get("agent") and agent_holds_lab(r, r["agent"])):
+    if r["state"] != "ready" or r.get("restoring") or (r.get("agent") and agent_holds_lab(r, r["agent"])):
         raise ValueError("an agent can only be attached to a lab that's ready, with no agent at work in it")
+    if r.get("plan_first") and not r.get("plan_approved"):
+        raise ValueError("approve the lab's plan first: its agent has no access to the nodes until then")
     d = topo_run_dir(rid)
     if not (d / "Vagrantfile").exists() or not (d / "id_ed25519").exists():
         raise ValueError("this lab's VMs are gone")
@@ -2362,6 +2602,7 @@ def delete_topo_run(rid):
         shutil.rmtree(d, ignore_errors=True)
     TOPO_RUNS.pop(rid, None)
     shutil.rmtree(topo_snap_dir(rid), ignore_errors=True)
+    shutil.rmtree(topo_captures_dir(rid), ignore_errors=True)
     try:
         topo_run_path(rid).unlink()
     except FileNotFoundError:
@@ -3254,6 +3495,10 @@ class Handler(BaseHTTPRequestHandler):
                     and parts[4] == "labfile":                        # .../labfile: from the newest snapshot
                 name, data = labfile_for_lab(parts[3])
                 return self.send_download(name, data, "application/json")
+            if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 6 and TOPO_RUN_ID_RE.match(parts[3]) \
+                    and parts[4] == "captures":                        # .../captures/<id>: the .pcap for Wireshark
+                name, data = topo_capture_file(parts[3], parts[5])
+                return self.send_download(name, data, "application/vnd.tcpdump.pcap")
             if (parts[:3] == ["api", "vmtopo", "runs"] and len(parts) >= 5 and TOPO_RUN_ID_RE.match(parts[3])
                     and parts[4] == "snapshots"):
                 rid = parts[3]
@@ -3376,6 +3621,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"job": topo_score_now(parts[3])})
                 if parts[4] == "intents":
                     return self.send_json({"job": topo_intents_now(parts[3])})
+                if parts[4] == "rollback":
+                    return self.send_json({"job": topo_rollback(parts[3], b.get("turn"))})
+                if parts[4] == "approve-plan":
+                    topo_approve_plan(parts[3], b)
+                    return self.send_json({"ok": True})
                 if parts[4] == "message":
                     return self.send_json(send_topo_followup(parts[3], b.get("text")))
                 if parts[4] == "save":
@@ -3401,6 +3651,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[6] == "terminal-stop":
                     stop_topo_terminal(parts[3], node)
                     return self.send_json({"ok": True})
+                if parts[6] == "capture":
+                    return self.send_json(topo_capture_start(parts[3], node, b.get("iface"), b.get("seconds")))
             if parts[:2] == ["api", "peers"]:
                 if parts == ["api", "peers", "links"]:
                     link = create_link(b)
