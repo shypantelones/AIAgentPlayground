@@ -4,7 +4,7 @@
 Runs on the HOST (never inside a sandbox). Binds to 127.0.0.1 only. Every action maps to a fixed,
 validated docker command; there is no free-form shell. Standard library only.
 """
-import difflib, io, ipaddress, json, os, queue, re, secrets, shutil, subprocess, sys, threading, time, urllib.request, uuid, zipfile
+import base64, difflib, io, ipaddress, json, os, queue, re, secrets, shutil, subprocess, sys, threading, time, urllib.request, uuid, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -614,7 +614,7 @@ def model_patch(meta):
     if meta.get("backend") == "cloud":
         prov = PROVIDERS[meta["provider"]]; key = PROVIDER_KEY[meta["provider"]]; m = meta["cloud_model"]
         return ('{ gateway: { mode: "local" }, models: { providers: { %s: { baseUrl: "%s", api: "%s", apiKey: "relay-placeholder", '
-                'models: [ { id: "%s", name: "%s (cloud)", reasoning: false, input: ["text"], contextWindow: 200000, maxTokens: 8192 } ] } } }, '
+                'models: [ { id: "%s", name: "%s (cloud)", reasoning: false, input: ["text", "image"], contextWindow: 200000, maxTokens: 8192 } ] } } }, '
                 'agents: { defaults: { model: { primary: "%s/%s" } } } }' % (key, prov["base"], prov["api"], m, m, key, m))
     m = meta.get("model") or DEFAULT_MODEL
     return ('{ gateway: { mode: "local" }, models: { providers: { ollama: { baseUrl: "http://ollama.internal:11434", api: "ollama", apiKey: "ollama-local", '
@@ -2668,6 +2668,224 @@ def stop_topo_terminal(rid, node, quiet=False):
     save_topo_run(r)
 
 
+
+# ---------------------------------------------------------------- diagram -> lab (an agent reads your diagram)
+# You upload a diagram (an image, a draw.io file, Mermaid or plain text) with notes; an agent writes a compact lab
+# spec (vr.spec_to_labfile), the panel validates it and shows the result; you revise it with the agent or take the
+# lab file into the normal "build from a lab file" form. Nothing is built until you press Create there.
+DRAFTS = {}              # draft id -> record (also persisted to data/lab-drafts/<id>/draft.json)
+DRAFT_DIR = ROOT / "data" / "lab-drafts"
+DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+DRAFT_ID_RE = TOPO_RUN_ID_RE
+DRAFT_IMAGE_MAGIC = {"png": b"\x89PNG", "jpg": b"\xff\xd8\xff", "gif": b"GIF8", "webp": b"RIFF"}
+DRAFT_MAX_IMAGE = 5_000_000
+DRAFT_MAX_TEXT = 60_000
+DRAFT_CONTEXT_MAX = 4000
+DRAFT_SPEC_FILE = "lab-draft.json"
+WORKSPACE = "/home/node/.openclaw/workspace"
+DRAFT_PROMPT = (
+    "Reverse-engineer this network diagram into a lab. {source}\n"
+    "User notes: {context}\n"
+    "Write " + DRAFT_SPEC_FILE + " in your working directory, JSON only:\n"
+    '{{"title":"..","nodes":[{{"name":"r1","role":"router","routes":["10.2.0.0/24 via 10.1.0.2"]}}],'
+    '"links":[{{"a":"r1","b":"sw1","a_ip":"10.1.0.1/24"}}],"notes":[".."]}}\n'
+    "Roles: router switch host firewall loadbalancer server upstream. Names: lowercase, start with a letter, max 15 "
+    "chars. 2-12 nodes, max 7 links per node. Switches take no IPs. IPv4 only; avoid 10.0.2.0/24. upstream is an "
+    "internet stand-in fixed at 198.51.100.1/30. Put what the lab can't hold (VLANs, routing protocols, DHCP, "
+    "firewall rules) in notes.\n{mode}Then reply with a one-line summary.")
+DRAFT_BARE = "Topology only: leave out a_ip, b_ip and routes.\n"
+
+
+def draft_path(did):
+    return DRAFT_DIR / did / "draft.json"
+
+
+def save_draft(d):
+    with TOPO_LOCK:
+        draft_path(d["id"]).parent.mkdir(parents=True, exist_ok=True)
+        tmp = draft_path(d["id"]).with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1))
+        tmp.replace(draft_path(d["id"]))
+
+
+def load_lab_drafts():
+    for f in sorted(DRAFT_DIR.glob("*/draft.json"), key=lambda f: f.stat().st_mtime, reverse=True)[:50]:
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        if d["state"] == "drafting":
+            d.update(state="failed", error="the control panel was restarted while the agent was working; revise to try again")
+            f.write_text(json.dumps(d, indent=1))
+        DRAFTS[d["id"]] = d
+
+
+def draft_view(d, full=False):
+    v = {k: d.get(k) for k in ("id", "state", "agent", "agent_model", "created", "diagram_name", "kind", "configured",
+                               "error", "turns", "title")}
+    if full:
+        v.update({k: d.get(k) for k in ("context", "summary", "diagram", "warnings", "notes")})
+        v["labfile"] = d.get("labfile")
+    return v
+
+
+def decode_diagram(diagram):
+    """The upload -> ("image", ext, bytes) or ("text", name, text). Images are checked by their first bytes."""
+    if not isinstance(diagram, dict):
+        raise ValueError("choose a diagram file")
+    name = re.sub(r"[^A-Za-z0-9._ -]", "_", str(diagram.get("name") or "diagram"))[:80]
+    if diagram.get("text") is not None:
+        text = str(diagram["text"])
+        if not text.strip():
+            raise ValueError("the diagram file is empty")
+        if len(text) > DRAFT_MAX_TEXT:
+            raise ValueError(f"that text diagram is too large (max {DRAFT_MAX_TEXT // 1000} KB)")
+        return "text", name, text
+    try:
+        data = base64.b64decode(str(diagram.get("data") or ""), validate=True)
+    except Exception:
+        raise ValueError("couldn't read the uploaded image")
+    if len(data) > DRAFT_MAX_IMAGE:
+        raise ValueError(f"that image is too large (max {DRAFT_MAX_IMAGE // 1_000_000} MB)")
+    ext = next((e for e, magic in DRAFT_IMAGE_MAGIC.items() if data.startswith(magic) and (e != "webp" or data[8:12] == b"WEBP")), None)
+    if not ext:
+        raise ValueError("images must be PNG, JPEG, GIF or WebP")
+    return "image", ext, data
+
+
+def create_lab_draft(form):
+    agent = (form.get("agent") or "").strip().lower()
+    if not agent:
+        raise ValueError("choose the agent that reads the diagram")
+    meta = load_meta(agent)                                    # raises KeyError if unknown
+    if not agent_running(agent):
+        raise ValueError(f"{agent} is not running; start it first")
+    context = (form.get("context") or "").strip()
+    if not context:
+        raise ValueError("add notes about the diagram: what the boxes are, the addressing, anything it doesn't show")
+    if len(context) > DRAFT_CONTEXT_MAX:
+        raise ValueError(f"the notes are too long (max {DRAFT_CONTEXT_MAX} characters)")
+    kind, ext_or_name, payload = decode_diagram(form.get("diagram"))
+    if kind == "image" and meta.get("backend") != "cloud":
+        raise ValueError("reading an image needs a cloud agent (the local models here read text only); "
+                         "upload a draw.io, Mermaid or text version instead")
+    did = uuid.uuid4().hex[:8]
+    configured = bool(form.get("configured", True))
+    d = {"id": did, "state": "drafting", "agent": agent, "agent_model": agent_model_id(meta), "created": time.time(),
+         "diagram_name": str((form.get("diagram") or {}).get("name") or "diagram")[:80], "kind": kind,
+         "configured": configured, "context": context, "chat": f"labdraft-{did}", "turns": 0, "error": None,
+         "summary": None, "labfile": None, "diagram": None, "warnings": [], "notes": [], "title": None}
+    if kind == "image":
+        source = f"Diagram: ./diagram-{did}.{ext_or_name} (read it)."
+        d["workspace_file"] = f"diagram-{did}.{ext_or_name}"
+    else:
+        summary = vr.drawio_summary(payload)
+        source = "Diagram" + (" (from draw.io)" if summary else "") + f":\n```\n{(summary or payload).strip()}\n```"
+    message = DRAFT_PROMPT.format(source=source, context=context, mode="" if configured else DRAFT_BARE)
+    DRAFTS[did] = d
+    save_draft(d)
+    (DRAFT_DIR / did / "prompt.txt").write_text(message, encoding="utf-8")     # kept to retry a draft that never ran
+    if kind == "image":
+        (DRAFT_DIR / did / d["workspace_file"]).write_bytes(payload)
+    threading.Thread(target=lab_draft_runner, args=(did, message, payload if kind == "image" else None), daemon=True).start()
+    return did
+
+
+def ensure_vision(agent, log=lambda s: None):
+    """Cloud agents created before images were declared get `input: ["text", "image"]` (needs a gateway restart)."""
+    meta = load_meta(agent)
+    key = PROVIDER_KEY[meta["provider"]]
+    rc, out, _ = dc(agent, "exec", "-T", "gateway", "node", "dist/index.js", "config", "get", f"models.providers.{key}.models", timeout=60)
+    if rc == 0 and '"image"' in out:
+        return
+    with CHAT_LOCKS.setdefault(agent, threading.Lock()):        # don't restart the gateway under a running turn
+        log(f"letting {agent}'s model take images (restarting its gateway)...")
+        need(dc(agent, "exec", "-T", "gateway", "node", "dist/index.js", "config", "patch", "--stdin",
+                "--replace-path", f"models.providers.{key}.models", input=model_patch(meta)), "config patch")
+        need(dc(agent, "restart", "gateway"), "gateway restart")
+        wait_gateway(agent, log)
+
+
+def read_draft_spec(agent, reply):
+    """The spec the agent wrote to its workspace, else a JSON object in its reply."""
+    rc, out, _ = dc(agent, "exec", "-T", "gateway", "cat", f"{WORKSPACE}/{DRAFT_SPEC_FILE}", timeout=30)
+    for text in ([out] if rc == 0 and out.strip() else []) + [reply or ""]:
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except ValueError:
+                continue
+    raise ValueError(f"no readable {DRAFT_SPEC_FILE} (write it as JSON in your working directory)")
+
+
+def lab_draft_runner(did, message, image=None):
+    d = DRAFTS[did]
+    agent = d["agent"]
+    try:
+        if image is not None:
+            ensure_vision(agent)
+            need(dc(agent, "exec", "-T", "gateway", "sh", "-c", f"base64 -d > {WORKSPACE}/{d['workspace_file']}",
+                    input=base64.b64encode(image).decode(), timeout=60), "copy the diagram to the agent")
+        dc(agent, "exec", "-T", "gateway", "rm", "-f", f"{WORKSPACE}/{DRAFT_SPEC_FILE}", timeout=20)
+        res = run_turn(agent, d["chat"], message, title=f"Lab from {d['diagram_name']}"[:40])
+        d["summary"] = res["reply"][-2000:]
+        if not res["ok"]:
+            raise RuntimeError(f"the agent didn't answer: {res['reply'][:300]}")
+        d["turns"] += 1
+        spec = read_draft_spec(agent, res["reply"])
+        lf, diagram, warnings = vr.spec_to_labfile(spec, d["configured"], {"diagram": d["diagram_name"], "draft": did,
+                                                                            "drafted_by": d["agent_model"]})
+        d.update(state="ready", error=None, fixable=False, labfile=lf, diagram=diagram, warnings=warnings,
+                 notes=lf["source"]["notes"], title=lf["title"])
+    except ValueError as e:                                     # the agent's answer: Revise sends this back to it
+        d.update(state="failed", error=str(e)[:1000], fixable=True)
+    except Exception as e:  # noqa
+        d.update(state="failed", error=str(e)[:1000], fixable=False)
+    save_draft(d)
+
+
+def revise_lab_draft(did, text):
+    d = DRAFTS.get(did)
+    if not d:
+        raise KeyError("unknown draft")
+    if d["state"] == "drafting":
+        raise ValueError("the agent is still working on this draft")
+    text = (text or "").strip()
+    if len(text) > DRAFT_CONTEXT_MAX:
+        raise ValueError(f"too long (max {DRAFT_CONTEXT_MAX} characters)")
+    if not text and d["state"] != "failed":
+        raise ValueError("say what to change")
+    if not agent_running(d["agent"]):
+        raise ValueError(f"{d['agent']} is not running; start it first")
+    image = None
+    if not d["turns"]:                                          # it never reached the agent: send the first prompt again
+        message = (DRAFT_DIR / did / "prompt.txt").read_text(encoding="utf-8") + (f"\nAlso: {text}" if text else "")
+        if d.get("workspace_file"):
+            image = (DRAFT_DIR / did / d["workspace_file"]).read_bytes()
+    else:
+        problem = f"The panel couldn't use your last answer: {d['error']}\n" if d["state"] == "failed" and d.get("fixable") else ""
+        message = f"{problem}{text + chr(10) if text else ''}Update {DRAFT_SPEC_FILE}, then reply with a one-line summary."
+    d.update(state="drafting", error=None)
+    save_draft(d)
+    threading.Thread(target=lab_draft_runner, args=(did, message, image), daemon=True).start()
+
+
+def delete_lab_draft(did):
+    d = DRAFTS.get(did)
+    if not d:
+        raise KeyError("unknown draft")
+    if d["state"] == "drafting":
+        raise ValueError("the agent is still working on this draft")
+    if d.get("workspace_file"):
+        try:
+            dc(d["agent"], "exec", "-T", "gateway", "rm", "-f", f"{WORKSPACE}/{d['workspace_file']}", timeout=20)
+        except Exception:  # noqa  (the agent may be gone)
+            pass
+    DRAFTS.pop(did, None)
+    shutil.rmtree(DRAFT_DIR / did, ignore_errors=True)
+
 # ---------------------------------------------------------------- isolation self-check
 def verify(name):
     def job(log):
@@ -3213,9 +3431,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def body(self):
+    def body(self, limit=1_000_000):
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 1_000_000:
+        if n > limit:
             raise ValueError("body too large")
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
@@ -3260,10 +3478,19 @@ class Handler(BaseHTTPRequestHandler):
             if parts == ["api", "vmtopo"]:
                 return self.send_json({"topologies": vr.load_topologies(), "tasks": vr.load_topology_tasks(),
                                        "settings": vmb_settings(),
-                                       "runs": [topo_run_view(r) for r in sorted(TOPO_RUNS.values(), key=lambda x: x["created"], reverse=True)[:40]]})
+                                       "runs": [topo_run_view(r) for r in sorted(TOPO_RUNS.values(), key=lambda x: x["created"], reverse=True)[:40]],
+                                       "drafts": [draft_view(d) for d in sorted(DRAFTS.values(), key=lambda x: x["created"], reverse=True)[:20]]})
             if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 4 and TOPO_RUN_ID_RE.match(parts[3]):
                 r = TOPO_RUNS.get(parts[3])
                 return self.send_json(topo_run_view(r, full=True)) if r else self.fail(404, "no such run")
+            if parts[:3] == ["api", "vmtopo", "drafts"] and len(parts) in (4, 5) and DRAFT_ID_RE.match(parts[3]):
+                d = DRAFTS.get(parts[3])
+                if not d:
+                    return self.fail(404, "no such draft")
+                if len(parts) == 4:
+                    return self.send_json(draft_view(d, full=True))
+                if parts[4] == "labfile" and d.get("labfile"):
+                    return self.send_download(f"lab-draft-{d['id']}.json", json.dumps(d["labfile"], indent=1).encode(), "application/json")
             if parts[:3] == ["api", "vmtopo", "runs"] and len(parts) == 5 and TOPO_RUN_ID_RE.match(parts[3]) \
                     and parts[4] == "labfile":                        # .../labfile: from the newest snapshot
                 name, data = labfile_for_lab(parts[3])
@@ -3328,7 +3555,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         parts = [p for p in urlparse(self.path).path.split("/") if p]
         try:
-            b = self.body()
+            b = self.body(8_000_000 if parts == ["api", "vmtopo", "drafts"] else 1_000_000)   # diagrams can be images
             if parts == ["api", "agents"]:
                 return self.send_json({"job": create_agent(str(b.get("name", "")).strip().lower(), b)})
             if parts[:2] == ["api", "shared"] and len(parts) == 3:
@@ -3371,6 +3598,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"ok": True})
             if parts == ["api", "vmtopo", "runs"]:
                 return self.send_json({"run": create_topo_run(b)})
+            if parts == ["api", "vmtopo", "drafts"]:
+                return self.send_json({"draft": create_lab_draft(b)})
+            if parts[:3] == ["api", "vmtopo", "drafts"] and len(parts) == 5 and DRAFT_ID_RE.match(parts[3]):
+                if parts[4] == "revise":
+                    revise_lab_draft(parts[3], b.get("text"))
+                    return self.send_json({"ok": True})
+                if parts[4] == "delete":
+                    delete_lab_draft(parts[3])
+                    return self.send_json({"ok": True})
             if parts == ["api", "vmtopo", "benchmarks"]:
                 bid, ids = create_topo_benchmark(b)
                 return self.send_json({"benchmark": bid, "runs": ids})
@@ -3521,6 +3757,7 @@ def main():
     load_sessions()
     load_vm_runs()
     load_topo_runs()
+    load_lab_drafts()
     srv = ThreadingHTTPServer(("127.0.0.1", PANEL_PORT), Handler)
     print(f"AI Agent control panel: http://127.0.0.1:{PANEL_PORT}  (Ctrl+C to stop)")
     try:

@@ -22,7 +22,7 @@ function vtBuildSection() {
   VT.newTopo = h("select", {}, ...vtData.topologies.map(t => h("option", { value: t.id }, t.title)));
   const topoRow = h("div", { class: "row" }, "Topology", VT.newTopo);
   VT.preview = h("div", { class: "col" });
-  const showPreview = topo => VT.preview.replaceChildren(topo ? renderTopologyDiagram(vtDiagramOf(topo)) : "");
+  const showPreview = (topo, configs) => VT.preview.replaceChildren(topo ? renderTopologyDiagram(vtDiagramOf(topo, configs)) : "");
   VT.customOn = h("input", { type: "checkbox" });
   VT.custCounts = {};
   for (const role of ["host", "router", "switch", "loadbalancer", "firewall", "server", "upstream"]) {
@@ -78,6 +78,17 @@ function vtBuildSection() {
   VT.fileInput = h("input", { type: "file", accept: ".json,application/json" });
   VT.fileInfo = h("div", { class: "hint" }, "Choose a lab file exported from a lab's snapshots.");
   VT.labfile = null;
+  VT.useLabfile = lf => {
+    VT.labfile = lf;
+    showPreview(lf.topology, lf.configs);
+    const nodes = (lf.topology?.nodes || []).map(n => `${n.name} (${n.role})`);
+    const cfg = Object.keys(lf.configs || {});
+    VT.fileInfo.className = "hint";
+    VT.fileInfo.textContent = `"${lf.title}": ${nodes.length} nodes (${nodes.join(", ")}), ${(lf.topology?.links || []).length} links; ` +
+      (cfg.length ? `configs for ${cfg.join(", ")} are applied once the VMs are up, then checked.` : "no configs in the file.") +
+      (lf.source?.exported ? ` Exported ${lf.source.exported}.` : "") +
+      (lf.source?.draft ? ` Drafted from ${lf.source.diagram} by ${lf.source.drafted_by}.` : "");
+  };
   VT.fileInput.addEventListener("change", async () => {
     VT.labfile = null;
     const f = VT.fileInput.files[0];
@@ -85,14 +96,7 @@ function vtBuildSection() {
     try {
       const lf = JSON.parse(await f.text());
       if (lf.format !== "aiagentplayground-lab") throw new Error("this isn't an AI Agent Playground lab file");
-      VT.labfile = lf;
-      showPreview(lf.topology);
-      const nodes = (lf.topology?.nodes || []).map(n => `${n.name} (${n.role})`);
-      const cfg = Object.keys(lf.configs || {});
-      VT.fileInfo.className = "hint";
-      VT.fileInfo.textContent = `"${lf.title}": ${nodes.length} nodes (${nodes.join(", ")}), ${(lf.topology?.links || []).length} links; ` +
-        (cfg.length ? `configs for ${cfg.join(", ")} are applied once the VMs are up, then checked.` : "no configs in the file.") +
-        (lf.source?.exported ? ` Exported ${lf.source.exported}.` : "");
+      VT.useLabfile(lf);
     } catch (e) { VT.fileInfo.className = "fail"; VT.fileInfo.textContent = `Can't read that file: ${e.message}`; }
   });
   const fileBox = h("div", { class: "col" }, VT.fileInput, VT.fileInfo);
@@ -100,7 +104,7 @@ function vtBuildSection() {
   const syncCustomModes = () => {
     if (VT.fileOn.checked) VT.customOn.checked = false;
     showPreview(VT.fileOn.checked ? (VT.labfile && VT.labfile.topology) : VT.customOn.checked ? null
-      : vtData.topologies.find(t => t.id === VT.newTopo.value));
+      : vtData.topologies.find(t => t.id === VT.newTopo.value), VT.fileOn.checked && VT.labfile ? VT.labfile.configs : null);
     const fromFile = VT.fileOn.checked, custom = VT.customOn.checked;
     topoRow.hidden = custom || fromFile;
     customRow.hidden = fromFile;
@@ -115,6 +119,7 @@ function vtBuildSection() {
   VT.customOn.addEventListener("change", syncCustomModes);
   VT.promptOn.addEventListener("change", syncCustomModes);
   VT.fileOn.addEventListener("change", syncCustomModes);
+  VT.syncModes = syncCustomModes;
 
   VT.newAgents = h("div", { class: "col" }, ...vbAgentCheckboxes());
   VT.newKeep = h("input", { type: "checkbox" });
@@ -181,6 +186,7 @@ function vtBuildSection() {
       h("div", { class: "hint" }, "The agent writes its plan with no access to the nodes. Nothing runs until you approve the plan on the lab's page. Needs an agent."),
       h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection"),
       VT.newMsg, h("div", { class: "row" }, create)),
+    vtDraftSection(),
     h("h5", {}, "Topology runs"), VT.runsBox, VT.detail);
 }
 
@@ -189,6 +195,8 @@ async function vtLoad() {
   try { vtData = await api("/api/vmtopo"); } catch { return; }
   const rs = JSON.stringify(vtData.runs);
   if (rs !== vtSig.runs) { vtSig.runs = rs; renderVTRuns(); }
+  const ds = JSON.stringify(vtData.drafts || []);
+  if (ds !== vtSig.drafts) { vtSig.drafts = ds; renderVTDrafts(); }
   if (typeof renderBench === "function") renderBench();
   if (vtSelRun) loadVTDetail();
 }
@@ -478,8 +486,108 @@ function vtSnapshots(r) {
 
 /* A topology that isn't built yet, ready to draw: each end of a link gets the interface it will have (a node's lab
    links are its NICs 2, 3, ... in link order; see vm_runner.lab_iface_names). */
-function vtDiagramOf(topo) {
+function vtDiagramOf(topo, configs) {
   const slots = [8, 9, 10, 16, 17, 18, 19], used = {};
   const next = n => { const i = used[n] = (used[n] ?? -1) + 1; return i < slots.length ? `enp0s${slots[i]}` : `nic${i + 2}`; };
-  return { nodes: topo.nodes, links: topo.links.map(l => ({ ...l, a_if: next(l.a), b_if: next(l.b) })) };
+  const addresses = {};
+  for (const [node, secs] of Object.entries(configs || {}))
+    for (const line of (secs.addresses || "").split("\n")) {
+      const [ifc, , ...rest] = line.trim().split(/\s+/), addrs = rest.filter(a => a.includes("/") && !/^fe80:/i.test(a));
+      if (ifc && !["lo", "enp0s3"].includes(ifc.split("@")[0]) && addrs.length) (addresses[node] = addresses[node] || {})[ifc.split("@")[0]] = addrs;
+    }
+  return { nodes: topo.nodes, links: topo.links.map(l => ({ ...l, a_if: next(l.a), b_if: next(l.b) })), addresses };
+}
+
+/* Lab from a diagram: an agent reads your diagram (image, draw.io, Mermaid or text) plus your notes and drafts a
+   lab file; you check the drawing, revise it with the agent, then take it into "build from a lab file" above. */
+let vtSelDraft = null;
+function vtDraftSection() {
+  VT.draftsBox = h("div", { class: "col" });
+  VT.draftDetail = h("div", { class: "col" });
+  const file = h("input", { type: "file", accept: "image/png,image/jpeg,image/gif,image/webp,.drawio,.xml,.mmd,.mermaid,.txt,.md" });
+  const notes = h("textarea", { rows: 3, placeholder: "Required: what the diagram can't say. e.g. Boxes marked R are routers, PCs are hosts; use 192.168.10.0/24 for the LAN; the cloud icon is the internet." });
+  notes.value = vbDrafts["labdraft"] || "";
+  notes.addEventListener("input", () => { vbDrafts["labdraft"] = notes.value; });
+  const configured = h("input", { type: "checkbox", checked: true });
+  const agents = state.instances.filter(i => i.status === "healthy");
+  const sel = h("select", {}, h("option", { value: "" }, agents.length ? "Choose an agent..." : "No running agents"),
+    ...agents.map(i => h("option", { value: i.name }, `${i.name} · ${i.modelId}`)));
+  const msg = h("div", { class: "fail" });
+  const go = h("button", { class: "primary", onclick: async () => {
+    msg.textContent = "";
+    const f = file.files[0];
+    if (!f) { msg.textContent = "Choose the diagram file."; return; }
+    if (!notes.value.trim()) { msg.textContent = "Add notes about the diagram."; notes.focus(); return; }
+    if (!sel.value) { msg.textContent = "Choose the agent that reads it."; return; }
+    const isImage = f.type.startsWith("image/");
+    const agent = state.instances.find(i => i.name === sel.value);
+    if (isImage && agent && agent.backend !== "cloud") { msg.textContent = "Reading an image needs a cloud agent; local models here read text only (upload a draw.io, Mermaid or text version)."; return; }
+    if (f.size > (isImage ? 5e6 : 6e4)) { msg.textContent = isImage ? "Images can be up to 5 MB." : "Text diagrams can be up to 60 KB."; return; }
+    const diagram = { name: f.name };
+    if (isImage) diagram.data = await new Promise((ok, bad) => {
+      const rd = new FileReader(); rd.onload = () => ok(String(rd.result).split(",")[1]); rd.onerror = bad; rd.readAsDataURL(f);
+    });
+    else diagram.text = await f.text();
+    try {
+      const res = await api("/api/vmtopo/drafts", { agent: sel.value, diagram, context: notes.value, configured: configured.checked });
+      delete vbDrafts["labdraft"]; notes.value = ""; file.value = "";
+      vtSelDraft = res.draft; vtSig.drafts = ""; vtLoad();
+    } catch (e) { msg.textContent = e.message; }
+  } }, "Draft the lab");
+  return h("div", { class: "col" },
+    h("h5", {}, "Lab from a diagram"),
+    h("p", { class: "hint" }, "An agent reads your diagram and drafts a lab file: nodes, links and, if you like, addresses and static routes. Check the drawing, ask for changes, then build it with the form above. Images need a cloud agent; draw.io, Mermaid or a text description work with any agent."),
+    file, notes,
+    h("label", { class: "row" }, configured, "nodes come up configured (addresses, routes, forwarding); untick for a bare topology"),
+    h("div", { class: "row" }, "Agent", sel),
+    msg, h("div", { class: "row" }, go),
+    VT.draftsBox, VT.draftDetail);
+}
+
+function renderVTDrafts() {
+  const ds = vtData.drafts || [];
+  VT.draftsBox.replaceChildren(...ds.map(d => h("div", { class: "sess" + (d.id === vtSelDraft ? " sel" : ""), onclick: () => { vtSelDraft = d.id; renderVTDrafts(); } },
+    h("span", { class: "chip " + (d.state === "drafting" ? "awaiting" : d.state === "ready" ? "running" : "error") }, d.state),
+    ` ${d.title || d.diagram_name} — ${d.agent} (${d.agent_model})${d.configured ? "" : " — topology only"} `,
+    h("span", { class: "status" }, vtFmtTime(d.created)))));
+  loadVTDraft();
+}
+
+async function loadVTDraft() {
+  if (!vtSelDraft || !(vtData.drafts || []).some(d => d.id === vtSelDraft)) { VT.draftDetail.replaceChildren(); return; }
+  let d;
+  try { d = await api(`/api/vmtopo/drafts/${vtSelDraft}`); } catch { return; }
+  const key = `labdraft/${d.id}`;
+  const ask = h("textarea", { class: "al followup", placeholder: d.state === "failed" ? "Optional: anything to add when retrying" : "What should change? e.g. r2 is a firewall; h3 hangs off sw2, not sw1." });
+  ask.value = vbDrafts[key] || "";
+  ask.addEventListener("input", () => { vbDrafts[key] = ask.value; });
+  const msg = h("div", { class: "fail" });
+  const act = async (path, body) => {
+    msg.textContent = "";
+    try { await api(`/api/vmtopo/drafts/${d.id}/${path}`, body || {}); delete vbDrafts[key]; vtSig.drafts = ""; vtLoad(); }
+    catch (e) { msg.textContent = e.message; }
+  };
+  const busy = d.state === "drafting";
+  VT.draftDetail.replaceChildren(h("div", { class: "col bench" },
+    h("b", {}, d.title || d.diagram_name),
+    h("div", { class: "hint" }, `From ${d.diagram_name} · ${d.agent} (${d.agent_model}) · ${d.turns} turn${d.turns === 1 ? "" : "s"} · notes: ${d.context}`),
+    busy ? h("div", { class: "hint" }, `${d.agent} is reading the diagram...`) : null,
+    d.error ? h("div", { class: "fail" }, d.error) : null,
+    d.summary && !busy ? h("div", { class: "hint" }, `Agent: ${d.summary}`) : null,
+    d.diagram ? renderTopologyDiagram(d.diagram) : null,
+    (d.warnings || []).length ? h("div", { class: "hint" }, "Adjusted: " + d.warnings.join("; ")) : null,
+    (d.notes || []).length ? h("div", { class: "col" }, h("div", {}, "Not in the lab file (do it after the build, or have an agent do it):"),
+      h("ul", {}, ...d.notes.map(n => h("li", {}, n)))) : null,
+    busy ? null : ask,
+    msg,
+    busy ? null : h("div", { class: "row" },
+      d.labfile ? h("button", { class: "primary", onclick: () => {
+        VT.fileOn.checked = true; VT.useLabfile(d.labfile);
+        if ((d.notes || []).length && !VT.customPrompt.value.trim())
+          VT.customPrompt.value = "Finish this lab: " + d.notes.join("; ");
+        VT.syncModes(); VT.fileOn.scrollIntoView({ behavior: "smooth", block: "center" });
+      } }, "Use as lab file") : null,
+      h("button", { onclick: () => act("revise", { text: ask.value }) }, d.state === "failed" ? "Try again" : "Ask for changes"),
+      d.labfile ? h("a", { href: `/api/vmtopo/drafts/${d.id}/labfile`, download: "" }, "Download lab file") : null,
+      h("button", { onclick: () => act("delete") }, "Delete"))));
 }
