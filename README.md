@@ -33,6 +33,11 @@ and path checks run from each node), write a **plan** that waits for approval be
 lab back to any earlier turn, record **packet captures** for Wireshark, save and resume, and export the lab as a
 file. These are in the [Network workbench](control-panel/README.md#network-workbench) section.
 
+## Recommended hardware for VM Labs
+- **Minimum:** 16 GB RAM, 4 cores with hardware virtualization, about 60 GB free on an SSD. One lab of 3 to 7 VMs at a time.
+- **Comfortable:** 32 GB RAM and 8 cores for two labs at once.
+- Cloud agents need no local GPU. Local models add their own size. Details are in [control-panel/README.md](control-panel/README.md#recommended-hardware).
+
 ## Feature highlights (VM Labs)
 - **Intents:** say what a lab must and must not do (reach, block and path checks run from each node). See [Network workbench](control-panel/README.md#network-workbench).
 - **Plan first:** the agent writes its plan with no access to the nodes until you approve it.

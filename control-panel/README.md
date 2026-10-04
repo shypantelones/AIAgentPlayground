@@ -13,6 +13,19 @@ settings file and setup instructions for each OS:
 It opens http://127.0.0.1:8765. Requirements: Docker, and Python 3.8+ with nothing extra to install (standard library only;
 developed and tested on 3.11). Running `python app.py` here directly also works; the launchers just add per-OS setup.
 
+## Recommended hardware
+The panel and cloud agents are light. The VM labs are what need the machine: each lab VM defaults to 1.5 GB of RAM and
+one CPU core, and a lab is 3 to 7 VMs. These figures come from the labs we've built and run.
+
+| Setup | RAM | CPU | Disk | Notes |
+|---|---|---|---|---|
+| Minimum: one lab at a time, cloud agents | 16 GB | 4 cores with VT-x or AMD-V | ~60 GB free, SSD | 5 VMs take ~7.5 GB; Windows, WSL and Docker take ~4 GB. The first build downloads the Ubuntu base image. |
+| Comfortable: two labs at once | 32 GB | 8 cores | ~100 GB free, SSD | Two 5-VM labs take ~15 GB, with room for the panel, Docker and the agent containers. |
+| Adding local models | + the model's size | | + the model's size | A 14B model needs ~9 GB of RAM or VRAM. Not needed for cloud agents or labs. |
+
+Hardware virtualization must be on in the BIOS or UEFI for VirtualBox. The VM slot setting (`max_concurrent`, default 2)
+caps how many VMs run at once; raise it only with the RAM for it.
+
 ## What is in this folder (all OS-neutral)
 | Path | Purpose |
 |---|---|
