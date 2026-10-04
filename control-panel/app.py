@@ -1505,6 +1505,9 @@ def topo_run_view(r, full=False):
     v["captures"] = [{k: c.get(k) for k in ("id", "node", "iface", "seconds", "state", "size", "reason", "ts")}
                      for c in r.get("captures") or []]
     v["changes"] = r.get("changes") or []
+    v["plan_first"] = bool(r.get("plan_first"))
+    v["plan"] = r.get("plan")
+    v["plan_approved"] = bool(r.get("plan_approved"))
     v["restoring"] = bool(r.get("restoring"))
     v["intents"] = [i["text"] for i in r.get("intents") or []]
     v["intent_results"] = r.get("intent_results")
@@ -1586,6 +1589,9 @@ def create_topo_run(form):
             raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
     elif interactive:
         raise ValueError("attach an agent to start a session")
+    plan_first = bool(form.get("plan_first"))
+    if plan_first and not agent:
+        raise ValueError("a plan needs an agent to write it")
     # Intents are checked by name against this lab's nodes, so a typo fails here instead of as a red X later.
     intents = li.parse_intents(labfile["intents"] if labfile else form.get("intents"),
                                [n["name"] for n in topology["nodes"]])
@@ -1605,7 +1611,8 @@ def create_topo_run(form):
          "chat": f"vmtopo-{rid}" if agent else None,
          "agent_model": agent_model_id(load_meta(agent)) if agent else None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": "",
-         "intents": intents, "intent_results": None}
+         "intents": intents, "intent_results": None,
+         "plan_first": plan_first, "plan": None, "plan_approved": False}
     TOPO_RUNS[rid] = r
     save_topo_run(r)
     threading.Thread(target=topo_run_runner, args=(rid,), daemon=True).start()
@@ -1740,6 +1747,12 @@ def topo_run_runner(rid):
         if stopped():
             return finish("stopped", "stopped before the agent's turn")
         err = topo_agent_phase(r, topology, node_ports, priv, task, stopped)
+        if err == PLAN_WAITING:
+            # The plan is in; the lab stays up (not finished, so nothing is torn down) until you approve or delete it.
+            r.update(state="ready", agent_done=True)
+            save_topo_run(r)
+            topo_log(r, "the plan is ready: approve it to let the agent apply it, or delete the lab.")
+            return
         if err:
             return finish("error", err)
         finish("stopped" if stopped() else "done", r.get("reason", ""))
@@ -1773,11 +1786,60 @@ def topo_run_runner(rid):
         TOPO_STOP.pop(rid, None)
 
 
+PLAN_WAITING = "plan waiting for approval"
+PLAN_OPENING = ("Your plan is approved. Carry it out now, on the nodes, with ./vmrun-<node> as before. Then check "
+                "the result and tell me what you changed.")
+
+
+def write_plan(r, task):
+    """A plan-first lab's first turn: the agent writes its plan without any access to the nodes. Nothing has been
+    attached (no key, no relay, no vmrun commands), so it can't act on the lab until the plan is approved."""
+    node_lines = "\n".join(f"- {name} ({node['role']})" for name, node in r["nodes"].items())
+    goal = task["prompt"] if task else r["custom_prompt"]
+    prompt = (f"{goal}\n\nLab nodes:\n{node_lines}\n\nPlan first. You have no access to the nodes yet, so don't try to "
+              "run anything. Reply with the plan only: for each node, the commands you intend to run and why, and how "
+              "you'll check the result. Nothing is applied until the user approves the plan.")
+    r["state"] = "working"
+    save_topo_run(r)
+    topo_log(r, f"asking {r['agent']} for a plan (no access to the nodes until you approve it)...")
+    res = topo_agent_turn(r, prompt)
+    plan = (res.get("reply") or "").strip()
+    if not res.get("ok") or not plan:
+        return "the agent didn't return a plan (see the transcript)"
+    r["plan"] = plan[-6000:]
+    save_topo_run(r)
+    return PLAN_WAITING
+
+
+def topo_approve_plan(rid, form):
+    """Approve a plan-first lab's plan: the agent is attached (the same way as attach_agent_to_lab) and told to apply
+    it. Its conversation already holds the plan it wrote."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if not r.get("plan_first") or not r.get("plan") or r.get("plan_approved") or r["state"] != "ready":
+        raise ValueError("this lab has no plan waiting for approval")
+    r["plan_approved"] = True
+    r["pending_opening"] = PLAN_OPENING
+    try:
+        attach_agent_to_lab(rid, {"agent": r["agent"], "interactive": form.get("interactive", r.get("interactive")),
+                                  "use_task": bool(r.get("task_id")) and not r.get("custom_prompt"),
+                                  "custom_prompt": r.get("custom_prompt")})
+    except Exception:
+        r["plan_approved"] = False                 # nothing was attached: the plan is still waiting
+        r.pop("pending_opening", None)
+        raise
+    topo_log(r, "plan approved: the agent applies it now.")
+
+
 def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     """Attach r["agent"] to the lab, give it its prompt (the task's, or r["custom_prompt"]), run its turn (and the
     interactive session, if any), detach it, and score the task if it has a check. Shared by a lab created with an
     agent (topo_run_runner) and an agent attached to a lab that already exists (topo_attach_runner).
-    Returns an error message if the agent couldn't be attached, else None."""
+    Returns an error message if the agent couldn't be attached, else None, or PLAN_WAITING for a plan-first lab whose
+    plan is written but not yet approved (then the agent has never had access to the nodes)."""
+    if r.get("plan_first") and not r.get("plan_approved"):
+        return write_plan(r, task)
     r["state"] = "working"
     save_topo_run(r)
     topo_log(r, f"attaching {r['agent']} to this lab...")
@@ -1822,7 +1884,8 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     if r.get("intents"):
         hints.append("Your lab has to meet these intents. They're checked from the source node after each of your "
                      "turns:\n" + li.summary_for_prompt(r["intents"]))
-    prompt = (f"{task['prompt'] if task else r['custom_prompt']}\n\nLab nodes (commands run from your working "
+    opening = r.pop("pending_opening", None) or (task["prompt"] if task else r["custom_prompt"])
+    prompt = (f"{opening}\n\nLab nodes (commands run from your working "
               f"directory):\n{node_lines}\n" + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n"
               + "\n".join(h for h in hints if h))
     topo_agent_turn(r, prompt)
@@ -2463,6 +2526,8 @@ def attach_agent_to_lab(rid, form):
         raise KeyError("unknown run")
     if r["state"] != "ready" or r.get("restoring") or (r.get("agent") and agent_holds_lab(r, r["agent"])):
         raise ValueError("an agent can only be attached to a lab that's ready, with no agent at work in it")
+    if r.get("plan_first") and not r.get("plan_approved"):
+        raise ValueError("approve the lab's plan first: its agent has no access to the nodes until then")
     d = topo_run_dir(rid)
     if not (d / "Vagrantfile").exists() or not (d / "id_ed25519").exists():
         raise ValueError("this lab's VMs are gone")
@@ -3322,6 +3387,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"job": topo_intents_now(parts[3])})
                 if parts[4] == "rollback":
                     return self.send_json({"job": topo_rollback(parts[3], b.get("turn"))})
+                if parts[4] == "approve-plan":
+                    topo_approve_plan(parts[3], b)
+                    return self.send_json({"ok": True})
                 if parts[4] == "message":
                     return self.send_json(send_topo_followup(parts[3], b.get("text")))
                 if parts[4] == "save":

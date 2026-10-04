@@ -119,12 +119,14 @@ function vtBuildSection() {
   VT.newAgents = h("div", { class: "col" }, ...vbAgentCheckboxes());
   VT.newKeep = h("input", { type: "checkbox" });
   VT.newInteractive = h("input", { type: "checkbox" });
+  VT.newPlanFirst = h("input", { type: "checkbox" });
   VT.newMsg = h("div", { class: "fail" });
   const create = h("button", { class: "primary", onclick: async () => {
     VT.newMsg.textContent = "";
     const agents = [...VT.newAgents.querySelectorAll("input:checked")].map(x => x.value);
     if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
-    const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked, intents: VT.newIntents.value };
+    const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked, intents: VT.newIntents.value,
+                   plan_first: VT.newPlanFirst.checked };
     if (VT.fileOn.checked) {
       if (!VT.labfile) { VT.newMsg.textContent = "Choose a lab file first."; return; }
       body.labfile = VT.labfile;
@@ -175,6 +177,8 @@ function vtBuildSection() {
       h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VT.newAgents,
       h("label", { class: "row" }, VT.newInteractive, "interactive session"),
       h("div", { class: "hint" }, "The agent keeps its access to every node after its first reply so you can send it more guidance. It ends when you press End session, or after 2 hours with no new message."),
+      h("label", { class: "row" }, VT.newPlanFirst, "plan first"),
+      h("div", { class: "hint" }, "The agent writes its plan with no access to the nodes. Nothing runs until you approve the plan on the lab's page. Needs an agent."),
       h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection"),
       VT.newMsg, h("div", { class: "row" }, create)),
     h("h5", {}, "Topology runs"), VT.runsBox, VT.detail);
@@ -210,7 +214,8 @@ async function loadVTDetail() {
   const key = [r.id, r.state, r.transcript.length, r.score && r.score.passed,
               Object.values(r.nodes).map(n => n.terminal.active).join(","), (r.conversation || []).length,
               (r.captures || []).map(c => c.state).join(","), (r.intent_results || []).map(x => x.passed).join(","),
-              (r.changes || []).map(c => `${c.turn}${c.rolled_back ? "x" : ""}`).join(","), r.restoring].join("|");
+              (r.changes || []).map(c => `${c.turn}${c.rolled_back ? "x" : ""}`).join(","), r.restoring,
+              r.plan ? r.plan.length : 0, r.plan_approved].join("|");
   if (key === vtSig.detail) return;
   vtSig.detail = key;
   const live = ["queued", "provisioning", "working", "attached", "scoring", "resuming"].includes(r.state);
@@ -269,7 +274,8 @@ async function loadVTDetail() {
     h("div", { class: "hint" }, r.diagram.snapshot ? `Addresses from snapshot ${r.diagram.snapshot.id} (${new Date(r.diagram.snapshot.ts * 1000).toLocaleString()}).`
       : "Addresses appear here once the lab has a snapshot.")));
   parts.push(...nodeRows);
-  if (r.state === "ready" && r.has_vms && !r.agent_holds) parts.push(vtAttachBox(r));
+  if (r.plan_first && r.plan && !r.plan_approved && r.state === "ready") parts.push(vtPlanBox(r));
+  if (r.state === "ready" && r.has_vms && !r.agent_holds && !(r.plan_first && !r.plan_approved)) parts.push(vtAttachBox(r));
   parts.push(vtSnapshots(r));
   if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "lab"));
   if (r.interactive && ["attached", "working"].includes(r.state))
@@ -334,6 +340,21 @@ function vtAttachBox(r) {
    download it as a zip, or compare any two. The picks and the open view survive the detail view's redraws. */
 let vtSnap = { rid: null, picks: [], view: null };
 const VT_SNAP_STATES = ["ready", "working", "attached", "scoring", "done", "stopped"];
+
+/* Plan first: the agent's plan, waiting for you. Approving attaches the agent, and it applies the plan. */
+function vtPlanBox(r) {
+  const msg = h("div", { class: "fail" });
+  const go = h("button", { class: "primary", onclick: async () => {
+    msg.textContent = "";
+    try { await api(`/api/vmtopo/runs/${r.id}/approve-plan`, { interactive: r.interactive }); vtSig.runs = ""; vtSig.detail = ""; vtLoad(); }
+    catch (e) { msg.textContent = e.message; }
+  } }, "Approve plan and apply");
+  return h("div", { class: "col bench" },
+    h("b", {}, "Plan waiting for approval"),
+    h("p", { class: "hint" }, `${r.agent} wrote this plan without any access to the nodes. Approving lets it run the plan on the lab.`),
+    h("pre", { style: "max-height:40vh" }, r.plan),
+    h("div", { class: "row" }, go), msg);
+}
 
 /* Change log: the agent's commands per node and turn, with a rollback point before each turn. Rolling back restores
    every node to how it was before that turn; the turns after it are kept, marked as rolled back. */
