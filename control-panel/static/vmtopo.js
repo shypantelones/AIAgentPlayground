@@ -13,6 +13,20 @@ const VT_ROLE_PREFIX = { switch: "sw", router: "r", firewall: "fw", loadbalancer
 const vtCustomNames = counts => Object.entries(VT_ROLE_PREFIX)
   .flatMap(([role, prefix]) => Array.from({ length: +counts[role] || 0 }, (_, i) => `${prefix}${i + 1}`));
 
+// Layout helpers for the Network labs tab: a titled group of controls, a titled section of a run, and a collapsible panel.
+const VT_GROUP_STYLE = "border-top:1px solid var(--line);padding-top:8px;margin-top:4px";
+const vtGroup = (title, hint, ...kids) => h("div", { class: "col", style: VT_GROUP_STYLE },
+  h("b", {}, title), hint ? h("div", { class: "hint" }, hint) : null, ...kids);
+const vtSection = (title, kids) => {
+  const shown = kids.filter(Boolean);
+  return shown.length ? h("div", { class: "col", style: VT_GROUP_STYLE }, h("b", {}, title), ...shown) : null;
+};
+const vtFold = (title, open, ...kids) => {
+  const opts = { style: VT_GROUP_STYLE };
+  if (open) opts.open = "";
+  return h("details", opts, h("summary", { style: "cursor:pointer" }, h("b", {}, title)), ...kids.filter(Boolean));
+};
+
 function vtBuildSection() {
   VT = {};
   VT.runsBox = h("div", { class: "col" });
@@ -168,26 +182,32 @@ function vtBuildSection() {
     h("h4", {}, "Network topologies"),
     h("p", { class: "hint" },
       "A small group of real VMs wired together with virtual cabling: routers, switches (real VMs doing real L2 bridging, not simulated devices), hosts, load balancers and firewalls. Nothing is pre-addressed except the switches, which just forward frames - assigning IPs, enabling routing/filtering and adding routes is the task. Attach an agent, or open a terminal on any node and do it yourself."),
-    h("h5", {}, "New lab"),
-    h("div", { class: "col" },
-      topoRow, VT.preview,
-      customRow,
-      h("label", { class: "row" }, VT.fileOn, "build from a lab file"), fileBox,
-      custBuilder,
-      taskRow, VT.newTaskInfo, promptRow, VT.customPrompt,
-      h("div", {}, "Intents (optional, one per line): what the lab must do. Each is checked from its source node after the agent's work, and a lab with intents and no task check is scored by them."),
-      h("div", { class: "hint" }, "reach or block a node or address over icmp or tcp/<port>, or check the route: 'h1 -> h2 icmp reach', 'h2 -> web1 tcp/22 block', 'h1 -> 10.2.0.10 path via r1, r2'. Lab files carry their own intents."),
-      VT.newIntents,
-      h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
-      h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VT.newAgents,
-      h("label", { class: "row" }, VT.newInteractive, "interactive session"),
-      h("div", { class: "hint" }, "The agent keeps its access to every node after its first reply so you can send it more guidance. It ends when you press End session, or after 2 hours with no new message."),
-      h("label", { class: "row" }, VT.newPlanFirst, "plan first"),
-      h("div", { class: "hint" }, "The agent writes its plan with no access to the nodes. Nothing runs until you approve the plan on the lab's page. Needs an agent."),
-      h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection"),
+    // The lab list comes first; the form folds away once there are runs to look at.
+    h("h5", {}, "Topology runs"), VT.runsBox,
+    vtFold("New lab", !vtData.runs.length,
+      vtGroup("1. Where the lab comes from", "A catalog topology, one you build from role counts, or a lab file.",
+        topoRow, VT.preview, customRow,
+        h("label", { class: "row" }, VT.fileOn, "build from a lab file"), fileBox,
+        custBuilder),
+      vtGroup("2. What the agent does", "A catalog task, or your own prompt. Custom topologies and lab files take a prompt.",
+        taskRow, VT.newTaskInfo, promptRow, VT.customPrompt),
+      vtGroup("3. Checks (optional)",
+        "What the lab must do, one per line. Each is checked from its source node after the agent's work. A lab with intents and no task check is scored by them.",
+        h("div", { class: "hint" }, "reach or block a node or address over icmp or tcp/<port>, or check the route: 'h1 -> h2 icmp reach', 'h2 -> web1 tcp/22 block', 'h1 -> 10.2.0.10 path via r1, r2'. Lab files carry their own intents."),
+        VT.newIntents),
+      vtGroup("4. Agent and session (optional)",
+        "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended.",
+        VT.newAgents,
+        h("div", { class: "hint" }, "Tick more than one agent to benchmark them side by side on the same task. Each agent shows what its model has done in VM Labs here."),
+        h("label", { class: "row" }, VT.newInteractive, "interactive session"),
+        h("div", { class: "hint" }, "The agent keeps its access to every node after its first reply so you can send it more guidance. It ends when you press End session, or after 2 hours with no new message."),
+        h("label", { class: "row" }, VT.newPlanFirst, "plan first"),
+        h("div", { class: "hint" }, "The agent writes its plan with no access to the nodes. Nothing runs until you approve the plan on the lab's page. Needs an agent.")),
+      vtGroup("5. Keep the VMs?", null,
+        h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection")),
       VT.newMsg, h("div", { class: "row" }, create)),
-    vtDraftSection(),
-    h("h5", {}, "Topology runs"), VT.runsBox, VT.detail);
+    vtFold("Draft a lab from a diagram", false, vtDraftSection()),
+    VT.detail);
 }
 
 async function vtLoad() {
@@ -276,37 +296,49 @@ async function loadVTDetail() {
       (!c ? "Its configs are applied once the VMs are up." : !bad.length ? "Every node matches the file."
         : `Differs from the file in ${bad.map(([n, m]) => `${n}: ${m.join(", ")}`).join("; ")} (see the transcript).`)));
   }
-  if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
-  if (r.diagram) parts.push(h("details", { open: "" }, h("summary", {}, "Topology diagram"),
-    renderTopologyDiagram(r.diagram),
-    h("div", { class: "hint" }, r.diagram.snapshot ? `Addresses from snapshot ${r.diagram.snapshot.id} (${new Date(r.diagram.snapshot.ts * 1000).toLocaleString()}).`
-      : "Addresses appear here once the lab has a snapshot.")));
-  parts.push(...nodeRows);
-  if (r.plan_first && r.plan && !r.plan_approved && r.state === "ready") parts.push(vtPlanBox(r));
-  if (r.state === "ready" && r.has_vms && !r.agent_holds && !(r.plan_first && !r.plan_approved)) parts.push(vtAttachBox(r));
-  parts.push(vtSnapshots(r));
-  if (r.conversation && r.conversation.length) parts.push(sessionConversation(r, "lab"));
-  if (r.interactive && ["attached", "working"].includes(r.state))
-    parts.push(sessionBox(r, "/api/vmtopo/runs", "lab", () => { vtSig.detail = ""; vtLoad(); }));
-  if (r.score) {
-    parts.push(h("div", { class: r.score.passed ? "pass" : "fail" }, r.score.passed ? "PASS" : "FAIL", ` (${r.score.duration_s}s)`));
-    parts.push(h("pre", {}, r.score.output));
-  }
-  if ((r.intents || []).length) {
+  // Sections, top to bottom: what the lab is, its machines and agent, how it's checked. The bulky tools fold away.
+  const intentRows = (r.intents || []).length ? (() => {
     // One row per intent: what was asked, and whether the last check (from its source node) met it.
     const res = r.intent_results || [];
-    parts.push(h("b", {}, `Intents${res.length ? ` (${res.filter(x => x.passed).length} of ${res.length} pass)` : " (not checked yet)"}`));
-    parts.push(h("div", { class: "col" }, ...r.intents.map((text, i) => {
-      const x = res.find(y => y.text === text);
-      return h("div", { class: x ? (x.passed ? "pass" : "fail") : "hint" },
-        `${x ? (x.passed ? "PASS" : "FAIL") : "—"}  ${text}${x ? `  (${x.detail})` : ""}`);
-    })));
-  }
-  if (["ready", "working", "attached", "done"].includes(r.state)) parts.push(vtCaptures(r));
-  if ((r.changes || []).length) parts.push(vtChanges(r));
-  parts.push(h("div", { class: "hint" }, "Live transcript:"));
-  parts.push(h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)"));
-  replaceKeepingFocus(VT.detail, parts);
+    return [h("div", { class: "hint" }, `${res.length ? `${res.filter(x => x.passed).length} of ${res.length} pass` : "not checked yet"}`),
+      h("div", { class: "col" }, ...r.intents.map(text => {
+        const x = res.find(y => y.text === text);
+        return h("div", { class: x ? (x.passed ? "pass" : "fail") : "hint" },
+          `${x ? (x.passed ? "PASS" : "FAIL") : "—"}  ${text}${x ? `  (${x.detail})` : ""}`);
+      }))];
+  })() : [];
+  const scoreRows = r.score ? [
+    h("div", { class: r.score.passed ? "pass" : "fail" }, r.score.passed ? "PASS" : "FAIL", ` (${r.score.duration_s}s)`),
+    h("pre", {}, r.score.output)] : [];
+
+  parts.push(vtSection("Status", [
+    r.custom_prompt ? h("pre", {}, r.custom_prompt) : null]));
+  parts.push(vtSection("Topology", [
+    r.diagram ? h("details", { open: "" }, h("summary", {}, "Topology diagram"),
+      renderTopologyDiagram(r.diagram),
+      h("div", { class: "hint" }, r.diagram.snapshot ? `Addresses from snapshot ${r.diagram.snapshot.id} (${new Date(r.diagram.snapshot.ts * 1000).toLocaleString()}).`
+        : "Addresses appear here once the lab has a snapshot.")) : null,
+    ...nodeRows,
+    r.plan_first && r.plan && !r.plan_approved && r.state === "ready" ? vtPlanBox(r) : null,
+    r.state === "ready" && r.has_vms && !r.agent_holds && !(r.plan_first && !r.plan_approved) ? vtAttachBox(r) : null]));
+  parts.push(vtSection("Agent session", [
+    r.conversation && r.conversation.length ? sessionConversation(r, "lab") : null,
+    r.interactive && ["attached", "working"].includes(r.state)
+      ? sessionBox(r, "/api/vmtopo/runs", "lab", () => { vtSig.detail = ""; vtLoad(); }) : null]));
+  parts.push(vtSection("Checks", [...scoreRows, ...intentRows]));
+  if (["ready", "working", "attached", "done"].includes(r.state)) parts.push(vtFold("Packet captures", false, vtCaptures(r)));
+  if ((r.changes || []).length) parts.push(vtFold("Change log", false, vtChanges(r)));
+  parts.push(vtFold("Config snapshots", false, vtSnapshots(r)));
+  parts.push(vtFold("Live transcript", false,
+    h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)")));
+  // Re-rendering happens as the transcript grows: keep each panel open or closed the way the user left it.
+  const openState = {};
+  VT.detail.querySelectorAll("details").forEach(d => { const t = d.querySelector("summary")?.textContent; if (t) openState[t] = d.open; });
+  replaceKeepingFocus(VT.detail, parts.filter(Boolean));
+  VT.detail.querySelectorAll("details").forEach(d => {
+    const t = d.querySelector("summary")?.textContent;
+    if (t && t in openState) d.open = openState[t];
+  });
 }
 
 /* Attach an agent to a lab that already exists (one you built yourself, or saved and resumed). When it's done the lab

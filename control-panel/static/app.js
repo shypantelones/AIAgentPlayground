@@ -170,6 +170,15 @@ function syncPanes() {
   else if (empty) empty.remove();
 }
 
+// The VM and network labs this agent is working in right now, shown under the agent's header. A click opens it in VM Labs.
+function attachmentChips(list) {
+  if (!list.length) return [h("div", { class: "hint" }, "Not working in any VM or network lab.")];
+  return [h("span", { class: "hint" }, "Working in:"), ...list.map(a => h("button", {
+    class: "chip " + a.state, title: "Open in VM Labs",
+    onclick: () => { openVB(); vbOpenRun(a); } },
+    `${a.kind === "network" ? "Network lab" : "VM"} ${a.id} · ${a.title} · ${a.state}`))];
+}
+
 function makePane(name) {
   let inst = state.instances.find(i => i.name === name);
   let tab = "chat", chatId = localStorage.getItem("chat-" + name) || "main", chats = {}, pending = false;
@@ -179,9 +188,10 @@ function makePane(name) {
   const dot = h("span", { class: "dot" });
   const link = h("a", { target: "_blank", rel: "noopener" }, "dashboard");
   const btns = h("span", { class: "row" });
+  const att = h("div", { class: "att", style: "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:4px 0" });
   const tabs = h("div", { class: "tabs" });
   const el = h("section", { class: "pane" },
-    h("div", { class: "phead" }, dot, h("b", {}, name), statusEl, h("span", { class: "sp" }), link, btns), tabs, body);
+    h("div", { class: "phead" }, dot, h("b", {}, name), statusEl, h("span", { class: "sp" }), link, btns), att, tabs, body);
 
   const running = () => inst && (inst.status === "healthy" || inst.status === "starting");
 
@@ -189,6 +199,7 @@ function makePane(name) {
     inst = i;
     dot.className = "dot " + i.status; statusEl.textContent = i.status + " \u00b7 " + (i.backend === "cloud" ? "cloud: " + i.provider : "local");
     link.href = `http://127.0.0.1:${i.port}/`;
+    att.replaceChildren(...attachmentChips(i.attachments || []));
     btns.replaceChildren(
       running() ? h("button", { onclick: () => action(`/api/agents/${name}/stop`, "Stop " + name) }, "Stop")
                 : h("button", { class: "primary", onclick: () => action(`/api/agents/${name}/start`, "Start " + name) }, "Start"),
