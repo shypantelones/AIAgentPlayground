@@ -1787,6 +1787,14 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         "are in bridge br0, with VLAN filtering off. To use VLANs on it, turn filtering on (ip link set br0 type bridge "
         "vlan_filtering 1) and set each port with `bridge vlan` (an access port: bridge vlan add dev <port> vid <id> pvid "
         "untagged, then bridge vlan del dev <port> vid 1; a trunk: bridge vlan add dev <port> vid <id> for each VLAN)."
+        + ("\n\nServer nodes have dnsmasq (DHCP and DNS) installed but not configured or running: put your settings in "
+           "a new file in /etc/dnsmasq.d/ (a defaults file there already keeps it off the setup interface), then "
+           "`systemctl enable --now dnsmasq`. Hosts can get an address with `dhclient <interface>`."
+           if any(n["role"] == "server" for n in r["nodes"].values()) else "")
+        + (f"\n\nUpstream nodes stand in for the internet: their first lab interface is already {vr.UPSTREAM_ADDR} "
+           f"and they serve http://{vr.UPSTREAM_WEB}/. They have no route to your networks, so reaching them from "
+           "behind a router needs NAT (masquerade) on that router."
+           if any(n["role"] == "upstream" for n in r["nodes"].values()) else "")
         + ("\n\nRouter nodes run FRR with the OSPF, OSPFv3 and BGP daemons available but not configured. Configure "
            "them with vtysh, for example: ./vmrun-r1 <<'EOF'\nvtysh -c 'configure terminal' -c 'router ospf' "
            "-c 'network 10.0.0.0/30 area 0'\nvtysh -c 'show ip ospf neighbor'\nEOF\n"

@@ -408,6 +408,85 @@ class VlanTests(unittest.TestCase):
             self.assertIn(f"enp0s{8 + i} {'connects ' if i == 0 else ''}to {peer}", task["prompt"])
 
 
+class ServiceNodeTests(unittest.TestCase):
+    """Service nodes: a "server" with dnsmasq (DHCP/DNS), and an "upstream" standing in for the internet."""
+
+    def sh_ok(self, script):
+        r = subprocess.run(["sh", "-n"], input=script, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_roles_exist_and_name_nicely(self):
+        self.assertIn("server", vr.NODE_ROLES)
+        self.assertIn("upstream", vr.NODE_ROLES)
+        names = [n["name"] for n in vr._named_nodes({"server": 1, "upstream": 1, "host": 1})]
+        self.assertEqual(names, ["srv1", "up1", "h1"])
+
+    def test_server_gets_dnsmasq_kept_off_the_setup_nic_and_not_running(self):
+        p = vr._topo_provision_script("server", "KEY")
+        self.assertLess(p.index("except-interface=enp0s3"), p.index("apt-get install -y dnsmasq"),
+                        "the defaults must exist before dnsmasq first starts")
+        self.assertIn("except-interface=lo", p)
+        self.assertIn("bind-interfaces", p)
+        self.assertIn("systemctl disable --now dnsmasq", p)
+        self.sh_ok(p)
+
+    def test_upstream_is_a_preconfigured_internet_stand_in(self):
+        p = vr._topo_provision_script("upstream", "KEY")
+        self.assertIn(f"ip addr add {vr.UPSTREAM_ADDR}", p)
+        self.assertIn(f"ip addr add {vr.UPSTREAM_WEB}/32 dev dummy0", p)
+        self.assertIn("upstream ok", p)
+        self.assertIn("grep -v -e '^lo$' -e '^enp0s3$'", p, "never the setup NIC")
+        self.sh_ok(p)
+
+    def test_hosts_get_dhcp_and_test_tools(self):
+        p = vr._topo_provision_script("host", "KEY")
+        for pkg in ("isc-dhcp-client", "curl", "dnsutils"):
+            self.assertIn(pkg, p)
+
+    def test_custom_wiring_places_servers_like_hosts_and_upstreams_at_the_edge(self):
+        t = vr.build_custom_topology({"host": 1, "router": 1, "switch": 1, "server": 1, "upstream": 1}, "chain")
+        links = {(l["a"], l["b"]) for l in t["links"]}
+        self.assertIn(("srv1", "sw1"), links)
+        self.assertIn(("r1", "up1"), links)
+        star = vr.build_custom_topology({"host": 1, "switch": 1, "server": 1}, "star")
+        self.assertIn({"a": "srv1", "b": "sw1"}, star["links"])
+
+    def test_snapshots_capture_dnsmasq_and_service_state(self):
+        self.assertIn("/etc/dnsmasq.d/*.conf", vr.SNAPSHOT_SCRIPT)
+        self.assertIn("sec services", vr.SNAPSHOT_SCRIPT)
+
+    def test_lab_files_restore_dnsmasq_and_running_services(self):
+        secs = {"file /etc/dnsmasq.d/lab.conf": "dhcp-range=192.168.50.100,192.168.50.150,1h\n",
+                "file /etc/dnsmasq.conf": "\n", "file /etc/dnsmasq.d/../../etc/shadow": "x\n",
+                "services": "dnsmasq active\nnginx inactive\nsshd active\n"}
+        script, skipped = vr.render_apply_script(secs)
+        self.assertIn("tee /etc/dnsmasq.d/lab.conf", script)
+        self.assertIn("tee /etc/dnsmasq.conf", script)
+        self.assertIn("systemctl enable -q dnsmasq && sudo -n systemctl restart dnsmasq", script)
+        self.assertNotIn("restart nginx", script, "only services that were running are started")
+        self.assertNotIn("sshd", script, "only the lab's own services")
+        self.assertNotIn("shadow", script)
+        self.assertEqual(skipped, ["file /etc/dnsmasq.d/../../etc/shadow"])
+        self.sh_ok(script)
+
+    def test_rebuild_check_notices_a_service_that_is_not_running(self):
+        self.assertEqual(vr.config_mismatches({"services": "dnsmasq active\n"}, {"services": "dnsmasq inactive\n"}), ["services"])
+
+    def test_new_tasks_are_in_the_catalog_and_their_checks_parse(self):
+        for tid in ("srv1s1h2-dhcp-dns", "r1s1h1up1-nat"):
+            with self.subTest(tid):
+                task = vr.get_topology_task(tid)
+                topo = vr.get_topology(task["topology_id"])
+                self.assertIn(task["check_node"], [n["name"] for n in topo["nodes"]])
+                self.sh_ok(task["check"])
+                self.assertNotIn("10.0.2.", task["prompt"] + task["check"])
+        nat = vr.get_topology_task("r1s1h1up1-nat")
+        r1_peers = [l["a"] if l["b"] == "r1" else l["b"] for l in vr.get_topology("r1s1h1up1")["links"] if "r1" in (l["a"], l["b"])]
+        self.assertEqual(r1_peers, ["sw1", "up1"], "the prompt's enp0s8/enp0s9 map depends on this order")
+        self.assertIn("enp0s8 connects to sw1", nat["prompt"])
+        self.assertIn("enp0s9 to up1", nat["prompt"])
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to

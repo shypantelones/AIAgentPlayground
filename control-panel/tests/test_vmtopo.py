@@ -957,6 +957,15 @@ class RouterPromptTests(VmTopoBase):
     def test_every_lab_prompt_warns_about_the_setup_network(self):
         self.assertIn("10.0.2.0/24", self.prompt_for("s1h2"))
 
+    def test_service_and_upstream_hints_only_where_those_nodes_are(self):
+        p = self.prompt_for("srv1s1h2")
+        self.assertIn("dnsmasq", p)
+        self.assertNotIn("Upstream nodes", p)
+        p = self.prompt_for("r1s1h1up1")
+        self.assertIn("Upstream nodes", p)
+        self.assertIn("203.0.113.10", p)
+        self.assertNotIn("dnsmasq", p)
+
     def test_lab_prompts_explain_vlans_on_switches(self):
         p = self.prompt_for("s1h2")
         self.assertIn("vlan_filtering 1", p)
