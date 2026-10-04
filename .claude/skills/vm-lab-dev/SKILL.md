@@ -460,6 +460,31 @@ generated shell in each node's provision script.
   `cloudFields` in `static/app.js` shows it and warns below half the cheapest model's count.
 - **Not yet done:** the same warning on the lab form, and a live check of the per-turn cap on a real turn.
 
+## Lab files and snapshots (what a rebuild carries)
+
+- The snapshot script (`vm_runner.SNAPSHOT_SCRIPT`) leaves out the host-only proxy adapter: its addresses, routes, and
+  ufw/nft/iptables lines naming 192.168.56.x, and Vagrant's `50-vagrant.yaml`. A lab file must never pin a proxy
+  address from its source lab's slot.
+- `render_apply_script` skips any nftables or iptables section with `ufw-` chains (reported as "firewall rules (managed by
+  the lab's ufw)"). Restoring them flushed the rebuilt VM's own default-deny and proxy rules. Firewall roles without
+  ufw still restore.
+- Verified: a router lab exported, deleted and rebuilt from its file matches on every node, pings across the router, and
+  keeps ufw active. Not verified: a file from a snapshot taken before this change.
+
+## Agent roles (lab_roles.py)
+
+- `ROLES` maps a role name to `for`, `refuses` (plain words for the prompt), and `denied` (ERE patterns for grep).
+  `ALWAYS_DENIED` (power and disk operations) applies to every role, and to members with no role.
+- A team line takes its role from the brief: `[web-admin] ...`. `role_of` strips it; `validate_team` stores `role`.
+- `topo_member_turn` passes `deny=lr.denied_patterns(role)` to `vmrun_script`. The wrapper checks the argument string
+  (or the script on stdin) before anything runs: a match logs `REFUSED by this agent's role` and exits 4.
+- **Gotcha:** the wrapper uses `grep -Eq` with `\b`. GNU grep 3.8 (Debian in the agent image) handles it; busybox
+  may not. Check the image's grep before adding a pattern that depends on `\b`.
+- **Guard vs boundary:** the guard is a pattern check, and the agent holds the lab key. Hard enforcement means VM-side users
+  with restricted sudo, one per role. Not built yet.
+- **Tested:** unit tests for parsing and the prompt; the real wrapper with a fake ssh; a live router test with network-admin
+  and web-admin (intents and score passed, no refusals in the real run). Not tested live: firewall-admin, client-dev, tool-dev.
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:

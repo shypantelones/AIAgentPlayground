@@ -293,9 +293,13 @@ def ssh_script(port, key_path, script, timeout=60):
 SNAPSHOT_SECTION = "### "
 SNAPSHOT_SCRIPT = r"""
 sec() { echo "### $1"; }
-sec addresses; ip -br addr
-sec links; ip -br link
-sec routes; ip route show; echo "# ipv6"; ip -6 route show
+# The host-only adapter (the lab's link to its internet proxy, see lab_egress) belongs to the lab's infrastructure, not
+# its configuration: it's left out, so a lab file never pins a proxy address from this lab's slot.
+MGMT=$(ip -o -4 addr show | awk '/ 192\.168\.56\./{print $2; exit}')
+nomgmt() { if [ -n "$MGMT" ]; then grep -v -e "^$MGMT " -e "dev $MGMT " -e "192\.168\.56\."; else cat; fi; }
+sec addresses; ip -br addr | nomgmt
+sec links; ip -br link | nomgmt
+sec routes; ip route show | nomgmt; echo "# ipv6"; ip -6 route show
 sec forwarding; sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding 2>/dev/null
 if command -v bridge >/dev/null; then
   sec bridge
@@ -304,14 +308,15 @@ if command -v bridge >/dev/null; then
 fi
 sec "vlan interfaces"
 ip -o -d link show type vlan 2>/dev/null | sed -E 's/^[0-9]+: ([^:]+):.* vlan protocol ([^ ]+) id ([0-9]+).*/\1 \2 \3/'
-if command -v nft >/dev/null; then sec nftables; sudo -n nft list ruleset 2>&1; fi
-if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save 2>&1 | grep -v '^#'; fi
+if command -v nft >/dev/null; then sec nftables; sudo -n nft list ruleset 2>&1 | grep -v "192\.168\.56\."; fi
+if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save 2>&1 | grep -v '^#' | grep -v "192\.168\.56\."; fi
 if command -v vtysh >/dev/null; then
   sec frr; sudo -n vtysh -c 'show running-config' 2>&1 | grep -v -e '^Building configuration' -e '^Current configuration:'
 fi
 sec services
 for s in dnsmasq nginx frr; do systemctl cat "$s" >/dev/null 2>&1 && echo "$s $(systemctl is-active "$s")"; done
 for f in /etc/dnsmasq.conf /etc/dnsmasq.d/*.conf /etc/netplan/*.yaml /etc/frr/frr.conf /etc/frr/daemons /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf          /etc/nginx/sites-enabled/* /etc/nginx/streams-enabled/*; do
+  case "$f" in */50-vagrant.yaml) continue ;; esac     # Vagrant's own netplan: it carries the host-only address
   [ -f "$f" ] && { sec "file $f"; sudo -n cat "$f" 2>&1; }
 done
 true
@@ -455,6 +460,11 @@ def render_apply_script(sections):
             cmds.append(f"sudo -n sysctl -q -w {q(m.group(1) + '=' + m.group(2))}")
     b64 = lambda text: base64.b64encode(text.encode()).decode()
     nft, ipt = sections.get("nftables", ""), sections.get("iptables", "")
+    # A ruleset with ufw's chains belongs to the lab's own firewall (its outbound default-deny and proxy rules, which the
+    # VM's provisioning builds). Restoring it would flush that firewall, so it's skipped and the VM keeps its own.
+    if "ufw-" in nft or "ufw-" in ipt:
+        skipped.append("firewall rules (managed by the lab's ufw)")
+        nft = ipt = ""
     if _usable(nft):
         cmds.append(f"echo {b64('flush ruleset' + chr(10) + nft)} | base64 -d | sudo -n nft -f -")
     elif _usable(ipt):
@@ -762,7 +772,7 @@ def vm_name_for_node(rid, name):
     return f"aiagentplayground-vmtopo-{rid}-{name}"
 
 
-def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None):
+def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None, deny=None):
     """The `vmrun` wrapper put in an agent's workspace: runs commands on a VM through its relay and logs them.
     With `node`, each log entry names the node too ("=== <time> <node> $ <command>"), so a lab's change log can say
     which node a command ran on. Without it the entries are "=== <time> $ <command>", as before.
@@ -790,11 +800,26 @@ def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None):
                   "  fi\n"
                   f"  echo $((n - 1)) > \"{budget_file}\"\n"
                   "fi\n")
+    # A role guard (see lab_roles): a command matching one of the role's patterns is refused and logged as refused.
+    # Patterns are ERE for grep; none may contain a single quote.
+    guard = ""
+    if deny:
+        pat = "|".join(deny)
+        if "'" in pat:
+            raise ValueError("a guard pattern can't contain a single quote")
+        guard = (f"  if printf '%s' \"$1\" | grep -Eq '{pat}'; then\n"
+                 "    echo \"=== $ts " + label + "\\$ REFUSED by this agent's role: $*\" >> \"$LOG\"\n"
+                 "    echo \"refused: this command is outside your role. Ask the member who owns it.\" >&2\n"
+                 "    exit 4\n"
+                 "  fi\n")
+    arg_guard = guard.replace('"$1"', '"$*"')
+    script_guard = guard.replace('"$1"', '"$script"').replace("$*", "(script on stdin)")
     return ("#!/bin/sh\n"
             f"LOG={log_path}\n"
             + budget +
             "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
             "if [ $# -gt 0 ]; then\n"
+            + arg_guard +
             "  echo \"=== $ts " + label + "\\$ $*\" >> \"$LOG\"\n"
             f"  {ssh} \"$@\" 2>&1 | tee -a \"$LOG\"\n"
             "  exit 0\n"
@@ -806,6 +831,7 @@ def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None):
             "if [ -z \"$script\" ]; then\n"
             "  echo \"usage: $0 'command'   or   $0 <<'EOF' (script lines) EOF\" >&2; exit 2\n"
             "fi\n"
+            + script_guard.replace("  if printf", "if printf").replace("\n  ", "\n") +
             "printf '=== %s " + label + "$ (script on stdin)\\n%s\\n' \"$ts\" \"$script\" >> \"$LOG\"\n"
             f"printf '%s\\n' \"$script\" | {ssh} 'bash -s' 2>&1 | tee -a \"$LOG\"\n")
 

@@ -165,6 +165,46 @@ commands is refused before anything is built.
   cheapest model buys.
 - **Not yet done:** the same warning on the lab form, and a live check of the cap on a real turn.
 
+#### Lab files and rebuilds
+A lab file keeps each node's configuration (addresses, routes, forwarding, firewall where it isn't ufw-managed, service
+configs). It leaves out the lab's proxy adapter (its address is set by the lab's slot, so a file can't pin it), and it
+leaves out ufw's rules: the rebuilt VM gets its own firewall from its provisioning. A rebuild checks every node against
+the file and reports any difference. Trade-off: a node with hand-written ufw rules won't get them back from a file.
+
+#### Agent roles in a team
+A team line can start its brief with a role in brackets: `alpha | h1,r1,h2 | 1 | [network-admin] route h1 to h2 through r1`.
+The role says what the member is for, and its command guard refuses commands outside it. Roles are in `lab_roles.py`.
+
+| Role | For | Guard refuses (on the member's own nodes) |
+|---|---|---|
+| network-admin | routing, addresses, forwarding; makes sure other members have the paths they need | power and disk operations only |
+| firewall-admin | the firewall node(s): the rules that let required traffic through | power and disk operations, routes and addresses |
+| web-admin | the web server(s): installs and runs the service | power and disk operations, the firewall, routes, sysctl |
+| client-dev | the client side: the program that connects to the server | power and disk operations, the firewall, routes, sysctl |
+| tool-dev | developing and testing a tool on a host, apt and pip through the proxy | power and disk operations, the firewall, routes, sysctl |
+
+Every member refuses power and disk operations (`reboot`, `shutdown`, `mkfs`, `dd`, ...), whatever its role.
+A refused command is logged in the change log as `REFUSED by this agent's role`, and the member gets exit 4 from the
+wrapper.
+
+How the roles apply here:
+- **Node types map to roles:** routers and switches to network-admin, the firewall role to firewall-admin, the
+  server and load-balancer roles to web-admin, hosts to client-dev or tool-dev.
+- **Live test** (router lab, alpha as network-admin on h1, r1, h2; beta as web-admin on h2): both intents passed (ping
+  and TCP 8080 from h1 to h2), the score passed, and the members stayed in role. No command was refused in the real run.
+- **The guard works mechanically:** run through a member's wrapper inside its container, `sudo nft list ruleset` was
+  refused (exit 4) and `systemctl is-active nginx` went on to the relay.
+
+Trade-offs and gaps:
+- **The guard is a pattern check, not a boundary.** An agent holds the lab key and could reach a node over SSH directly.
+  The hard version is VM-side users with restricted sudo, one per role, which needs a provisioning change and a key per
+  member. That is the next step.
+- **Patterns are words, not intent.** A command that builds a firewall rule some other way (a script that writes an nft
+  file, for example) is not caught by the word match.
+- **Not tested live:** firewall-admin, client-dev and tool-dev. The role catalog and guards are tested with the wrapper
+  and unit tests only.
+- **Prompt cost:** each member's prompt now carries its role line (about 60 tokens).
+
 #### Teams: several agents in one lab
 A lab can take a **team** instead of one agent (the "Team" group in the new-lab form, one member per line:
 `agent | nodes | stage | brief`). Each member gets its own relay and `vmrun` commands for its nodes only, and its own

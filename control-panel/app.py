@@ -844,6 +844,7 @@ def store_token(name, token):
 #     click "Open terminal", published to 127.0.0.1 only, with a fresh random credential each time.
 import vm_runner as vr  # noqa: E402  (Vagrant/VirtualBox lifecycle; pure logic is testable without Docker/VirtualBox)
 import lab_intents as li  # noqa: E402  (intent lines -> checks run from each source node; pure logic, tested alone)
+import lab_roles as lr  # noqa: E402  (what each team role is for, and what its command guard refuses)
 import agent_costs as ac  # noqa: E402  (what an agent's commands cost, and how many a budget buys)
 import lab_egress as le  # noqa: E402  (what a lab VM may reach on the internet, and the proxy that enforces it)
 import lab_changes as lc  # noqa: E402  (a lab's change log: the agent's commands per node and turn; pure logic)
@@ -1501,6 +1502,8 @@ def load_topo_runs():
             r = json.loads(f.read_text())
         except Exception:
             continue
+        if "state" not in r or "id" not in r:
+            continue                                      # not a lab record: skip it, don't stop the panel starting
         if r["state"] in ("saving", "resuming"):
             # its VMs are kept either way (a saving lab is always "keep"); Resume brings it back from any of these
             r.update(state="saved", reason=f"the control panel was restarted while {r['state']}; Resume to boot it again")
@@ -1753,7 +1756,13 @@ def validate_team(raw, node_names):
             raise ValueError(f"{agent} needs a brief: what this agent is responsible for")
         if len(brief) > 1000:
             raise ValueError(f"{agent}'s brief is too long (max 1000 characters)")
-        members.append({"agent": agent, "nodes": list(nodes), "stage": stage, "brief": brief})
+        try:
+            role, brief = lr.role_of(brief)            # '[web-admin] serves the feed' -> role and the brief
+        except ValueError as e:
+            raise ValueError(f"{agent}: {e}")
+        if not brief:
+            raise ValueError(f"{agent} needs a brief after its role")
+        members.append({"agent": agent, "nodes": list(nodes), "stage": stage, "brief": brief, "role": role})
     if not members:
         raise ValueError("a team needs at least one member")
     if len(members) > TEAM_MAX:
@@ -1771,12 +1780,14 @@ def member_prompt(r, task, m, team):
     node_lines = "\n".join(f"- {n} ({r['nodes'][n]['role']}): ./vmrun-{n} '<cmd>'" for n in m["nodes"])
     others = "; ".join(f"{x['agent']} ({', '.join(x['nodes'])}): {x['brief']}" for x in team if x is not m) or "none"
     parts = [f"Shared goal (the whole team works on this):\n{goal}",
-             f"Your role: {m['brief']}",
+             lr.describe(m.get("role")) or f"Your role: {m['brief']}",
+             f"Your task: {m['brief']}" if m.get("role") else None,
              f"Your nodes (run commands from your working directory):\n{node_lines}\n"
              + vr.VMRUN_HOWTO.format(cmd=f"./vmrun-{m['nodes'][0]}"),
              f"Other team members, each on their own nodes: {others}. You can't message them; say in your reply what you "
              "need from them.",
              "Lab links are each node's 2nd+ interfaces, unaddressed. Leave enp0s3 alone and don't use 10.0.2.0/24."]
+    parts = [p for p in parts if p]
     if (r.get("egress") or {}).get("port"):
         parts.append(f"Internet: documentation and package sites only, through the proxy {le.proxy_url(r['egress']['port'])}; "
                      "apt and pip already use it.")
@@ -1798,7 +1809,8 @@ def topo_member_turn(r, topology, node_ports, priv, m, team):
         wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519",
                                   vr.relay_port_for_node(topology, name), "bench@vm-relay-topo",
                                   "/home/node/.openclaw/workspace/vm-session-topo.log", node=name,
-                                  budget_file=TOPO_BUDGET_FILE if r.get("budget") else None)
+                                  budget_file=TOPO_BUDGET_FILE if r.get("budget") else None,
+                                  deny=lr.denied_patterns(m.get("role")))
         dc(agent, "exec", "-T", "gateway", "sh", "-c",
            f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
            input=wrapper, timeout=20)
