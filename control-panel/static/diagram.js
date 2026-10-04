@@ -1,10 +1,10 @@
 "use strict";
 /* Topology diagrams: draws a lab (or a topology / lab file not built yet) as an SVG: nodes laid out in columns by hop
-   distance from the most connected node, links labeled at each end with that node's interface and, when a snapshot
-   is available, its addresses. Shared by the lab view and the new-lab previews. No external libraries: the panel
+   distance from one end of the network's longest path (so a chain reads left to right), links labeled just outside
+   each end's box with that node's interface and, when a snapshot is available, its addresses. Shared by the lab view and the new-lab previews. No external libraries: the panel
    only loads its own files. */
 
-const TDG = { colW: 210, rowH: 96, boxW: 118, boxH: 46, pad: 30 };
+const TDG = { colW: 290, rowH: 110, boxW: 112, boxH: 44, pad: 40, labelW: 150 };
 const TDG_ROLE_MARK = { router: "R", switch: "SW", host: "H", firewall: "FW", loadbalancer: "LB", server: "SRV", upstream: "NET" };
 
 /* `d`: {nodes: [{name, role}], links: [{a, b, a_if?, b_if?}], addresses?: {node: {iface: [cidr]}}} */
@@ -20,12 +20,18 @@ function renderTopologyDiagram(d) {
   const adj = Object.fromEntries(names.map(n => [n, []]));
   for (const l of d.links) { if (adj[l.a] && adj[l.b]) { adj[l.a].push(l.b); adj[l.b].push(l.a); } }
 
-  // columns = BFS distance from the most connected node; disconnected pieces continue to the right
+  // columns = BFS distance from one end of each piece's longest path (found by a BFS from any node: the farthest node
+  // it reaches is such an end); disconnected pieces continue to the right
+  const bfsFar = start => {
+    const dist = { [start]: 0 }, q = [start]; let far = start;
+    while (q.length) { const c = q.shift(); if (dist[c] > dist[far]) far = c; for (const nb of adj[c]) if (!(nb in dist)) { dist[nb] = dist[c] + 1; q.push(nb); } }
+    return far;
+  };
   const col = {}, order = [];
-  const roots = [...names].sort((x, y) => adj[y].length - adj[x].length);
   let base = 0;
-  for (const root of roots) {
-    if (root in col) continue;
+  for (const any of names) {
+    if (any in col) continue;
+    const root = bfsFar(any);
     col[root] = base; const queue = [root]; let maxc = base;
     while (queue.length) {
       const cur = queue.shift(); order.push(cur); maxc = Math.max(maxc, col[cur]);
@@ -37,10 +43,10 @@ function renderTopologyDiagram(d) {
   for (const n of order) { const c = col[n]; rows[c] = (rows[c] || 0) + 1; pos[n] = { c, r: rows[c] - 1 }; }
   const maxRows = Math.max(1, ...Object.values(rows));
   const cols = Math.max(1, ...Object.values(col).map(c => c + 1));
-  const W = TDG.pad * 2 + (cols - 1) * TDG.colW + TDG.boxW, H = TDG.pad * 2 + (maxRows - 1) * TDG.rowH + TDG.boxH;
+  const W = TDG.pad * 2 + (cols - 1) * TDG.colW + TDG.boxW + TDG.labelW, H = TDG.pad * 2 + (maxRows - 1) * TDG.rowH + TDG.boxH + 24;
   const center = n => {
     const off = (maxRows - rows[pos[n].c]) * TDG.rowH / 2;      // centre short columns vertically
-    return { x: TDG.pad + pos[n].c * TDG.colW + TDG.boxW / 2, y: TDG.pad + off + pos[n].r * TDG.rowH + TDG.boxH / 2 };
+    return { x: TDG.pad + TDG.labelW / 2 + pos[n].c * TDG.colW + TDG.boxW / 2, y: TDG.pad + off + pos[n].r * TDG.rowH + TDG.boxH / 2 };
   };
 
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, class: "tdg", role: "img",
@@ -61,9 +67,14 @@ function renderTopologyDiagram(d) {
     for (const [from, to, node, iface] of [[A, B, l.a, l.a_if], [B, A, l.b, l.b_if]]) {
       const lines = endLabel(node, iface);
       if (!lines.length) continue;
-      const t = 0.5 * (TDG.boxW + 24) / Math.max(1, Math.hypot(to.x - from.x, to.y - from.y));   // just outside the box
-      const x = from.x + (to.x - from.x) * Math.min(t, 0.45), y = from.y + (to.y - from.y) * Math.min(t, 0.45);
-      const text = el("text", { x, y: y - (lines.length - 1) * 6, class: "tdg-if", "text-anchor": "middle" });
+      // where the link leaves this node's box, then a little further along it; anchored away from the box
+      const len = Math.max(1, Math.hypot(to.x - from.x, to.y - from.y)), ux = (to.x - from.x) / len, uy = (to.y - from.y) / len;
+      const t = Math.min(TDG.boxW / 2 / Math.max(Math.abs(ux), 1e-6), TDG.boxH / 2 / Math.max(Math.abs(uy), 1e-6)) + 6;
+      const x = from.x + ux * t, y = from.y + uy * t;
+      const sideways = Math.abs(ux) >= Math.abs(uy) * 0.6;
+      const anchor = sideways ? (ux > 0 ? "start" : "end") : "middle";
+      const y0 = sideways ? y - 5 - (lines.length - 1) * 12 : (uy > 0 ? y + 9 : y - 3 - (lines.length - 1) * 12);
+      const text = el("text", { x, y: y0, class: "tdg-if", "text-anchor": anchor });
       lines.forEach((ln, i) => text.append(el("tspan", { x, dy: i ? 12 : 0 }, ln)));
       svg.append(text);
     }
