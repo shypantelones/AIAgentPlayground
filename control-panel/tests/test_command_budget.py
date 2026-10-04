@@ -115,6 +115,30 @@ class WrapperBudgetRaceTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class StaleLockTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform.startswith("win"), "runs the wrapper with sh and a fake ssh")
+    def test_a_lock_left_by_a_dead_command_does_not_block_the_next_one(self):
+        import os, subprocess, time
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            b = tmp / "bin"; b.mkdir()
+            (b / "ssh").write_text("#!/bin/sh\ncat >/dev/null 2>&1\necho ran\n"); (b / "ssh").chmod(0o755)
+            budget = tmp / "budget"; budget.write_text("3")
+            lock = tmp / "budget.lock"; lock.write_text("")
+            old = time.time() - 3600
+            os.utime(lock, (old, old))                       # left an hour ago
+            w = tmp / "vmrun-h1"
+            w.write_text(vr.vmrun_script("/k", 1, "h", str(tmp / "log"), node="h1", budget_file=str(budget)))
+            env = dict(os.environ, PATH=f"{b}{os.pathsep}{os.environ['PATH']}")
+            p = subprocess.run(["sh", str(w), "echo ok"], env=env, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(budget.read_text().strip(), "2")
+            self.assertFalse(lock.exists())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class WrapperBudgetTests(unittest.TestCase):
     def test_the_wrapper_takes_one_from_the_budget_and_refuses_at_zero(self):
         self.assertIn('echo $((n - 1)) > "/w/.vmrun-budget.tmp" && mv "/w/.vmrun-budget.tmp" "/w/.vmrun-budget"',
