@@ -1788,6 +1788,12 @@ def member_prompt(r, task, m, team):
              "need from them.",
              "Lab links are each node's 2nd+ interfaces, unaddressed. Leave enp0s3 alone and don't use 10.0.2.0/24."]
     parts = [p for p in parts if p]
+    allow = lr.SUDO_ALLOW.get(m.get("role")) or []
+    if allow:
+        # Your login can't open a root shell: each privileged command is run on its own, with sudo -n.
+        parts.append("Privileged commands: your login may run these with sudo, one command at a time: "
+                     + ", ".join(allow) + ". Write e.g. `sudo -n iptables -A FORWARD ...`; `sudo bash` and other "
+                     "shells are refused, so don't wrap commands in one.")
     if (r.get("egress") or {}).get("port"):
         parts.append(f"Internet: documentation and package sites only, through the proxy {le.proxy_url(r['egress']['port'])}; "
                      "apt and pip already use it.")
