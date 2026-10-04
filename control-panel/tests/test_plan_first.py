@@ -113,6 +113,8 @@ class ApprovalTests(PlanBase):
                 mock.patch.object(app, "dc", return_value=(0, "", "")), \
                 mock.patch.object(app, "run", return_value=(0, "", "")), \
                 mock.patch.object(app, "detach_topo_agent"), \
+                mock.patch.object(app, "env_file", return_value=self.tmp / "agent.env"), \
+                mock.patch.object(app, "proj", return_value="proj"), \
                 mock.patch.object(app.vr, "relay_command", return_value="cmd"):
             app.topo_agent_phase(self.run, topology, {"h1": 2201, "h2": 2202, "sw1": 2203}, priv, None, lambda: False)
         prompt = turn.call_args.args[1]
