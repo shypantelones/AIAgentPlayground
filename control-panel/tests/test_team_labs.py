@@ -137,11 +137,16 @@ class MemberRelayTests(unittest.TestCase):
         self.priv.write_text("key")
         # Records are saved while these run: keep them out of the real data folder.
         (self.tmp / "topo-runs").mkdir()
-        self.patch = mock.patch.object(app, "TOPOR_DIR", self.tmp / "topo-runs")
-        self.patch.start()
+        self.patches = [mock.patch.object(app, "TOPOR_DIR", self.tmp / "topo-runs"),
+                        # no real agent is needed: the compose project and env file are only names here
+                        mock.patch.object(app, "env_file", return_value=self.tmp / "agent.env"),
+                        mock.patch.object(app, "proj", return_value="proj")]
+        for p in self.patches:
+            p.start()
 
     def tearDown(self):
-        self.patch.stop()
+        for p in self.patches:
+            p.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_a_member_gets_a_relay_and_wrappers_for_its_nodes_only(self):
