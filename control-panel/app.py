@@ -844,6 +844,7 @@ def store_token(name, token):
 #     click "Open terminal", published to 127.0.0.1 only, with a fresh random credential each time.
 import vm_runner as vr  # noqa: E402  (Vagrant/VirtualBox lifecycle; pure logic is testable without Docker/VirtualBox)
 import lab_intents as li  # noqa: E402  (intent lines -> checks run from each source node; pure logic, tested alone)
+import lab_egress as le  # noqa: E402  (what a lab VM may reach on the internet, and the proxy that enforces it)
 import lab_changes as lc  # noqa: E402  (a lab's change log: the agent's commands per node and turn; pure logic)
 
 VMR_DIR = ROOT / "data" / "vm-runs"
@@ -1433,6 +1434,7 @@ TOPOR_DIR = ROOT / "data" / "topo-runs"
 TOPOR_DIR.mkdir(parents=True, exist_ok=True)
 TOPO_RUNS = {}           # run id -> live record (also persisted to data/topo-runs/<id>.json)
 TOPO_LOCK = threading.RLock()
+VAGRANT_UP_LOCK = threading.Lock()      # serializes `vagrant up` across labs (see topo_run_runner)
 TOPO_TERM_CREDS = {}     # "<run id>:<node>" -> current terminal credential; kept in memory only, never persisted
 TOPO_STOP = {}           # run id -> bool, polled by the runner thread at phase boundaries
 TOPO_RUN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
@@ -1517,6 +1519,7 @@ def topo_run_view(r, full=False):
         v["diagram"] = topo_run_diagram(r)
     v["captures"] = [{k: c.get(k) for k in ("id", "node", "iface", "seconds", "state", "size", "reason", "ts")}
                      for c in r.get("captures") or []]
+    v["egress"] = {k: (r.get("egress") or {}).get(k) for k in ("domains", "extra", "port")} if r.get("egress") else None
     v["changes"] = r.get("changes") or []
     v["plan_first"] = bool(r.get("plan_first"))
     v["plan"] = r.get("plan")
@@ -1605,6 +1608,15 @@ def create_topo_run(form):
     plan_first = bool(form.get("plan_first"))
     if plan_first and not agent:
         raise ValueError("a plan needs an agent to write it")
+    # Internet for the lab's VMs: documentation and package sites for its roles, plus any domains typed in for a niche
+    # tool. The port (and so the proxy) is picked when the lab is built; see topo_run_runner.
+    extra = [x for x in str(form.get("extra_domains") or "").splitlines() if x.strip()]
+    egress_domains = le.allowlist_for(sorted({n["role"] for n in topology["nodes"]}), extra)
+    # The proxy is reached over a host-only adapter, which takes one of VirtualBox's 8 adapter slots (the NAT one is
+    # the first): a node with internet can have at most 6 lab links.
+    busiest = max((len(vr.links_for_node(topology, n["name"])) for n in topology["nodes"]), default=0)
+    if busiest > 6:
+        raise ValueError(f"a lab with internet access allows 6 links per node, and one node here has {busiest}")
     # Intents are checked by name against this lab's nodes, so a typo fails here instead of as a red X later.
     intents = li.parse_intents(labfile["intents"] if labfile else form.get("intents"),
                                [n["name"] for n in topology["nodes"]])
@@ -1625,7 +1637,8 @@ def create_topo_run(form):
          "agent_model": agent_model_id(load_meta(agent)) if agent else None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": "",
          "intents": intents, "intent_results": None,
-         "plan_first": plan_first, "plan": None, "plan_approved": False}
+         "plan_first": plan_first, "plan": None, "plan_approved": False,
+         "egress": {"domains": egress_domains, "extra": extra, "port": None}}
     TOPO_RUNS[rid] = r
     save_topo_run(r)
     threading.Thread(target=topo_run_runner, args=(rid,), daemon=True).start()
@@ -1644,6 +1657,31 @@ def create_topo_benchmark(form):
         sub.pop("agents", None)
         ids.append(create_topo_run(sub))
     return bid, ids
+
+
+def egress_project(rid):
+    return f"aiagentplayground-egress-{rid}"
+
+
+def egress_up(r):
+    """Start this lab's internet proxy (idempotent). Its allowlist and config live with the lab's VMs."""
+    eg = topo_run_dir(r["id"]) / "egress"
+    eg.mkdir(parents=True, exist_ok=True)
+    allow = eg / "allowlist.txt"
+    allow.write_text("\n".join(r["egress"]["domains"]) + "\n")
+    conf = eg / "squid.conf"
+    conf.write_text(le.squid_conf())
+    compose = eg / "compose.yml"
+    compose.write_text(le.proxy_compose(egress_project(r["id"]), r["egress"]["port"], allow.resolve(), conf.resolve()))
+    rc, out, err = run([DOCKER, "compose", "-p", egress_project(r["id"]), "-f", str(compose), "up", "-d"], timeout=180)
+    if rc != 0:
+        raise RuntimeError(f"could not start the lab's internet proxy: {(err or out).strip()[-300:]}")
+
+
+def egress_down(rid):
+    compose = topo_run_dir(rid) / "egress" / "compose.yml"
+    if compose.exists():
+        run([DOCKER, "compose", "-p", egress_project(rid), "-f", str(compose), "down"], timeout=120)
 
 
 def topo_run_runner(rid):
@@ -1689,8 +1727,16 @@ def topo_run_runner(rid):
                 node_ports[name] = port
         for name, port in node_ports.items():
             r["nodes"][name]["ssh_port"] = port
+        egress_port = None
+        if r.get("egress"):
+            with TOPO_LOCK:                               # one proxy port per lab, kept for the lab's life (save/resume too)
+                eg_taken = {x["egress"]["port"] for x in TOPO_RUNS.values() if (x.get("egress") or {}).get("port")}
+                r["egress"]["port"] = egress_port = vr.allocate_port(le.PROXY_PORT_RANGE, eg_taken)
+            topo_log(r, f"starting the lab's internet proxy on 127.0.0.1:{egress_port} (documentation and package sites only)...")
+            egress_up(r)
         save_topo_run(r)
-        vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"])
+        vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"],
+                                       egress_port=egress_port)
         timeout = 900 + 300 * (len(topology["nodes"]) - 1)
         topo_log(r, f"starting {len(topology['nodes'])} VMs for '{r['topology_title']}' (first run also downloads the {vr.BOX} image)...")
         # --no-parallel: the VirtualBox provider parallelizes multi-machine `up` by default, which on real
@@ -1709,8 +1755,11 @@ def topo_run_runner(rid):
             if idx != -1:
                 topo_log(r, line[idx:])
         for attempt in range(vr.PORT_COLLISION_RETRIES + 1):
-            rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
-                                             on_line=on_vagrant_line, cancel=stopped)
+            # One lab's `vagrant up` at a time: two labs booting together hit VirtualBox's machine locks ("unexpected
+            # process has tried to lock the machine") and one lab fails. Each lab's own build is still sequential.
+            with VAGRANT_UP_LOCK:
+                rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
+                                                 on_line=on_vagrant_line, cancel=stopped)
             busy = vr.port_collision(out) if rc != 0 and not stopped() else None
             node = next((n for n, p in node_ports.items() if p == busy), None)
             if node is None or attempt == vr.PORT_COLLISION_RETRIES:
@@ -1795,6 +1844,10 @@ def topo_run_runner(rid):
                     vr.vagrant(d, "destroy", "-f", timeout=180)
                 except Exception:
                     pass
+            try:
+                egress_down(rid)
+            except Exception:  # noqa - the proxy is removed with the lab; a failure here must not block the cleanup
+                pass
             shutil.rmtree(d, ignore_errors=True)
         TOPO_STOP.pop(rid, None)
 
@@ -1894,6 +1947,13 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         "Your user may send more guidance after you reply; the lab stays available until they end the session."
         if r.get("interactive") else "",
     ]
+    if (r.get("egress") or {}).get("port"):
+        # Only the documentation and package sites on the allowlist are reachable, through the lab's proxy.
+        url = le.proxy_url(r["egress"]["port"])
+        sites = ", ".join(d.lstrip(".") for d in r["egress"]["domains"])
+        hints.append(f"The lab has no general internet. Documentation and package sites are reachable through the proxy "
+                     f"{url}: apt and pip already use it; for anything else use curl -x {url} https://<site>. "
+                     f"Allowed sites: {sites}. The 192.168.56.x interface is that link to the proxy: leave it alone.")
     if r.get("intents"):
         hints.append("Your lab has to meet these intents. They're checked from the source node after each of your "
                      "turns:\n" + li.summary_for_prompt(r["intents"]))
@@ -2506,6 +2566,8 @@ def topo_resume_runner(rid):
             idx = line.find("==>")
             if idx != -1:
                 topo_log(r, line[idx:])
+        if r.get("egress"):
+            egress_up(r)                                  # the VMs' firewall points at this proxy; it must be up first
         rc, out, err = vr.vagrant_stream(d, "resume", "--no-provision", timeout=300 + 120 * my_slots,
                                          on_line=on_vagrant_line, cancel=stopped)
         if stopped():
@@ -2610,6 +2672,10 @@ def delete_topo_run(rid):
         if node.get("terminal", {}).get("active"):
             stop_topo_terminal(rid, name, quiet=True)
     d = topo_run_dir(rid)
+    try:
+        egress_down(rid)                                  # before the folder goes: its compose file lives there
+    except Exception:  # noqa
+        pass
     if d.exists():
         vr.vagrant(d, "destroy", "-f", timeout=180)
         shutil.rmtree(d, ignore_errors=True)

@@ -13,6 +13,8 @@ A VM never gets a route to the host, to another VM, or to any agent other than t
 import base64, ipaddress, json, os, re, secrets, shlex, shutil, signal, socket, subprocess, sys, threading, time
 from pathlib import Path
 
+import lab_egress  # the internet policy for labs (presets, proxy and VM firewall config)
+
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOWS = sys.platform.startswith("win")
 CANCELLED_RC = 130     # returned by vagrant_stream() when its `cancel` check asked it to stop
@@ -1088,11 +1090,15 @@ echo 'upstream ok' > /var/www/html/index.html
 """
 
 
-def _topo_provision_script(role, pubkey_text):
+def _topo_provision_script(role, pubkey_text, egress_port=None, lab_ifaces=(), vm_ip=None):
+    """`egress_port`: the lab's internet proxy port on the host (see lab_egress). Given, along with this VM's host-only
+    address `vm_ip`, the VM's apt and pip go through that proxy before the first `apt-get update`, and its outbound
+    firewall is set up last, once the role's own networking exists. None (the default) leaves the VM's internet as
+    it was."""
     common = """#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
+{egress_before}apt-get update -y
 apt-get install -y {pkgs}
 useradd -m -s /bin/bash bench || true
 mkdir -p /home/bench/.ssh
@@ -1100,7 +1106,7 @@ echo '{pubkey}' > /home/bench/.ssh/authorized_keys
 chmod 700 /home/bench/.ssh && chmod 600 /home/bench/.ssh/authorized_keys
 chown -R bench:bench /home/bench
 echo 'bench ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/90-bench
-{extra}"""
+{extra}{egress_after}"""
     if role == "switch":
         # Config-free "unmanaged switch" by default: bridge every lab-facing NIC (anything but the NAT nic1,
         # which is always the interface already configured with an address) into one L2 broadcast domain.
@@ -1162,10 +1168,16 @@ ip link set br0 up
         # unlike the offline coding-task VMs above, this VM's whole point is reaching its neighbors.
         pkgs = "iproute2 iputils-ping traceroute tcpdump isc-dhcp-client curl dnsutils"   # DHCP client, web and DNS tests
         extra = ""
-    return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra)
+    egress_before = egress_after = ""
+    if egress_port is not None:
+        pkgs += " ufw"
+        egress_before = lab_egress.egress_script(egress_port, vm_ip)
+        egress_after = lab_egress.firewall_script(egress_port, lab_ifaces, vm_ip)
+    return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra,
+                         egress_before=egress_before, egress_after=egress_after)
 
 
-def render_topology_vagrantfile(run_dir, rid, topology, node_ports, pubkey_text, memory_mb, cpus):
+def render_topology_vagrantfile(run_dir, rid, topology, node_ports, pubkey_text, memory_mb, cpus, egress_port=None):
     """One multi-machine Vagrantfile (a config.vm.define block per node) plus one provision-<node>.sh per node.
     `node_ports`: {node_name: host_ssh_port}. Mirrors render_vagrantfile()'s isolation choices (NAT-only nic1,
     no synced folder, only SSH forwarded and only to 127.0.0.1, clipboard/dnd/audio disabled) for every node, and
@@ -1173,16 +1185,22 @@ def render_topology_vagrantfile(run_dir, rid, topology, node_ports, pubkey_text,
     itself - the agent (or you) must."""
     links = topology["links"]
     blocks = []
-    for node in topology["nodes"]:
+    for node_index, node in enumerate(topology["nodes"]):
         name = node["name"]
         vm_name = vm_name_for_node(rid, name)
         port = node_ports[name]
         prov_file = f"provision-{name}.sh"
-        _write_lf(run_dir / prov_file, _topo_provision_script(node["role"], pubkey_text))
+        # With internet, the lab's proxy is on the host-only network: every such VM gets one more adapter there, last
+        # (so the lab-link names don't move), with a fixed address that the provisioning script checks for.
+        vm_ip = lab_egress.vm_host_only_ip(egress_port, node_index) if egress_port is not None else None
+        _write_lf(run_dir / prov_file, _topo_provision_script(
+            node["role"], pubkey_text, egress_port, lab_iface_names(topology, name) if egress_port is not None else (), vm_ip))
         my_link_idxs = [idx for idx, link in enumerate(links) if name in (link["a"], link["b"])]
-        net_lines = "\n".join(
-            f'    node.vm.network "private_network", virtualbox__intnet: "{intnet_name(rid, idx)}", auto_config: false'
-            for idx in my_link_idxs)
+        net_lines = [f'    node.vm.network "private_network", virtualbox__intnet: "{intnet_name(rid, idx)}", auto_config: false'
+                     for idx in my_link_idxs]
+        if vm_ip:
+            net_lines.append(f'    node.vm.network "private_network", ip: "{vm_ip}"')
+        net_lines = "\n".join(net_lines)
         # A switch must receive frames addressed to OTHER MACs on each lab link to bridge them at all - VirtualBox
         # defaults every NIC's promiscuous policy to "deny", which silently drops exactly that return traffic at
         # the hypervisor level (confirmed on real hardware: ARP requests/broadcasts got through fine, since

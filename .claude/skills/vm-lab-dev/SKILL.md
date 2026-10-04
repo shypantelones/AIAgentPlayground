@@ -361,3 +361,71 @@ approval. `attach_agent_to_lab` refuses a plan-first lab until it's approved.
   rollback, captures or plan-first done.
 - The static JS (`vmtopo.js`) isn't syntax-checked by CI (CI runs Python
   only). Load a lab's view in a browser after UI changes.
+
+## Lab internet (lab_egress.py, host-only proxy)
+
+Lab VMs reach only documentation and package sites for their roles, plus
+per-lab extra domains. The policy and config generators are pure
+(`lab_egress.py`); `app.py` runs the proxy and `vm_runner.py` places the
+generated shell in each node's provision script.
+
+- **Presets:** `PRESETS` (by tool) and `ROLE_PRESETS` (by role). An
+  upstream node gets none. `allowlist_for(roles, extra)` gives the lab's
+  domain list; the user's extra domains are validated and capped at 50.
+- **Proxy:** one squid container per lab (`aiagentplayground-egress-<rid>`),
+  published on the host-only address `192.168.56.1:<port>`, never the LAN.
+  Ports come from `PROXY_PORT_RANGE` (62500-62513, 14 labs). The port is
+  picked in `topo_run_runner` and kept across save/resume. `egress_up`
+  starts it before `vagrant up`; `egress_down` stops it. Teardown and delete
+  must call `egress_down` **before** the lab folder is removed, because the
+  compose file lives there.
+- **VM network:** every VM with internet gets one extra `private_network`
+  adapter, last, at `vm_host_only_ip(port, node_index)`: a block of 12
+  addresses per proxy slot starting at `.20`. The provision script waits for
+  that address before apt, and the firewall finds the adapter by address
+  (its guest name depends on the link count).
+- **Firewall:** default-deny outbound; allowed are lab links, loopback and
+  the proxy. Inbound on the host-only adapter is denied. Routers get
+  `ufw default allow routed` plus `route deny out` on the NAT and host-only
+  adapters, so forwarded traffic can't leave the lab.
+- **Adapter limit:** VirtualBox allows 8 adapters per VM. NAT and host-only
+  take two, so a node with internet has at most 6 lab links. Checked in
+  `create_topo_run`.
+- **Why host-only:** the NAT gateway (`10.0.2.2`) can't carry VM traffic to
+  the host's loopback on this setup ("Network is unreachable", even for the
+  panel's own port 8765). Verified from a real VM.
+- **Verified on real VMs (two hosts, one switch):** allowed sites 200 through
+  the proxy; off-list site 403 from squid; direct internet times out; apt
+  updates through the proxy.
+- **Verified with a router and two labs:** routing through the router; each
+  host's proxy access on its own adapter; the router forwarding block (a host
+  reaching the proxy through the router times out); no direct internet from
+  router or hosts; no ICMP or TCP between labs on the host-only network (checked
+  with outbound open on the sending side). Details are in the README.
+- **ufw gotcha:** ufw accepts ICMP echo before its user rules, so `deny in` on
+  an adapter doesn't stop ping. `firewall_script` adds an `iptables -I INPUT 1
+  ... --ctstate NEW -j DROP` for the host-only adapter; only NEW is matched so
+  proxy replies still arrive.
+- **Serialized builds:** `VAGRANT_UP_LOCK` makes `vagrant up` one lab at a time.
+  Two labs booting together failed with a VirtualBox machine-lock error.
+- **Not yet verified:** a lab-file rebuild with the host-only adapter present
+  (the extra address may show up in configs); presets for real apps beyond
+  apt/pip; the panel's slot limit under many labs.
+- **Gotchas hit:** a shell `\n` inside a Python f-string is written `\\n`
+  in the source (the f-string turns it into `\n` for the shell). The
+  PowerShell wrapper used to run `vagrant` from WSL treats `{...}` as a
+  script block, so avoid `%{http_code}` there and use exit codes instead.
+  Two panel processes can run at once if the old launcher isn't stopped:
+  check the bound port before testing.
+
+## Recording changes (required in every PR)
+
+Every PR that changes lab behaviour records, in the same PR:
+1. The feature in `control-panel/README.md` (the Network workbench section),
+   including its trade-offs, and anything decided against and why.
+2. The same feature and trade-offs in this skill, in the section for that
+   area, with any gotchas hit.
+3. What is not yet verified on real VMs, so a reviewer can see it.
+
+A feature isn't finished until these are written down. Reviewers check this
+before merging.

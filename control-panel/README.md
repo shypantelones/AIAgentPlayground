@@ -148,6 +148,67 @@ Topology labs are built to be worked in and kept, not only run once. From a lab'
   agent; the drafting, checking and building around it have.)
 - **Attach an agent to a lab that already exists**, and benchmark several agents on the same topology task.
 
+#### Internet access for labs
+Lab VMs don't get open internet. A lab reaches documentation and package sites for its roles, plus any domains you
+add for a niche tool (the "Internet" group in the new-lab form). Presets are in `lab_egress.py`:
+
+| Role | Gets presets for |
+|---|---|
+| host, server | OS packages, Python, Node, web servers, databases |
+| loadbalancer | OS packages, web servers |
+| router | OS packages, routing (FRR, nftables, kernel docs) |
+| firewall | OS packages, nftables |
+| switch | OS packages |
+| upstream | nothing (it stands in for the internet) |
+
+How it works:
+- Each lab runs its own squid proxy with that allowlist. It listens on VirtualBox's host-only network address
+  (`192.168.56.1`), not the LAN. Each lab VM gets a second adapter on that network with its own address.
+- apt and pip use the proxy. Other tools use it explicitly: `curl -x http://192.168.56.1:<port> https://<site>`.
+  The agent is told the proxy address and the allowed sites.
+- The VM firewall is default-deny outbound: lab links, loopback and the proxy only. Inbound on the host-only adapter is
+  refused, so labs can't reach each other through it.
+
+Trade-offs (decided, and why):
+- **Host-only, not the NAT gateway.** The NAT gateway (`10.0.2.2`) would be simpler, but on this setup it can't carry VM
+  traffic to the host's loopback ("Network is unreachable" from the VM, even for the panel's own port). Host-only also
+  gives a fixed address to filter on.
+- **Hostname allowlist, not IP allowlist.** The proxy checks the requested hostname, so CDN address changes don't break
+  it. The cost is one more moving part: a proxy per lab.
+- **At most 6 lab links per node with internet.** VirtualBox allows 8 adapters per VM; the NAT and host-only adapters
+  use two of them. Labs without internet don't have this limit.
+- **At most 14 labs with internet at a time.** Each lab takes one proxy port (`62500`-`62513`) and a block of 12 host-only
+  addresses. A lab that needs more is refused with "no free port".
+- **A router never carries internet traffic.** Routers can't forward traffic out to the proxy or the NAT, so a client
+  can't reach the internet through a router (deliberate: otherwise it would bypass the proxy). Each VM uses its own
+  host-only adapter to reach the proxy, so a host behind a router still gets documentation with `curl -x` or apt.
+- **Names are resolved by the proxy.** The VMs don't resolve internet names themselves. Tools that ignore proxy settings
+  (anything but apt, pip and explicit `curl -x`) can't reach the internet at all.
+- **Labs can't reach each other through the host-only network, but ufw alone didn't prove it.** ufw accepts ICMP
+  echo requests before its own rules, so a "deny in" on the host-only adapter still let another lab ping a VM. The
+  firewall also drops new inbound connections on that adapter, ahead of ufw. Replies to a VM's own proxy requests still
+  get through, because only `NEW` connections are dropped.
+- **Labs with internet build one at a time.** `vagrant up` is serialized across labs: two labs booting together hit
+  VirtualBox machine locks and one failed. Each lab's own build is still sequential, but a lab waiting for its turn
+  can't be cancelled until the one ahead of it finishes.
+- **Presets are a starting list.** Some sites load assets from other hosts (CDNs, package mirrors); a page can render
+  partly. Add the host to the lab's extra domains.
+- **Labs with internet take longer to build**: apt goes through the proxy, and the proxy is an extra container per lab.
+
+**Verified on real VMs** (lab A: `h1 - r1 - h2` with a router; lab B: two hosts on one link, both built at once):
+- Routing: h1 and h2 reach each other through r1 in both directions.
+- Proxy: each host reaches an allowed docs site through its own host-only adapter, including the host behind the router.
+  An off-list site gets a 403 from the proxy.
+- Forwarding: a host that tries to reach the proxy *through* the router times out.
+- Internet: the router and both hosts time out on direct internet access.
+- Labs: VMs of lab A can't ping or connect to lab B's VMs, with outbound open on the sending side too (so the inbound
+  rule is what blocks them). Lab A's and lab B's own internal traffic still works.
+
+## Development: record features and trade-offs in every PR
+Every PR that changes behaviour updates this README (the feature section and its trade-offs) and the `vm-lab-dev` skill
+(`.claude/skills/vm-lab-dev/`). A feature isn't finished until its trade-offs and any untested parts are written down
+there. Reviewers should check that before merging.
+
 ## Data
 `data/instances/<name>/` holds each agent's `.env` (dashboard token), proxy allowlist and chat history.
 Agent memory/workspace live in Docker volumes and are removed by "Delete agent".
