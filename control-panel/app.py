@@ -844,6 +844,7 @@ def store_token(name, token):
 #     click "Open terminal", published to 127.0.0.1 only, with a fresh random credential each time.
 import vm_runner as vr  # noqa: E402  (Vagrant/VirtualBox lifecycle; pure logic is testable without Docker/VirtualBox)
 import lab_intents as li  # noqa: E402  (intent lines -> checks run from each source node; pure logic, tested alone)
+import agent_costs as ac  # noqa: E402  (what an agent's commands cost, and how many a budget buys)
 import lab_egress as le  # noqa: E402  (what a lab VM may reach on the internet, and the proxy that enforces it)
 import lab_changes as lc  # noqa: E402  (a lab's change log: the agent's commands per node and turn; pure logic)
 
@@ -1528,6 +1529,7 @@ def topo_run_view(r, full=False):
                      for c in r.get("captures") or []]
     v["egress"] = {k: (r.get("egress") or {}).get(k) for k in ("domains", "extra", "port")} if r.get("egress") else None
     v["changes"] = r.get("changes") or []
+    v["budget"] = r.get("budget")
     v["team"] = [{k: m[k] for k in ("agent", "nodes", "stage", "brief")} for m in r["team"]] if r.get("team") else None
     v["plan_first"] = bool(r.get("plan_first"))
     v["plan"] = r.get("plan")
@@ -1614,18 +1616,21 @@ def create_topo_run(form):
     elif interactive:
         raise ValueError("attach an agent to start a session")
     team = validate_team(form.get("team"), [n["name"] for n in topology["nodes"]]) if form.get("team") else None
+    budget_members = [(agent, agent_model_id(load_meta(agent)))] if agent else []
     if team:
         if agent or interactive or form.get("plan_first"):
             raise ValueError("a team lab takes its members instead of one agent; sessions and plans are single-agent for now")
         if not task and not custom_prompt:
             raise ValueError("pick a task or write a shared goal for the team")
         for m in team:
-            load_meta(m["agent"])                     # raises KeyError if unknown
+            member_meta = load_meta(m["agent"])       # raises KeyError if unknown
+            budget_members.append((m["agent"], agent_model_id(member_meta)))
             if not agent_running(m["agent"]):
                 raise ValueError(f"{m['agent']} is not running; start it first")
             busy = [x for x in TOPO_RUNS.values() if agent_holds_lab(x, m["agent"])]
             if busy:
                 raise ValueError(f"{m['agent']} is already attached to lab {busy[0]['id']}; end or stop that lab first")
+    budget = lab_budget(form, budget_members)           # raises ValueError if the budget can't run a useful turn
     plan_first = bool(form.get("plan_first"))
     if plan_first and not agent:
         raise ValueError("a plan needs an agent to write it")
@@ -1659,6 +1664,7 @@ def create_topo_run(form):
          "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": "",
          "intents": intents, "intent_results": None,
          "team": [dict(m, chat=f"vmtopo-{rid}-{m['agent']}") for m in team] if team else None,
+         "budget": budget,
          "plan_first": plan_first, "plan": None, "plan_approved": False,
          "egress": {"domains": egress_domains, "extra": extra, "port": None}}
     TOPO_RUNS[rid] = r
@@ -1791,7 +1797,8 @@ def topo_member_turn(r, topology, node_ports, priv, m, team):
     for name in nodes:
         wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519",
                                   vr.relay_port_for_node(topology, name), "bench@vm-relay-topo",
-                                  "/home/node/.openclaw/workspace/vm-session-topo.log", node=name)
+                                  "/home/node/.openclaw/workspace/vm-session-topo.log", node=name,
+                                  budget_file=TOPO_BUDGET_FILE if r.get("budget") else None)
         dc(agent, "exec", "-T", "gateway", "sh", "-c",
            f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
            input=wrapper, timeout=20)
@@ -2087,7 +2094,8 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     for name in r["nodes"]:
         relay_port = vr.relay_port_for_node(topology, name)
         wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", relay_port,
-                                  "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log", node=name)
+                                  "bench@vm-relay-topo", "/home/node/.openclaw/workspace/vm-session-topo.log", node=name,
+                                  budget_file=TOPO_BUDGET_FILE if r.get("budget") else None)
         dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
            f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
            input=wrapper, timeout=20)
@@ -2463,6 +2471,32 @@ def detach_topo_agent(agent):
 
 
 TOPO_CHANGE_LOG = "vm-session-topo.log"
+TOPO_BUDGET_FILE = "/home/node/.openclaw/workspace/.vmrun-budget"   # read by the vmrun wrappers (see vm_runner)
+TOPO_BUDGET_MAX_USD = 20.0
+
+
+def lab_budget(form, members):
+    """The lab's command budget: each agent gets `budget_usd`, which buys a number of commands on its own model.
+    `members` is [(agent, model_id)]. Local (Ollama) agents cost no dollars, so they aren't budgeted. Returns
+    {usd, commands, used}, or None when no paid agent is in the lab."""
+    members = [(a, m) for a, m in members if not (m or "").startswith("ollama/")]
+    if not members:
+        return None
+    try:
+        usd = float(form.get("budget_usd") or 0.5)
+    except (TypeError, ValueError):
+        raise ValueError("the budget has to be a dollar amount, e.g. 0.50")
+    if not 0 < usd <= TOPO_BUDGET_MAX_USD:
+        raise ValueError(f"the budget has to be more than $0 and at most ${TOPO_BUDGET_MAX_USD:.0f}")
+    return {"usd": usd, "commands": {agent: ac.commands_for_budget(usd, model) for agent, model in members}, "used": {}}
+
+
+def budget_left(r, agent):
+    """Commands `agent` may still run in this lab, or None if it isn't budgeted."""
+    b = r.get("budget")
+    if not b or agent not in b["commands"]:
+        return None
+    return max(0, b["commands"].get(agent, 0) - b["used"].get(agent, 0))
 
 
 def read_agent_log(agent, log_name):
@@ -2553,6 +2587,11 @@ def topo_agent_turn(r, message, member=None):
     with VAGRANT_UP_LOCK:
         usable = snapshot_lab_vms(r, point)              # rollback point: the lab as this turn found it
     before = read_agent_log(agent, TOPO_CHANGE_LOG)
+    if r.get("budget"):                                  # the wrapper's allowance for this agent, from what's left
+        left = budget_left(r, agent)
+        # An unbudgeted agent clears the file: its workspace may still hold a count from an earlier lab.
+        cmd = f"echo {left} > {TOPO_BUDGET_FILE}" if left is not None else f"rm -f {TOPO_BUDGET_FILE}"
+        dc(agent, "exec", "-T", "gateway", "sh", "-c", cmd, timeout=20)
     turn = lambda: run_turn(agent, chat, message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200)
     if member is None:
         res = counted_agent_turn(r, message, TOPO_CHANGE_LOG, turn)
@@ -2569,11 +2608,15 @@ def topo_agent_turn(r, message, member=None):
     after = read_agent_log(agent, TOPO_CHANGE_LOG)
     commands = lc.new_entries(before, after) if before is not None and after is not None else []   # unknown: none listed
     with TOPO_LOCK:
+        if budget_left(r, agent) is not None:
+            b = r["budget"]
+            b["used"][agent] = b["used"].get(agent, 0) + len(commands)
         r.setdefault("changes", []).append({"turn": n, "agent": agent, "point": point if usable else None,
                                             "rolled_back": False, "commands": commands[:lc.MAX_PER_TURN],
                                             "command_count": len(commands)})
     save_topo_run(r)
-    topo_log(r, f"{agent}'s turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
+    topo_log(r, f"{agent}'s turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})"
+             + (f"; budget left: {budget_left(r, agent)} commands" if budget_left(r, agent) is not None else ""))
     try:                                    # what this turn left configured on the nodes, for review and diffs
         with VAGRANT_UP_LOCK:
             snap = take_topo_snapshot(r, f"after {agent}'s turn {n}")

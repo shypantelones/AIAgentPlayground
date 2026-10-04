@@ -188,7 +188,7 @@ class CreateTeamTests(unittest.TestCase):
         self.patches = [mock.patch.object(app, "TOPOR_DIR", self.tmp / "topo-runs"),
                         mock.patch.object(app, "load_meta", return_value={}),
                         mock.patch.object(app, "agent_running", return_value=True),
-                        mock.patch.object(app, "agent_model_id", return_value="m")]
+                        mock.patch.object(app, "agent_model_id", return_value="anthropic/claude-haiku-4-5")]
         for p in self.patches:
             p.start()
 

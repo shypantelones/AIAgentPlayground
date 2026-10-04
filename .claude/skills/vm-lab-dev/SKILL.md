@@ -442,6 +442,20 @@ generated shell in each node's provision script.
 - **Not yet verified:** more than two stages, save/resume of a team lab, and a member whose relay fails in a
   real lab.
 
+## Command budget (agent_costs.py)
+
+- `agent_costs.py` (pure): `PRICES` per model (same as the model menu in `app.py`), `cost_per_command`,
+  `commands_for_budget` (raises below `MIN_COMMANDS` or for an unpriced cloud model). Per-command cost assumes 12k
+  input and 300 output tokens; it is an estimate, not a measurement.
+- `lab_budget(form, members)` runs in `create_topo_run`: each paid member gets `budget_usd` worth of commands on its
+  model. Ollama members are skipped. `r["budget"] = {usd, commands, used}`; `budget_left(r, agent)`.
+- `topo_agent_turn` writes `TOPO_BUDGET_FILE` (in the agent workspace) before each turn, or removes it for an
+  unbudgeted agent, and charges `len(commands)` after. The `vmrun` wrapper (`vmrun_script(..., budget_file=)`) takes one per
+  command and refuses at zero. It's a runaway guard: the agent shares the workspace.
+- **Gotcha:** a model id with no price made every local-agent lab fail at creation until local agents were skipped. Test
+  budgets with priced cloud ids and local ids both.
+- **Not yet done:** the Model-tab warning, and a per-turn cap separate from the lab total.
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:
