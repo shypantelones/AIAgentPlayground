@@ -208,7 +208,8 @@ function renderVTRuns() {
 async function loadVTDetail() {
   let r; try { r = await api("/api/vmtopo/runs/" + vtSelRun); } catch { vtSelRun = null; return; }
   const key = [r.id, r.state, r.transcript.length, r.score && r.score.passed,
-              Object.values(r.nodes).map(n => n.terminal.active).join(","), (r.conversation || []).length].join("|");
+              Object.values(r.nodes).map(n => n.terminal.active).join(","), (r.conversation || []).length,
+              (r.captures || []).map(c => c.state).join(","), (r.intent_results || []).map(x => x.passed).join(",")].join("|");
   if (key === vtSig.detail) return;
   vtSig.detail = key;
   const live = ["queued", "provisioning", "working", "attached", "scoring", "resuming"].includes(r.state);
@@ -286,6 +287,7 @@ async function loadVTDetail() {
         `${x ? (x.passed ? "PASS" : "FAIL") : "—"}  ${text}${x ? `  (${x.detail})` : ""}`);
     })));
   }
+  if (["ready", "working", "attached", "done"].includes(r.state)) parts.push(vtCaptures(r));
   parts.push(h("div", { class: "hint" }, "Live transcript:"));
   parts.push(h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)"));
   replaceKeepingFocus(VT.detail, parts);
@@ -330,6 +332,29 @@ function vtAttachBox(r) {
    download it as a zip, or compare any two. The picks and the open view survive the detail view's redraws. */
 let vtSnap = { rid: null, picks: [], view: null };
 const VT_SNAP_STATES = ["ready", "working", "attached", "scoring", "done", "stopped"];
+
+/* Packet capture: tcpdump on one node's interface for a set time. The .pcap downloads for Wireshark. */
+function vtCaptures(r) {
+  const node = h("select", {}, ...Object.keys(r.nodes).map(n => h("option", { value: n }, n)));
+  const iface = h("input", { type: "text", value: "enp0s8", size: 10 });
+  const secs = h("input", { type: "number", value: 10, min: 1, max: 120, style: "width:5em" });
+  const msg = h("div", { class: "fail" });
+  const go = h("button", { onclick: async () => {
+    msg.textContent = "";
+    try {
+      await api(`/api/vmtopo/runs/${r.id}/nodes/${node.value}/capture`, { iface: iface.value.trim(), seconds: +secs.value });
+      vtSig.detail = ""; vtLoad();
+    } catch (e) { msg.textContent = e.message; }
+  } }, "Capture");
+  const list = (r.captures || []).slice().reverse().map(c => h("div", { class: c.state === "done" ? "pass" : c.state === "failed" ? "fail" : "hint" },
+    `${c.node} ${c.iface} ${c.seconds}s · ${c.state}${c.state === "done" ? ` (${c.size} bytes) ` : c.reason ? ` — ${c.reason} ` : " "}`,
+    c.state === "done" ? h("a", { href: `/api/vmtopo/runs/${r.id}/captures/${c.id}` }, "download .pcap") : null));
+  return h("div", { class: "col bench" },
+    h("b", {}, "Packet capture"),
+    h("p", { class: "hint" }, "Records one interface on one node with tcpdump, for the time you choose (up to 2 minutes). Open the .pcap in Wireshark."),
+    h("div", { class: "row" }, "Node", node, "Interface", iface, "Seconds", secs, go),
+    msg, ...list);
+}
 
 function vtSnapshots(r) {
   if (vtSnap.rid !== r.id) vtSnap = { rid: r.id, picks: [], view: null };
