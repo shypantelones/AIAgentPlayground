@@ -52,6 +52,17 @@ class LabBudgetTests(unittest.TestCase):
 
 
 class PerTurnCapTests(unittest.TestCase):
+    def setUp(self):
+        # topo_agent_turn saves the run record: keep it out of the real data folder
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "topo-runs").mkdir()
+        self.patch = mock.patch.object(app, "TOPOR_DIR", self.tmp / "topo-runs")
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
     def test_the_per_turn_cap_defaults_and_is_recorded(self):
         self.assertEqual(app.lab_budget({"budget_usd": 0.5}, [("alpha", HAIKU)])["per_turn"], app.TOPO_COMMAND_CAP_DEFAULT)
         self.assertEqual(app.lab_budget({"budget_usd": 0.5, "command_cap": "12"}, [("alpha", HAIKU)])["per_turn"], 12)

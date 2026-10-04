@@ -1501,6 +1501,8 @@ def load_topo_runs():
             r = json.loads(f.read_text())
         except Exception:
             continue
+        if "state" not in r or "id" not in r:
+            continue                                      # not a lab record: skip it, don't stop the panel starting
         if r["state"] in ("saving", "resuming"):
             # its VMs are kept either way (a saving lab is always "keep"); Resume brings it back from any of these
             r.update(state="saved", reason=f"the control panel was restarted while {r['state']}; Resume to boot it again")
