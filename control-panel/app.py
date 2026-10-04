@@ -1929,6 +1929,8 @@ def topo_member_turn(r, topology, node_ports, priv, m, team, prompt=None):
     topo_log(r, f"attaching {agent} to {', '.join(nodes)}...")
     member_dir = topo_run_dir(r["id"]) / "members" / agent
     member_dir.mkdir(parents=True, exist_ok=True)
+    for old_key in (member_dir / "id_ed25519", member_dir / "id_ed25519.pub"):
+        old_key.unlink(missing_ok=True)                    # ssh-keygen won't overwrite a key file without asking
     mpriv, mpub = vr.gen_keypair(member_dir)
     try:
         member_keys_set(r, node_ports, r["id"], m, mpub.read_text())
