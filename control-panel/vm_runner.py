@@ -307,7 +307,9 @@ if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save
 if command -v vtysh >/dev/null; then
   sec frr; sudo -n vtysh -c 'show running-config' 2>&1 | grep -v -e '^Building configuration' -e '^Current configuration:'
 fi
-for f in /etc/netplan/*.yaml /etc/frr/frr.conf /etc/frr/daemons /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf          /etc/nginx/sites-enabled/* /etc/nginx/streams-enabled/*; do
+sec services
+for s in dnsmasq nginx frr; do systemctl cat "$s" >/dev/null 2>&1 && echo "$s $(systemctl is-active "$s")"; done
+for f in /etc/dnsmasq.conf /etc/dnsmasq.d/*.conf /etc/netplan/*.yaml /etc/frr/frr.conf /etc/frr/daemons /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf          /etc/nginx/sites-enabled/* /etc/nginx/streams-enabled/*; do
   [ -f "$f" ] && { sec "file $f"; sudo -n cat "$f" 2>&1; }
 done
 true
@@ -346,7 +348,8 @@ LABFILE_VERSION = 1
 LABFILE_MAX_LINKS = 64
 LABFILE_MAX_TEXT = 200_000
 SETUP_IFACES = ("lo", "enp0s3")          # loopback and the NAT/setup NIC: never part of a lab's config
-APPLY_FILE_RE = re.compile(r"^/etc/(nginx|frr)/[A-Za-z0-9._/-]+$")     # service config files a lab file may restore
+APPLY_FILE_RE = re.compile(r"^/etc/((nginx|frr|dnsmasq\.d)/[A-Za-z0-9._/-]+|dnsmasq\.conf)$")   # service configs a lab file may restore
+APPLY_SERVICES = ("dnsmasq", "nginx", "frr")
 APPLY_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:/@%-]+$")                  # one word of an `ip` address/route
 APPLY_SYSCTL_RE = re.compile(r"^(net\.[a-z0-9_.]+) = (-?\d+)$")
 APPLY_SKIP_PROTOS = ("kernel", "dhcp", "ra")                           # routes the system creates on its own
@@ -476,6 +479,10 @@ def render_apply_script(sections):
         cmds.append("sudo -n nginx -t -q && sudo -n systemctl reload nginx")
     if restart_frr:
         cmds.append("sudo -n systemctl restart frr")
+    for line in sections.get("services", "").splitlines():         # services that were running are running again
+        toks = line.split()
+        if len(toks) == 2 and toks[0] in APPLY_SERVICES and toks[1] == "active":
+            cmds.append(f"sudo -n systemctl enable -q {toks[0]} && sudo -n systemctl restart {toks[0]}")
     body = "".join(f"{c} || echo {q('FAILED: ' + c[:200])}\n" for c in cmds)
     return f"{body}echo done\n", skipped
 
@@ -569,7 +576,7 @@ def config_mismatches(wanted, live):
     """Sections of a node's lab-file config that the rebuilt node doesn't match (addresses, routes, forwarding,
     firewall). [] means the rebuild is faithful."""
     out = []
-    for sec in ("addresses", "routes", "forwarding", "nftables", "frr", "bridge", "vlan interfaces"):
+    for sec in ("addresses", "routes", "forwarding", "nftables", "frr", "bridge", "vlan interfaces", "services"):
         if sec in wanted and _usable(wanted[sec]) and _compare_view(sec, wanted[sec]) != _compare_view(sec, live.get(sec, "")):
             out.append(sec)
     return out
@@ -611,7 +618,7 @@ def get_task(task_id):
 TOPO_SSH_PORT_RANGE = (62400, 62599)    # one per node, across all concurrently-provisioning topology runs
 TOPO_TERM_PORT_RANGE = (62600, 62799)   # one per active per-node web terminal
 NODE_NAME_RE = re.compile(r"^[a-z][a-z0-9]{0,14}$")
-NODE_ROLES = ("router", "switch", "host", "loadbalancer", "firewall")
+NODE_ROLES = ("router", "switch", "host", "loadbalancer", "firewall", "server", "upstream")
 TOPOLOGY_ID_RE = TASK_ID_RE             # same shape; kept as a separate name so the two catalogs can diverge later
 TOPOLOGY_FILE = Path(__file__).resolve().parent / "vm_topologies.json"
 TOPOLOGY_TASK_FILE = Path(__file__).resolve().parent / "vm_topology_tasks.json"
@@ -722,17 +729,9 @@ def vmrun_script(key_path, port, host, log_path):
             f"printf '%s\\n' \"$script\" | {ssh} 'bash -s' 2>&1 | tee -a \"$LOG\"\n")
 
 
-VMRUN_HOWTO = (
-    "Your own shell expands $variables inside double quotes before the command reaches the machine, so pass a "
-    "one-line command in single quotes, and send anything longer, or anything containing $, as a script on "
-    "standard input with a quoted heredoc - nothing inside it is changed:\n"
-    "{cmd} <<'EOF'\n"
-    "cat > /tmp/example.sh <<'INNER'\n"
-    "for i in 1 2 3; do echo \"$i\"; done\n"
-    "INNER\n"
-    "chmod +x /tmp/example.sh && /tmp/example.sh\n"
-    "EOF"
-)
+# Sent to the agent with every VM/lab prompt, so kept short (each word costs tokens on every run).
+VMRUN_HOWTO = ("Use single quotes for one-liners; send longer scripts or anything with $ as a quoted heredoc "
+               "(arrives unchanged): {cmd} <<'EOF' ... EOF")
 
 
 def relay_port_for_node(topology, name):
@@ -759,12 +758,14 @@ def relay_command(topology, node_ports):
 # validate_topology() - so render_topology_vagrantfile(), the lifecycle in app.py, and the frontend never need to
 # know or care whether a topology came from vm_topologies.json or was built here.
 MAX_CUSTOM_NODES = 12                   # safety cap: this project's "lightweight, bounded" posture applies here too
-ROLE_PREFIX = {"switch": "sw", "router": "r", "firewall": "fw", "loadbalancer": "lb", "host": "h"}
+ROLE_PREFIX = {"switch": "sw", "router": "r", "firewall": "fw", "loadbalancer": "lb", "host": "h", "server": "srv",
+               "upstream": "up"}
+ROLE_ORDER = ("switch", "router", "firewall", "loadbalancer", "server", "upstream", "host")   # naming / summary order
 
 
 def _named_nodes(counts):
     nodes = []
-    for role in ("switch", "router", "firewall", "loadbalancer", "host"):   # structural roles first, for readable names
+    for role in ROLE_ORDER:                                    # structural roles first, for readable names
         n = int(counts.get(role, 0) or 0)
         if n < 0:
             raise ValueError(f"count for '{role}' can't be negative")
@@ -787,7 +788,8 @@ def _chain_wiring(nodes):
     round-robin across the available switches, or onto the end of the chain if there are none."""
     switches = [n["name"] for n in nodes if n["role"] == "switch"]
     inline = [n["name"] for n in nodes if n["role"] in ("router", "firewall")]
-    leaves = [n["name"] for n in nodes if n["role"] in ("host", "loadbalancer")]
+    leaves = [n["name"] for n in nodes if n["role"] in ("host", "loadbalancer", "server")]
+    edges = [n["name"] for n in nodes if n["role"] == "upstream"]          # the outside world: off the last router
     if not switches and not inline:
         raise ValueError("chain wiring needs at least one switch, router or firewall")
     chain, si, ii = [], 0, 0
@@ -800,6 +802,9 @@ def _chain_wiring(nodes):
     anchors = switches or chain[-1:]
     for i, leaf in enumerate(leaves):
         links.append({"a": leaf, "b": anchors[i % len(anchors)]})
+    edge_anchor = ([n for n in chain if n in inline] or chain)[-1]
+    for edge in edges:
+        links.append({"a": edge_anchor, "b": edge})
     return links
 
 
@@ -810,7 +815,7 @@ def _manual_wiring(nodes, links):
 
 
 def build_custom_topology(counts, wiring, links=None):
-    """counts: {"host": n, "router": n, "switch": n, "loadbalancer": n, "firewall": n}. wiring: "star" | "chain" |
+    """counts: {role: n} for any of NODE_ROLES. wiring: "star" | "chain" |
     "manual" (the last needs `links`, a list of {"a", "b"} pairs naming the generated nodes - the frontend shows
     the generated name list as soon as counts are entered, before the user types links)."""
     nodes = _named_nodes(counts)
@@ -827,7 +832,7 @@ def build_custom_topology(counts, wiring, links=None):
     else:
         raise ValueError(f"unknown wiring pattern '{wiring}'")
     summary = ", ".join(f"{sum(1 for n in nodes if n['role'] == role)} {role}"
-                        for role in ("host", "router", "switch", "loadbalancer", "firewall")
+                        for role in ("host",) + tuple(r for r in ROLE_ORDER if r != "host")
                         if any(n["role"] == role for n in nodes))
     topology = {"id": "custom", "title": f"Custom: {summary} ({wiring})", "nodes": nodes, "links": gen_links}
     return validate_topology(topology)
@@ -838,6 +843,33 @@ sed -i -E 's/^(ospfd|ospf6d|bgpd)=no/\\1=yes/' /etc/frr/daemons
 usermod -aG frrvty,frr bench
 systemctl enable frr
 systemctl restart frr
+"""
+
+
+SERVER_DNSMASQ_SETUP = """
+mkdir -p /etc/dnsmasq.d
+cat > /etc/dnsmasq.d/00-lab-defaults.conf <<'CONF'
+# Written at lab setup: serve lab interfaces only - never the setup NIC (enp0s3) or loopback, where systemd-resolved
+# already listens. Put your lab's DHCP/DNS settings in another file in this folder.
+bind-interfaces
+except-interface=lo
+except-interface=enp0s3
+# This node's /etc/hosts maps its own name to a loopback address (127.0.2.1); served over DNS (e.g. with
+# expand-hosts) that would answer srv1.lab with 127.0.2.1. Define lab names with address= or host-record= instead.
+no-hosts
+CONF
+apt-get install -y dnsmasq
+systemctl disable --now dnsmasq
+"""
+UPSTREAM_ADDR, UPSTREAM_WEB = "198.51.100.1/30", "203.0.113.10"
+UPSTREAM_SETUP = f"""
+lab_if="$(ls /sys/class/net | grep -v -e '^lo$' -e '^enp0s3$' | sort -V | head -1)"
+ip addr add {UPSTREAM_ADDR} dev "$lab_if"
+ip link set "$lab_if" up
+ip link add dummy0 type dummy
+ip addr add {UPSTREAM_WEB}/32 dev dummy0
+ip link set dummy0 up
+echo 'upstream ok' > /var/www/html/index.html
 """
 
 
@@ -888,6 +920,20 @@ ip link set br0 up
         # proxy config is pre-written - wiring a real backend pool is the task.
         pkgs = "nginx libnginx-mod-stream iproute2 iputils-ping tcpdump"
         extra = ""
+    elif role == "server":
+        # A service node: dnsmasq (DHCP + DNS), installed but NOT configured or running - serving a lab network is
+        # the task. Its defaults file is written before the package is installed, so dnsmasq never binds the setup NIC
+        # or loopback (where it would collide with systemd-resolved on 127.0.0.53) - only lab interfaces, once given
+        # addresses. Lab settings go in another file in /etc/dnsmasq.d/, then `systemctl enable --now dnsmasq`.
+        pkgs = "iproute2 iputils-ping tcpdump dnsutils"
+        extra = SERVER_DNSMASQ_SETUP
+    elif role == "upstream":
+        # A stub internet edge ("the ISP"): its first lab interface is 198.51.100.1/30 (the ISP side of the link, from
+        # a documentation range), and it answers on 203.0.113.10 (a dummy interface) with a web page, standing in for
+        # a host on the internet. It has no route back to anyone's lab networks, so reaching it from behind a router
+        # takes NAT - which is the point. No real internet is involved.
+        pkgs = "nginx iproute2 iputils-ping tcpdump"
+        extra = UPSTREAM_SETUP
     elif role == "router":
         # Same tooling as a host, plus FRR: zebra with the OSPF, OSPFv3 and BGP daemons enabled but NOT configured -
         # no router-id, no networks, no neighbors - so routing protocols are available through `vtysh` and choosing
@@ -899,7 +945,7 @@ ip link set br0 up
     else:
         # host: enough tooling to assign addresses, add routes, and prove connectivity. Deliberately NO ufw lockdown -
         # unlike the offline coding-task VMs above, this VM's whole point is reaching its neighbors.
-        pkgs = "iproute2 iputils-ping traceroute tcpdump"
+        pkgs = "iproute2 iputils-ping traceroute tcpdump isc-dhcp-client curl dnsutils"   # DHCP client, web and DNS tests
         extra = ""
     return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra)
 

@@ -80,6 +80,26 @@
       "prompt": "One switch (sw1) connects two hosts and a router. Put the hosts in separate VLANs and route between them on a single router link (router-on-a-stick). sw1's lab ports: enp0s8 connects to h1, enp0s9 to h2, enp0s10 to r1. On sw1, turn VLAN filtering on for br0, make enp0s8 an access port in VLAN 10 and enp0s9 an access port in VLAN 20 (each untagged, with that VLAN as its PVID, and no longer in VLAN 1), and make enp0s10 a trunk carrying VLANs 10 and 20 tagged. On r1, create two 802.1Q subinterfaces on its lab interface: VLAN 10 with 192.168.10.1/24 and VLAN 20 with 192.168.20.1/24, and enable IP forwarding. On h1 set 192.168.10.11/24 with gateway 192.168.10.1, and on h2 set 192.168.20.11/24 with gateway 192.168.20.1, both untagged on their lab interface. When done, h1 must be able to ping h2 through r1.",
       "check_node": "r1",
       "check": "set -e\nip -o -d link show type vlan | grep -q ' id 10 ' || { echo 'r1 has no VLAN 10 subinterface'; exit 1; }\nip -o -d link show type vlan | grep -q ' id 20 ' || { echo 'r1 has no VLAN 20 subinterface'; exit 1; }\n[ \"$(sysctl -n net.ipv4.ip_forward)\" = 1 ] || { echo 'IP forwarding is off on r1'; exit 1; }\nping -c3 -W2 192.168.10.11 >/dev/null || { echo 'h1 (192.168.10.11) does not answer on VLAN 10'; exit 1; }\nping -c3 -W2 192.168.20.11 >/dev/null || { echo 'h2 (192.168.20.11) does not answer on VLAN 20'; exit 1; }\nping -c3 -W2 -I 192.168.10.1 192.168.20.11 >/dev/null || { echo 'h2 does not answer traffic from VLAN 10 (check its gateway)'; exit 1; }\nping -c3 -W2 -I 192.168.20.1 192.168.10.11 >/dev/null || { echo 'h1 does not answer traffic from VLAN 20 (check its gateway)'; exit 1; }\necho 'VLANs 10 and 20 reach their hosts through the trunk, and r1 routes between them'"
+    },
+    {
+      "id": "srv1s1h2-dhcp-dns",
+      "title": "Run DHCP and DNS for a LAN",
+      "topology_id": "srv1s1h2",
+      "difficulty": "medium",
+      "est_minutes": 20,
+      "prompt": "One LAN on switch sw1 (already working) with two hosts and a server, srv1, which has dnsmasq installed but not configured or running. Give srv1's lab interface the static address 192.168.50.1/24. Configure dnsmasq on srv1 (in a new file in /etc/dnsmasq.d/) to hand out addresses 192.168.50.100-192.168.50.150 by DHCP with a 1-hour lease, and to serve DNS for the domain \"lab\": srv1.lab must resolve to 192.168.50.1, and each DHCP client must be resolvable by its hostname under .lab (h1.lab, h2.lab). Start dnsmasq. On h1 and h2, get an address for the lab interface by DHCP (`dhclient <interface>`); don't set their addresses by hand. When done, h1 must hold a DHCP address in that range, resolve srv1.lab and h2.lab through srv1, and reach h2.",
+      "check_node": "h1",
+      "check": "set -e\na=$(ip -o -4 addr show dev enp0s8 | awk '{print $4}' | cut -d/ -f1 | head -1)\ncase \"$a\" in 192.168.50.*) ;; *) echo 'h1 has no 192.168.50.x address on its lab interface'; exit 1;; esac\nip -o -4 addr show dev enp0s8 | grep -q dynamic || { echo \"h1's address $a was not assigned by DHCP\"; exit 1; }\nlast=${a##*.}; [ \"$last\" -ge 100 ] && [ \"$last\" -le 150 ] || { echo \"h1's address $a is outside 192.168.50.100-150\"; exit 1; }\n[ \"$(dig +short @192.168.50.1 srv1.lab)\" = 192.168.50.1 ] || { echo 'srv1.lab does not resolve to 192.168.50.1 through srv1'; exit 1; }\nh2=$(dig +short @192.168.50.1 h2.lab)\ncase \"$h2\" in 192.168.50.*) ;; *) echo 'h2.lab does not resolve through srv1 (are DHCP clients registered in DNS?)'; exit 1;; esac\nping -c2 -W2 \"$h2\" >/dev/null || { echo \"h2 ($h2) does not answer\"; exit 1; }\necho \"h1 got $a by DHCP; srv1.lab and h2.lab ($h2) resolve through srv1; h2 answers\""
+    },
+    {
+      "id": "r1s1h1up1-nat",
+      "title": "Give a LAN internet access through NAT",
+      "topology_id": "r1s1h1up1",
+      "difficulty": "medium",
+      "est_minutes": 15,
+      "prompt": "h1 sits on a LAN (switch sw1, already working) behind router r1, whose other link goes to up1, an upstream node standing in for the internet: up1's side of that link is already 198.51.100.1/30, and it serves a web page at http://203.0.113.10/. up1 has no route to your LAN. r1's lab interfaces: enp0s8 connects to sw1 (the LAN), enp0s9 to up1. Give r1 192.168.60.1/24 on the LAN side and 198.51.100.2/30 on the upstream side, a default route via 198.51.100.1, IP forwarding, and source NAT (masquerade) for traffic from 192.168.60.0/24 leaving towards up1. Give h1 192.168.60.11/24 with gateway 192.168.60.1. When done, h1 must be able to fetch http://203.0.113.10/ and ping it.",
+      "check_node": "h1",
+      "check": "set -e\nip -o -4 addr show | grep -q ' 192.168.60.11/24' || { echo 'h1 does not have 192.168.60.11/24'; exit 1; }\nping -c2 -W2 203.0.113.10 >/dev/null || { echo 'h1 cannot ping 203.0.113.10 (route, forwarding or NAT on r1?)'; exit 1; }\ncurl -s --max-time 5 http://203.0.113.10/ | grep -q 'upstream ok' || { echo 'h1 cannot fetch http://203.0.113.10/'; exit 1; }\necho 'h1 reaches the upstream through r1 (which has no route back to the LAN, so NAT is working)'"
     }
   ]
 }

@@ -862,7 +862,7 @@ VM_SESSION_POLL_S = 1.0
 VM_PROMPT_MAX = 20_000
 # Appended to each follow-up: with a bare follow-up, a local model was seen to just describe the ./vmrun command it
 # would run instead of running it.
-VM_FOLLOWUP_REMINDER = "\n\n(Keep working on the VM with ./vmrun as before, and check the output before you reply.)"
+VM_FOLLOWUP_REMINDER = "\n\n(Use ./vmrun as before; check output before replying.)"
 
 
 def stop_vm_runs_for(agent_name):
@@ -1138,14 +1138,12 @@ def vm_run_runner(rid):
             return finish("error", "could not attach the agent's VM relay (see transcript)")
         prompt = (
             f"{task['prompt'] if task else r['custom_prompt']}\n\n"
-            "You have an executable command available in your current working directory called ./vmrun. "
-            "It runs shell commands on a separate Linux machine set up for this task and returns their output - do "
-            "all of this task's file creation and testing there, not in your own filesystem. For example: "
-            "./vmrun 'cd /home/bench/work && ls -la'\n"
+            "./vmrun in your working directory runs commands on this task's Linux machine; do all work and testing "
+            "there, e.g. ./vmrun 'cd /home/bench/work && ls'.\n"
             + vr.VMRUN_HOWTO.format(cmd="./vmrun") + "\n"
-            "Before you reply, run what you built on that machine and check that its output is what the task asks for."
-            + ("\nYour user may send you more guidance in this conversation after you reply; the machine stays "
-               "available to you until they end the session." if r.get("interactive") else "")
+            "Before replying, run what you built there and check its output."
+            + ("\nYour user may send more guidance after you reply; the machine stays available until they end "
+               "the session." if r.get("interactive") else "")
         )
         vm_agent_turn(r, prompt)
         if r.get("interactive"):
@@ -1429,8 +1427,7 @@ TOPO_LIVE_STATES = ("queued", "provisioning", "working", "attached", "scoring", 
 TOPO_OCCUPYING_STATES = TOPO_LIVE_STATES + ("ready",)
 TOPO_FOLLOWUPS = {}      # run id -> queue.Queue of your follow-up messages for an interactive lab session
 TOPO_END = {}            # run id -> True once you end an interactive lab session
-TOPO_FOLLOWUP_REMINDER = ("\n\n(Keep working on the lab nodes with their ./vmrun-<node> commands as before, and check "
-                          "the results before you reply.)")
+TOPO_FOLLOWUP_REMINDER = "\n\n(Use the ./vmrun-<node> commands as before; check results before replying.)"
 TOPO_RELAY_FILES = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay-topo.compose.yml")]
 
 
@@ -1773,27 +1770,28 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
     if rc != 0:
         detach_topo_agent(r["agent"])
         return "could not attach the agent's lab relay (see transcript)"
-    node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} '<command>'" for name in r["nodes"])
-    prompt = (
-        f"{task['prompt'] if task else r['custom_prompt']}\n\n"
-        "This lab has these nodes, each reachable with its own command run from your current working "
-        f"directory (e.g. ./vmrun-h1 'ip addr'):\n{node_lines}\n\n"
-        + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n\n"
-        "Every node's first network interface is for setup only (already configured - leave it alone); its "
-        "other interfaces are the lab links, with no address until you (or the task) configure them. Don't use "
-        "10.0.2.0/24 for lab addresses: it's the setup network on every node, and a lab subnet that overlaps it "
-        "loses to it in routing decisions. A "
-        "'switch' node is already working as a plain Ethernet switch and needs no configuration: all its lab ports "
-        "are in bridge br0, with VLAN filtering off. To use VLANs on it, turn filtering on (ip link set br0 type bridge "
-        "vlan_filtering 1) and set each port with `bridge vlan` (an access port: bridge vlan add dev <port> vid <id> pvid "
-        "untagged, then bridge vlan del dev <port> vid 1; a trunk: bridge vlan add dev <port> vid <id> for each VLAN)."
-        + ("\n\nRouter nodes run FRR with the OSPF, OSPFv3 and BGP daemons available but not configured. Configure "
-           "them with vtysh, for example: ./vmrun-r1 <<'EOF'\nvtysh -c 'configure terminal' -c 'router ospf' "
-           "-c 'network 10.0.0.0/30 area 0'\nvtysh -c 'show ip ospf neighbor'\nEOF\n"
-           "Static routes with `ip route` work too." if any(n["role"] == "router" for n in r["nodes"].values()) else "")
-        + ("\n\nYour user may send you more guidance in this conversation after you reply; the lab stays "
-           "available to you until they end the session." if r.get("interactive") else "")
-    )
+    node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} '<cmd>'" for name in r["nodes"])
+    roles = {n["role"] for n in r["nodes"].values()}
+    # Everything below is sent on every agent turn's first message, often to a paid model: keep it terse, and only
+    # describe roles that are actually in this lab.
+    hints = [
+        "Lab links are each node's 2nd+ interfaces, unaddressed. Leave enp0s3 alone and don't use 10.0.2.0/24 "
+        "(the setup network on every node).",
+        "Switches bridge their lab ports in br0, VLAN filtering off. For VLANs: ip link set br0 type bridge "
+        "vlan_filtering 1; access port: bridge vlan add dev <port> vid <id> pvid untagged + bridge vlan del dev "
+        "<port> vid 1; trunk: bridge vlan add dev <port> vid <id>." if "switch" in roles else "",
+        "Routers run FRR (ospfd, ospf6d, bgpd; unconfigured): use vtysh -c 'conf t' -c ..., or ip route."
+        if "router" in roles else "",
+        "Servers have dnsmasq, not running: add a file in /etc/dnsmasq.d/ (it ignores /etc/hosts: use address= or "
+        "host-record=), then systemctl enable --now dnsmasq. Hosts: dhclient <interface>." if "server" in roles else "",
+        f"Upstream nodes are the internet: already {vr.UPSTREAM_ADDR}, serving http://{vr.UPSTREAM_WEB}/, with no "
+        "route to your networks (needs NAT)." if "upstream" in roles else "",
+        "Your user may send more guidance after you reply; the lab stays available until they end the session."
+        if r.get("interactive") else "",
+    ]
+    prompt = (f"{task['prompt'] if task else r['custom_prompt']}\n\nLab nodes (commands run from your working "
+              f"directory):\n{node_lines}\n" + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n"
+              + "\n".join(h for h in hints if h))
     topo_agent_turn(r, prompt)
     if r.get("interactive"):
         agent_session_loop(r, stopped, TOPO_FOLLOWUPS, TOPO_END, lambda line: topo_log(r, line),

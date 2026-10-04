@@ -9,7 +9,7 @@ const vtSig = {};
 const vtFmtTime = t => t ? new Date(t * 1000).toLocaleTimeString() : "";
 const vtElapsed = r => { const end = r.ended || Date.now() / 1000; const s = Math.max(0, Math.round(end - (r.started || r.created))); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`; };
 
-const VT_ROLE_PREFIX = { switch: "sw", router: "r", firewall: "fw", loadbalancer: "lb", host: "h" };
+const VT_ROLE_PREFIX = { switch: "sw", router: "r", firewall: "fw", loadbalancer: "lb", server: "srv", upstream: "up", host: "h" };
 const vtCustomNames = counts => Object.entries(VT_ROLE_PREFIX)
   .flatMap(([role, prefix]) => Array.from({ length: +counts[role] || 0 }, (_, i) => `${prefix}${i + 1}`));
 
@@ -23,7 +23,7 @@ function vtBuildSection() {
   const topoRow = h("div", { class: "row" }, "Topology", VT.newTopo);
   VT.customOn = h("input", { type: "checkbox" });
   VT.custCounts = {};
-  for (const role of ["host", "router", "switch", "loadbalancer", "firewall"]) {
+  for (const role of ["host", "router", "switch", "loadbalancer", "firewall", "server", "upstream"]) {
     VT.custCounts[role] = h("input", { type: "number", min: 0, max: 12, value: 0, style: "max-width:50px;flex:none" });
   }
   VT.custWiring = h("select", {},
@@ -44,7 +44,7 @@ function vtBuildSection() {
   Object.values(VT.custCounts).forEach(el => el.addEventListener("input", refreshCustomHint));
   VT.custWiring.addEventListener("change", refreshCustomHint);
   const custBuilder = h("div", { class: "col" },
-    h("div", { class: "row" }, ...["host", "router", "switch", "loadbalancer", "firewall"]
+    h("div", { class: "row" }, ...["host", "router", "switch", "loadbalancer", "firewall", "server", "upstream"]
       .flatMap(role => [role, VT.custCounts[role]])),
     h("div", { class: "row" }, "Wiring", VT.custWiring),
     VT.custNamesHint, VT.custLinks);
