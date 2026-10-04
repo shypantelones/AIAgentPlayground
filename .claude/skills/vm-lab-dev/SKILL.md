@@ -496,8 +496,12 @@ generated shell in each node's provision script.
   wrappers as `<login>@vm-relay-topo`. Detach removes the key line (`grep -v -F -x`, then `cp`; the grep's exit status is
   ignored so an empty file still clears).
 - `member_prompt` lists the role's sudo commands and asks for one `sudo -n` command at a time.
-- **Gotcha, the budget race:** parallel commands in one turn read the same budget counter. The wrapper now takes a
-  `flock` on `<budget>.lock`, writes to `<budget>.tmp` and renames. A test runs 20 parallel commands against a budget of 5.
+- **Gotcha, the budget race:** parallel commands in one turn read the same budget counter. The wrapper takes an
+  exclusive file create (`set -C`) on `<budget>.lock`, writes to `<budget>.tmp` and renames, then removes the lock by hand.
+  Not `flock` (missing on macOS) and not `mkdir`/`rmdir` (overlapped under load on this machine). No EXIT trap: the
+  pipeline's subshells inherit it and release the lock early. A test runs 20 parallel commands against a budget of 5.
+- **Gotcha, stale locks:** a command that dies inside the lock leaves the file, and every later command waits. A lock
+  older than a minute (`find -mmin +1`) is taken over. Found live: all of an agent's commands hung and the turn logged zero.
 - **Live:** firewall-admin on `h1 - fw1 - h2` passed all three intents and the score (27 commands, about $0.36 by estimate).
 
 ## Recording changes (required in every PR)
