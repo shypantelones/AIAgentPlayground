@@ -302,7 +302,16 @@ async function loadVBDetail() {
 function replaceKeepingFocus(container, parts) {
   const ta = container.querySelector("textarea.followup");
   const caret = ta && document.activeElement === ta ? [ta.selectionStart, ta.selectionEnd] : null;
+  // Log boxes (<pre>) are rebuilt on every refresh. Remember where each one was scrolled: a box the reader had at the
+  // bottom stays at the bottom (new lines show), any other keeps its place instead of jumping to the top.
+  const boxes = [...container.querySelectorAll("pre")].map(pre => ({
+    top: pre.scrollTop, atBottom: pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4 }));
   container.replaceChildren(...parts);
+  container.querySelectorAll("pre").forEach((pre, i) => {
+    const b = boxes[i];
+    if (!b) return;
+    pre.scrollTop = b.atBottom ? pre.scrollHeight : b.top;
+  });
   const ta2 = container.querySelector("textarea.followup");
   if (ta2 && caret) { ta2.focus(); ta2.setSelectionRange(...caret); }
 }
