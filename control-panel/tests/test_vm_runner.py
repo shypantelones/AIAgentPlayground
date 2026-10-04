@@ -490,6 +490,35 @@ class ServiceNodeTests(unittest.TestCase):
         self.assertIn("enp0s9 to up1", nat["prompt"])
 
 
+class DiagramTests(unittest.TestCase):
+    TOPO = None
+
+    def setUp(self):
+        self.topo = vr.get_topology("r2s2h2")
+
+    def test_interface_names_follow_each_nodes_link_order(self):
+        d = vr.topology_diagram(self.topo)
+        ends = {(l["a"], l["b"]): (l["a_if"], l["b_if"]) for l in d["links"]}
+        # what a live OSPF lab showed: r1's LAN is enp0s8 and its transit enp0s9; r2 the other way round
+        self.assertEqual(ends[("sw1", "r1")][1], "enp0s8")
+        self.assertEqual(ends[("r1", "r2")], ("enp0s9", "enp0s8"))
+        self.assertEqual(ends[("r2", "sw2")][0], "enp0s9")
+
+    def test_snapshot_names_win_over_the_pattern(self):
+        names = vr.lab_iface_names(self.topo, "r1", "lo UNKNOWN\nenp0s3 UP\nenp0s8 UP\nenp0s16 UP\n")
+        self.assertEqual(names, ["enp0s8", "enp0s16"])
+        self.assertEqual(vr.lab_iface_names(self.topo, "r1", ""), ["enp0s8", "enp0s9"])
+        many = {"nodes": [{"name": "sw1", "role": "switch"}] + [{"name": f"h{i}", "role": "host"} for i in range(8)],
+                "links": [{"a": f"h{i}", "b": "sw1"} for i in range(8)]}
+        self.assertEqual(vr.lab_iface_names(many, "sw1"), ["enp0s8", "enp0s9", "enp0s10", "enp0s16", "enp0s17", "enp0s18", "enp0s19", "nic9"])
+
+    def test_addresses_come_from_the_snapshot_without_system_ones(self):
+        snap = {"r1": {"addresses": "lo UNKNOWN 127.0.0.1/8\nenp0s3 UP 10.0.2.15/24\nenp0s8 UP 192.168.1.1/24 fe80::1/64\n"
+                                    "enp0s8.10@enp0s8 UP 192.168.10.1/24\nenp0s9 DOWN\n"}}
+        d = vr.topology_diagram(self.topo, snap)
+        self.assertEqual(d["addresses"], {"r1": {"enp0s8": ["192.168.1.1/24"], "enp0s8.10": ["192.168.10.1/24"]}})
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to

@@ -1498,6 +1498,8 @@ def topo_run_view(r, full=False):
     v["interactive"] = bool(r.get("interactive"))
     v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
     v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
+    if full:
+        v["diagram"] = topo_run_diagram(r)
     v["from_labfile"] = (r.get("labfile") or {}).get("title")
     v["labfile_check"] = r.get("labfile_check")
     v.update({k: r.get(k) for k in ("saved_at", "resumed", "agent_done")})
@@ -1508,6 +1510,16 @@ def topo_run_view(r, full=False):
             msgs = load_chats(r["agent"]).get(r["chat"], {}).get("messages", [])[-100:]
             v["conversation"] = [{"role": m.get("role"), "text": m.get("text", "")[-20000:], "ts": m.get("ts")} for m in msgs]
     return v
+
+
+def topo_run_diagram(r):
+    """The lab's diagram, labeled with interface addresses from its newest snapshot (if any)."""
+    topology = vr.get_topology(r["topology_id"]) if r["topology_id"] else r["topology"]
+    snaps = list_topo_snapshots(r["id"])
+    snap = load_topo_snapshot(r["id"], snaps[0]["id"]) if snaps else None
+    d = vr.topology_diagram(topology, (snap or {}).get("nodes"))
+    d["snapshot"] = {"id": snap["id"], "ts": snap["ts"]} if snap else None
+    return d
 
 
 def topo_taken_ports(rng):
@@ -1697,13 +1709,17 @@ def topo_run_runner(rid):
                 return finish("error", f"node '{name}' booted but never accepted SSH")
         if r.get("labfile"):
             apply_labfile(r, node_ports, priv)
+        # Decide BEFORE "ready" whether this run has its own agent: once the lab is ready, attach_agent_to_lab() may set
+        # r["agent"] from another thread, and reading it after that would run the attached agent a second time here
+        # (and then finish - and tear down - the lab it was attached to).
+        own_agent = r["agent"]
         r["state"] = "ready"
         save_topo_run(r)
         task = vr.get_topology_task(r["task_id"]) if r["task_id"] else None
         topo_log(r, "ready." + (f" Task: {task['title']}" if task else " Your own prompt for the agent." if r.get("custom_prompt")
                                 else " No task attached: open a terminal on any node to use this lab directly."))
 
-        if not r["agent"]:
+        if not own_agent:
             # No agent attached: this lab is for YOU - open terminals, do the task (if any), then use "Score now"
             # whenever you like. Stay in "ready" and return without tearing anything down; Stop/Delete handle that.
             return

@@ -620,7 +620,9 @@ class AttachAgentTests(VmTopoBase):
         app.attach_agent_to_lab(rid, dict({"agent": "alpha", "custom_prompt": "Address h1 and h2."}, **form))
 
     def back_to_ready(self, rid):
-        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid].get("agent_done") and app.TOPO_RUNS[rid]["state"] == "ready"))
+        # 20s, not the default 8s: on Windows (tests run over a slow \\wsl$ path there) every save_topo_run is slow,
+        # and this failed once on a run that took 41s instead of the usual 26s
+        self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid].get("agent_done") and app.TOPO_RUNS[rid]["state"] == "ready", 20))
         for t in set(threading.enumerate()) - self._threads_before:
             t.join(timeout=8)
 
@@ -700,6 +702,23 @@ class AttachAgentTests(VmTopoBase):
                     t.join(timeout=8)
                 self.assertEqual(len(self.destroys()), destroyed)
 
+    def test_attach_right_as_the_lab_becomes_ready_runs_the_agent_once(self):
+        """Regression (found as a 1-in-8 flake on Windows): the lab's own build thread read r["agent"] after setting
+        "ready", so an attach landing in between ran the agent twice and the build thread then finished the lab."""
+        real_log = app.topo_log
+
+        def log_then_attach(r, line):
+            real_log(r, line)
+            if line.startswith("ready."):
+                (app.topo_run_dir(r["id"]) / "Vagrantfile").write_text("# fake")
+                app.attach_agent_to_lab(r["id"], {"agent": "alpha", "custom_prompt": "go"})
+        with mock.patch.object(app, "topo_log", log_then_attach):
+            rid = app.create_topo_run({"topology_id": "s1h2"})
+            self.back_to_ready(rid)
+        self.assertEqual(len(self.turns), 1, "the agent ran once, by the attach")
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "ready")
+        self.assertFalse(self.destroys(), "the build thread must not finish and tear down the lab")
+
     def test_validation(self):
         app.update_vmb_settings({"max_concurrent": 6})           # room for two 3-node labs at once
         rid = self.scratch_lab(task_id="s1h2-connectivity")
@@ -741,6 +760,17 @@ class SnapshotTests(VmTopoBase):
 
     def port(self, rid, node):
         return app.TOPO_RUNS[rid]["nodes"][node]["ssh_port"]
+
+    def test_lab_view_has_a_diagram_labeled_from_the_newest_snapshot(self):
+        rid = self.ready_lab()
+        d = app.topo_run_view(app.TOPO_RUNS[rid], full=True)["diagram"]
+        self.assertIsNone(d["snapshot"])
+        self.assertEqual({n["name"] for n in d["nodes"]}, {"h1", "h2", "sw1"})
+        self.node_config = {self.port(rid, "h1"): "enp0s8 UP 10.0.0.1/24"}
+        sid = app.take_topo_snapshot(app.TOPO_RUNS[rid], "x")["id"]
+        d = app.topo_run_view(app.TOPO_RUNS[rid], full=True)["diagram"]
+        self.assertEqual(d["snapshot"]["id"], sid)
+        self.assertEqual(d["addresses"]["h1"]["enp0s8"], ["10.0.0.1/24"])
 
     def test_snapshot_captures_every_node_and_lists_it(self):
         rid = self.ready_lab()

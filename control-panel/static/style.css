@@ -95,3 +95,10 @@ select{max-width:100%}
 .chip.saved{background:#e3ecfb;color:#1d4f91}.chip.saving,.chip.resuming{background:#fff1cf;color:#7a5200}
 .snap{gap:10px}.snap .num{font-variant-numeric:tabular-nums;color:var(--mute)}
 pre.diff span.add{color:var(--ok)}pre.diff span.del{color:var(--bad)}pre.diff span.hunk{color:var(--mute)}
+.tdg-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;padding:4px;background:var(--bg)}
+.tdg{display:block;max-width:none}
+.tdg-link{stroke:var(--mute);stroke-width:1.5}
+.tdg-node rect{fill:var(--panel);stroke:var(--line);stroke-width:1.5}
+.tdg-router rect,.tdg-firewall rect{stroke:var(--acc)}.tdg-upstream rect{stroke:var(--warn);stroke-dasharray:4 3}
+.tdg-name{fill:var(--ink);font-weight:600;font-size:13px}.tdg-role{fill:var(--mute);font-size:10px}
+.tdg-if{fill:var(--ink);font-size:10px;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--bg);stroke-width:3px;stroke-linejoin:round}

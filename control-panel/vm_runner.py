@@ -690,6 +690,50 @@ def links_for_node(topology, name):
     return [link for link in topology["links"] if name in (link["a"], link["b"])]
 
 
+# VirtualBox NIC n (n >= 2: lab links) -> its Linux name in the Ubuntu guests: adapters 1-4 sit at PCI slots 3, 8, 9,
+# 10 and 5-8 at 16-19 (nic1 is always the NAT/setup enp0s3). Used only when a node's real interface names aren't known
+# from a snapshot; nodes with up to 3 lab links (enp0s8-10) are what's been seen on real labs.
+NIC_PCI_SLOTS = (3, 8, 9, 10, 16, 17, 18, 19)
+
+
+def lab_iface_names(topology, name, snapshot_links=""):
+    """Interface name for each of `name`'s links, in link order. From the node's snapshot (`ip -br link`: its
+    physical lab NICs, sorted) when there is one, else from NIC_PCI_SLOTS."""
+    n = len(links_for_node(topology, name))
+    seen = sorted({int(m.group(1)) for m in re.finditer(r"^enp0s(\d+)(?:\s|$)", snapshot_links or "", re.M)} - {3})
+    if len(seen) >= n:
+        return [f"enp0s{i}" for i in seen[:n]]
+    return [f"enp0s{NIC_PCI_SLOTS[i + 1]}" if i + 1 < len(NIC_PCI_SLOTS) else f"nic{i + 2}" for i in range(n)]
+
+
+def topology_diagram(topology, snapshot_nodes=None):
+    """What the panel draws: nodes, links with each end's interface name, and per-node interface addresses (lab ones
+    only: no loopback, setup NIC or link-local) from a snapshot's "addresses" section, if given."""
+    snapshot_nodes = snapshot_nodes or {}
+    ifaces = {n["name"]: lab_iface_names(topology, n["name"], snapshot_nodes.get(n["name"], {}).get("links", ""))
+              for n in topology["nodes"]}
+    pos = {n["name"]: 0 for n in topology["nodes"]}
+    links = []
+    for l in topology["links"]:
+        ends = {}
+        for side in ("a", "b"):
+            node = l[side]
+            ends[f"{side}_if"] = ifaces[node][pos[node]] if pos[node] < len(ifaces[node]) else None
+            pos[node] += 1
+        links.append({"a": l["a"], "b": l["b"], **ends})
+    addresses = {}
+    for node, secs in snapshot_nodes.items():
+        for line in secs.get("addresses", "").splitlines():
+            toks = line.split()
+            if len(toks) < 3 or toks[0].split("@")[0] in SETUP_IFACES:
+                continue
+            addrs = [t for t in toks[2:] if "/" in t and not t.lower().startswith("fe80:")]
+            if addrs:
+                addresses.setdefault(node, {})[toks[0].split("@")[0]] = addrs
+    return {"nodes": [{"name": n["name"], "role": n["role"]} for n in topology["nodes"]], "links": links,
+            "addresses": addresses}
+
+
 def intnet_name(rid, idx):
     return f"aiagentplayground-topo-{rid}-link{idx}"
 
