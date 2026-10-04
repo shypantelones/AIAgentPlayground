@@ -192,13 +192,23 @@ How the roles apply here:
   server and load-balancer roles to web-admin, hosts to client-dev or tool-dev.
 - **Live test** (router lab, alpha as network-admin on h1, r1, h2; beta as web-admin on h2): both intents passed (ping
   and TCP 8080 from h1 to h2), the score passed, and the members stayed in role. No command was refused in the real run.
+- **VM-side logins (now built):** every lab VM has a login per role (`netadmin`, `fwadmin`, `webadmin`, `clientdev`,
+  `tooldev`, and `member` for a member without a role). Each has sudo for only the commands its role needs (`lab_roles.SUDO_ALLOW`).
+  A member gets its own key: the panel installs its public half on its nodes for its role's login only, gives the agent the
+  private half, and removes the public half when the member detaches. The member's wrappers connect as that login. `bench`
+  keeps full sudo for the panel's own work. A sudoers file that fails `visudo -c` is removed at provision.
+- **Live firewall-admin test** (`h1 - fw1 - h2`; alpha as network-admin addresses the lab, beta as firewall-admin on fw1
+  makes the firewall pass ICMP and TCP 22 from h1 and block TCP 22 from h2): all three intents passed and the score passed.
+  Beta worked through its fwadmin login with `sudo -n`. A first run failed because two parallel commands raced on the
+  budget counter (now locked), and because beta wrote one `sudo bash` heredoc (its login can't open a shell): the prompt
+  now lists the role's sudo commands and asks for one `sudo -n` command at a time.
 - **The guard works mechanically:** run through a member's wrapper inside its container, `sudo nft list ruleset` was
   refused (exit 4) and `systemctl is-active nginx` went on to the relay.
 
 Trade-offs and gaps:
-- **The guard is a pattern check, not a boundary.** An agent holds the lab key and could reach a node over SSH directly.
-  The hard version is VM-side users with restricted sudo, one per role, which needs a provisioning change and a key per
-  member. That is the next step.
+- **The guard is still a pattern check, and the login limit is the hard part.** A member can't run anything its role's
+  login can't sudo, so a web admin can't change the firewall even with a shell. But the pattern guard only catches
+  commands by their words. Non-sudo commands (reading, ssh to a host the member can reach as its own login) aren't limited.
 - **Patterns are words, not intent.** A command that builds a firewall rule some other way (a script that writes an nft
   file, for example) is not caught by the word match.
 - **Not tested live:** firewall-admin, client-dev and tool-dev. The role catalog and guards are tested with the wrapper

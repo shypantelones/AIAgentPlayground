@@ -485,6 +485,21 @@ generated shell in each node's provision script.
 - **Tested:** unit tests for parsing and the prompt; the real wrapper with a fake ssh; a live router test with network-admin
   and web-admin (intents and score passed, no refusals in the real run). Not tested live: firewall-admin, client-dev, tool-dev.
 
+## VM-side role logins (vm_role_users)
+
+- `lab_roles.ROLE_USERS` (role -> login), `NO_ROLE_USER` (`member`), `SUDO_ALLOW` (absolute paths per role).
+  `provision_users_script()` is placed in `_topo_provision_script` (`{users}`): useradd, `.ssh` setup, and a sudoers file per
+  login checked with `visudo -cf` (removed if bad). Keyword checks on a host's firewall must ignore these lines
+  (`without_role_logins` in the tests): the sudo lists name firewall tools.
+- `topo_member_turn`: generates a key in `topo_run_dir/members/<agent>`, installs the public key with `member_key_script`
+  (run as bench via `vr.ssh_script`, key base64-encoded, `tee -a`), gives the agent the private key, and connects its
+  wrappers as `<login>@vm-relay-topo`. Detach removes the key line (`grep -v -F -x`, then `cp`; the grep's exit status is
+  ignored so an empty file still clears).
+- `member_prompt` lists the role's sudo commands and asks for one `sudo -n` command at a time.
+- **Gotcha, the budget race:** parallel commands in one turn read the same budget counter. The wrapper now takes a
+  `flock` on `<budget>.lock`, writes to `<budget>.tmp` and renames. A test runs 20 parallel commands against a budget of 5.
+- **Live:** firewall-admin on `h1 - fw1 - h2` passed all three intents and the score (27 commands, about $0.36 by estimate).
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:
