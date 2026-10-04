@@ -762,7 +762,7 @@ def vm_name_for_node(rid, name):
     return f"aiagentplayground-vmtopo-{rid}-{name}"
 
 
-def vmrun_script(key_path, port, host, log_path, node=None):
+def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None):
     """The `vmrun` wrapper put in an agent's workspace: runs commands on a VM through its relay and logs them.
     With `node`, each log entry names the node too ("=== <time> <node> $ <command>"), so a lab's change log can say
     which node a command ran on. Without it the entries are "=== <time> $ <command>", as before.
@@ -777,8 +777,22 @@ def vmrun_script(key_path, port, host, log_path, node=None):
     ssh = (f"ssh -i {key_path} -p {port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
            f"-o LogLevel=ERROR {host}")
     label = f"{node} " if node else ""
+    # A command budget (see agent_costs): when the budget file exists, each command takes one from it, and the
+    # command is refused at zero. The panel writes the file at the start of each turn. A runaway-loop guard: the
+    # agent shares this workspace, so it isn't a security boundary.
+    budget = ""
+    if budget_file:
+        budget = (f"if [ -f \"{budget_file}\" ]; then\n"
+                  f"  n=$(cat \"{budget_file}\" 2>/dev/null || echo 0)\n"
+                  "  if [ \"$n\" -le 0 ]; then\n"
+                  "    echo \"command budget used up for this agent in this lab: stop and tell the user what is left to do\" >&2\n"
+                  "    exit 3\n"
+                  "  fi\n"
+                  f"  echo $((n - 1)) > \"{budget_file}\"\n"
+                  "fi\n")
     return ("#!/bin/sh\n"
             f"LOG={log_path}\n"
+            + budget +
             "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
             "if [ $# -gt 0 ]; then\n"
             "  echo \"=== $ts " + label + "\\$ $*\" >> \"$LOG\"\n"

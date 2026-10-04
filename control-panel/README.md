@@ -148,6 +148,20 @@ Topology labs are built to be worked in and kept, not only run once. From a lab'
   agent; the drafting, checking and building around it have.)
 - **Attach an agent to a lab that already exists**, and benchmark several agents on the same topology task.
 
+#### Cost budget for cloud agents
+Each cloud agent in a lab gets a dollar budget (the "Budget" group in the new-lab form, default $0.50, max $20). The
+model decides how many commands that buys: each command is one model call, priced from the model menu in `app.py`
+(`agent_costs.py`). On Haiku 4.5 $0.50 buys about 37 commands; on Opus 5.5 about 9. A lab whose budget buys fewer than 5
+commands is refused before anything is built.
+- **Enforcement:** each command takes one from a counter in the agent's workspace, and the `vmrun` wrapper refuses at zero.
+  The panel resets the counter before each turn from what's left, and charges each turn's commands after it.
+- **Trade-offs:** the per-command price is an estimate (12k input and 300 output tokens per command). It was not measured,
+  so the real spend can be higher or lower. The agent shares its workspace, so it could edit the counter or reach the lab
+  through its own SSH: this stops runaway loops, not a deliberate bypass. Set a spend limit with your provider as the hard cap.
+- **Local agents** (Ollama) aren't budgeted: they cost no dollars.
+- **Not yet done:** a warning in the agent's Model tab when a pricier model is picked, and a per-turn cap separate from the
+  lab total.
+
 #### Teams: several agents in one lab
 A lab can take a **team** instead of one agent (the "Team" group in the new-lab form, one member per line:
 `agent | nodes | stage | brief`). Each member gets its own relay and `vmrun` commands for its nodes only, and its own

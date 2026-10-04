@@ -139,6 +139,7 @@ function vtBuildSection() {
   VT.newKeep = h("input", { type: "checkbox" });
   VT.newInteractive = h("input", { type: "checkbox" });
   VT.newPlanFirst = h("input", { type: "checkbox" });
+  VT.newBudget = h("input", { type: "number", min: 0.01, max: 20, step: 0.01, value: "0.50", style: "width:6em" });
   VT.newTeam = h("textarea", { rows: 3, placeholder: "alpha | h1,r1 | 1 | network admin: builds the routing\nbeta | h2 | 2 | web server: serves the feed" });
   VT.newDomains = h("textarea", { rows: 2, placeholder: "e.g. docs.example.org (one per line, for a niche tool)" });
   VT.newMsg = h("div", { class: "fail" });
@@ -147,7 +148,8 @@ function vtBuildSection() {
     const agents = [...VT.newAgents.querySelectorAll("input:checked")].map(x => x.value);
     if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
     const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked, intents: VT.newIntents.value,
-                   plan_first: VT.newPlanFirst.checked, extra_domains: VT.newDomains.value };
+                   plan_first: VT.newPlanFirst.checked, extra_domains: VT.newDomains.value,
+                   budget_usd: VT.newBudget.value };
     if (VT.fileOn.checked) {
       if (!VT.labfile) { VT.newMsg.textContent = "Choose a lab file first."; return; }
       body.labfile = VT.labfile;
@@ -216,7 +218,9 @@ function vtBuildSection() {
         h("div", { class: "hint" }, "The agent writes its plan with no access to the nodes. Nothing runs until you approve the plan on the lab's page. Needs an agent.")),
       vtGroup("5. Internet", "The lab's VMs reach documentation and package sites for their roles, through a proxy that checks each hostname. Add a site here if a niche tool needs one.",
         VT.newDomains),
-      vtGroup("6. Keep the VMs?", null,
+      vtGroup("6. Budget per paid agent", "Each cloud agent gets this many dollars of model calls in the lab. The model decides how many commands that buys: a bigger model buys fewer. Local agents aren't budgeted. Set a spend limit with your provider as well: this is a guard against runaway loops, not a hard cap.",
+        h("label", { class: "row" }, "$", VT.newBudget)),
+      vtGroup("7. Keep the VMs?", null,
         h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection")),
       VT.newMsg, h("div", { class: "row" }, create)),
     vtFold("Draft a lab from a diagram", false, vtDraftSection()),
@@ -339,6 +343,8 @@ async function loadVTDetail() {
     ...nodeRows,
     r.plan_first && r.plan && !r.plan_approved && r.state === "ready" ? vtPlanBox(r) : null,
     r.state === "ready" && r.has_vms && !r.agent_holds && !(r.plan_first && !r.plan_approved) ? vtAttachBox(r) : null]));
+  if (r.budget) parts.push(vtSection("Budget", Object.entries(r.budget.commands).map(([a, n]) => h("div", { class: "hint" },
+    `${a}: ${Math.max(0, n - (r.budget.used[a] || 0))} of ${n} commands left (budget $${r.budget.usd.toFixed(2)})`))));
   if (r.team) parts.push(vtSection("Team", r.team.map(m => h("div", { class: "hint" },
     `stage ${m.stage} · ${m.agent} · nodes ${m.nodes.join(", ")} · ${m.brief}`))));
   parts.push(vtSection("Agent session", [
