@@ -53,7 +53,7 @@ class ProxyTests(unittest.TestCase):
         self.assertIn("cache deny all", conf)
 
     def test_proxy_is_published_on_the_host_only_address_only(self):
-        comp = le.proxy_compose("aiagentplayground-egress-abc", 62500, Path("F:/x/allowlist.txt"), Path("F:/x/squid.conf"))
+        comp = le.proxy_compose("aiagentplayground-egress-abc", 62500, "F:/x/allowlist.txt", "F:/x/squid.conf")
         self.assertIn('"192.168.56.1:62500:3128"', comp)
         self.assertNotIn('"62500:3128"', comp)
         self.assertNotIn("127.0.0.1", comp)
