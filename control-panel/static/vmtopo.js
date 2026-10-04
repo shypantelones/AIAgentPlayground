@@ -139,6 +139,7 @@ function vtBuildSection() {
   VT.newKeep = h("input", { type: "checkbox" });
   VT.newInteractive = h("input", { type: "checkbox" });
   VT.newPlanFirst = h("input", { type: "checkbox" });
+  VT.newTeam = h("textarea", { rows: 3, placeholder: "alpha | h1,r1 | 1 | network admin: builds the routing\nbeta | h2 | 2 | web server: serves the feed" });
   VT.newDomains = h("textarea", { rows: 2, placeholder: "e.g. docs.example.org (one per line, for a niche tool)" });
   VT.newMsg = h("div", { class: "fail" });
   const create = h("button", { class: "primary", onclick: async () => {
@@ -168,6 +169,12 @@ function vtBuildSection() {
       body.custom_prompt = VT.promptOn.checked ? (VT.customPrompt.value.trim() || null) : null;
     }
     try {
+      if (VT.newTeam.value.trim()) {
+        // A team takes its members instead of the single-agent checkboxes above.
+        await api("/api/vmtopo/runs", { ...body, agent: null, team: VT.newTeam.value });
+        vtSig.runs = ""; vtLoad();
+        return;
+      }
       if (agents.length && !confirmAgentModels(agents)) return;
       if (agents.length > 1) await api("/api/vmtopo/benchmarks", { ...body, agents });
       else await api("/api/vmtopo/runs", { ...body, agent: agents[0] || null });
@@ -196,6 +203,9 @@ function vtBuildSection() {
         "What the lab must do, one per line. Each is checked from its source node after the agent's work. A lab with intents and no task check is scored by them.",
         h("div", { class: "hint" }, "reach or block a node or address over icmp or tcp/<port>, or check the route: 'h1 -> h2 icmp reach', 'h2 -> web1 tcp/22 block', 'h1 -> 10.2.0.10 path via r1, r2'. Lab files carry their own intents."),
         VT.newIntents),
+      vtGroup("4. Team (optional, instead of one agent)",
+        "One member per line: agent | nodes | stage | brief. Members in the same stage work at the same time; stage 2 starts when stage 1 is done. Each member sees only its own nodes. Teams take one turn per member for now.",
+        VT.newTeam),
       vtGroup("4. Agent and session (optional)",
         "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended.",
         VT.newAgents,
@@ -329,6 +339,8 @@ async function loadVTDetail() {
     ...nodeRows,
     r.plan_first && r.plan && !r.plan_approved && r.state === "ready" ? vtPlanBox(r) : null,
     r.state === "ready" && r.has_vms && !r.agent_holds && !(r.plan_first && !r.plan_approved) ? vtAttachBox(r) : null]));
+  if (r.team) parts.push(vtSection("Team", r.team.map(m => h("div", { class: "hint" },
+    `stage ${m.stage} · ${m.agent} · nodes ${m.nodes.join(", ")} · ${m.brief}`))));
   parts.push(vtSection("Agent session", [
     r.conversation && r.conversation.length ? sessionConversation(r, "lab") : null,
     r.interactive && ["attached", "working"].includes(r.state)

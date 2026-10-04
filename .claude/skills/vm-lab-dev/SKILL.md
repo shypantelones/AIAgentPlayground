@@ -418,6 +418,30 @@ generated shell in each node's provision script.
   Two panel processes can run at once if the old launcher isn't stopped:
   check the bound port before testing.
 
+## Teams (multi-agent labs, team_labs)
+
+- **Data:** `r["team"]` is a list of members `{agent, nodes, stage, brief, chat}`
+  (`chat` is `vmtopo-<rid>-<agent>`). A team lab has `r["agent"] = None`. `lab_agents(r)`
+  gives the agents for a lab; `agent_holds_lab` checks membership, so one lab per agent still holds.
+- **Creation:** `validate_team` (lines `agent | nodes | stage | brief`, max 6 members, stages 1-9,
+  nodes must exist, briefs up to 1000 characters). `create_topo_run` checks each member is running and
+  not already in a lab, and that a team has a shared goal (task or custom prompt).
+- **Run:** `topo_run_runner` calls `topo_team_phase`. Stages run in order; a stage's members run as threads
+  and are joined. `topo_member_turn` injects the key, writes `vmrun-<node>` only for the member's nodes,
+  starts a relay with `relay_command` for those ports, runs one turn, and detaches. A failed member is
+  recorded and the others still run. Intents and score run once after all stages.
+- **Turn:** `topo_agent_turn(r, message, member=...)` uses the member's agent and chat. Snapshots run under
+  `VAGRANT_UP_LOCK`. Change records carry `agent`.
+- **Prompt:** `member_prompt` gives the goal, the role, the member's own `vmrun` commands, the other members
+  (name, nodes, brief), the proxy, and the intents. Kept short: it's sent on every turn.
+- **Gotcha:** tests that call code which saves run records must patch `TOPOR_DIR`. An unpatched test wrote
+  `x.json`/`y.json` into the real `data/topo-runs` and crashed the panel at startup (`load_topo_runs` reads
+  `state`).
+- **Cost:** every command a member runs is a model call. A live two-member test used about 110 commands on one
+  member; check usage on the provider console after any live test.
+- **Not yet verified:** more than two stages, save/resume of a team lab, and a member whose relay fails in a
+  real lab.
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:
