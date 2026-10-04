@@ -2236,7 +2236,8 @@ def topo_rollback(rid, turn):
 
 def topo_agent_turn(r, message):
     t0 = time.time()
-    n = (r.get("agent_turns") or 0) + 1                  # this turn's number, as counted_agent_turn will record it
+    # The lab's own turn counter: agent_turns restarts at 0 on every attach, and snapshot names must stay unique.
+    n = r["change_seq"] = (r.get("change_seq") or 0) + 1
     point = f"before-turn-{n}"
     usable = snapshot_lab_vms(r, point)                  # rollback point: the lab as this turn found it
     before = read_agent_log(r["agent"], TOPO_CHANGE_LOG)
