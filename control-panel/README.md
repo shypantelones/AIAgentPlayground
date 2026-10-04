@@ -165,6 +165,12 @@ commands is refused before anything is built.
   cheapest model buys.
 - **Not yet done:** the same warning on the lab form, and a live check of the cap on a real turn.
 
+#### Lab files and rebuilds
+A lab file keeps each node's configuration (addresses, routes, forwarding, firewall where it isn't ufw-managed, service
+configs). It leaves out the lab's proxy adapter (its address is set by the lab's slot, so a file can't pin it), and it
+leaves out ufw's rules: the rebuilt VM gets its own firewall from its provisioning. A rebuild checks every node against
+the file and reports any difference. Trade-off: a node with hand-written ufw rules won't get them back from a file.
+
 #### Teams: several agents in one lab
 A lab can take a **team** instead of one agent (the "Team" group in the new-lab form, one member per line:
 `agent | nodes | stage | brief`). Each member gets its own relay and `vmrun` commands for its nodes only, and its own

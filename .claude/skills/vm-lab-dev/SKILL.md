@@ -460,6 +460,17 @@ generated shell in each node's provision script.
   `cloudFields` in `static/app.js` shows it and warns below half the cheapest model's count.
 - **Not yet done:** the same warning on the lab form, and a live check of the per-turn cap on a real turn.
 
+## Lab files and snapshots (what a rebuild carries)
+
+- The snapshot script (`vm_runner.SNAPSHOT_SCRIPT`) leaves out the host-only proxy adapter: its addresses, routes, and
+  ufw/nft/iptables lines naming 192.168.56.x, and Vagrant's `50-vagrant.yaml`. A lab file must never pin a proxy
+  address from its source lab's slot.
+- `render_apply_script` skips any nftables or iptables section with `ufw-` chains (reported as "firewall rules (managed by
+  the lab's ufw)"). Restoring them flushed the rebuilt VM's own default-deny and proxy rules. Firewall roles without
+  ufw still restore.
+- Verified: a router lab exported, deleted and rebuilt from its file matches on every node, pings across the router, and
+  keeps ufw active. Not verified: a file from a snapshot taken before this change.
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:
