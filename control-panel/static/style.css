@@ -96,7 +96,7 @@ select{max-width:100%}
 .snap{gap:10px}.snap .num{font-variant-numeric:tabular-nums;color:var(--mute)}
 pre.diff span.add{color:var(--ok)}pre.diff span.del{color:var(--bad)}pre.diff span.hunk{color:var(--mute)}
 .tdg-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;padding:4px;background:var(--bg)}
-.tdg{width:100%;height:auto;display:block}
+.tdg{display:block;max-width:none}
 .tdg-link{stroke:var(--mute);stroke-width:1.5}
 .tdg-node rect{fill:var(--panel);stroke:var(--line);stroke-width:1.5}
 .tdg-router rect,.tdg-firewall rect{stroke:var(--acc)}.tdg-upstream rect{stroke:var(--warn);stroke-dasharray:4 3}

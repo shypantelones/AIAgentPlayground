@@ -49,9 +49,8 @@ function renderTopologyDiagram(d) {
     return { x: TDG.pad + TDG.labelW / 2 + pos[n].c * TDG.colW + TDG.boxW / 2, y: TDG.pad + off + pos[n].r * TDG.rowH + TDG.boxH / 2 };
   };
 
-  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, class: "tdg", role: "img",
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, class: "tdg", role: "img",
     "aria-label": `Topology: ${d.nodes.length} nodes, ${d.links.length} links` });
-  svg.style.maxWidth = `${W}px`;
   const addrs = d.addresses || {};
   const endLabel = (node, iface) => {
     if (!iface) return [];
@@ -64,7 +63,7 @@ function renderTopologyDiagram(d) {
     if (!(l.a in pos) || !(l.b in pos)) continue;
     const A = center(l.a), B = center(l.b);
     svg.append(el("line", { x1: A.x, y1: A.y, x2: B.x, y2: B.y, class: "tdg-link" }));
-    for (const [from, to, node, iface] of [[A, B, l.a, l.a_if], [B, A, l.b, l.b_if]]) {
+    for (const [from, to, node, iface, above] of [[A, B, l.a, l.a_if, true], [B, A, l.b, l.b_if, false]]) {
       const lines = endLabel(node, iface);
       if (!lines.length) continue;
       // where the link leaves this node's box, then a little further along it; anchored away from the box
@@ -73,7 +72,8 @@ function renderTopologyDiagram(d) {
       const x = from.x + ux * t, y = from.y + uy * t;
       const sideways = Math.abs(ux) >= Math.abs(uy) * 0.6;
       const anchor = sideways ? (ux > 0 ? "start" : "end") : "middle";
-      const y0 = sideways ? y - 5 - (lines.length - 1) * 12 : (uy > 0 ? y + 9 : y - 3 - (lines.length - 1) * 12);
+      // a link's two end labels go on opposite sides of it, so long ones can't run into each other
+      const y0 = sideways ? (above ? y - 5 - (lines.length - 1) * 12 : y + 12) : (uy > 0 ? y + 9 : y - 3 - (lines.length - 1) * 12);
       const text = el("text", { x, y: y0, class: "tdg-if", "text-anchor": anchor });
       lines.forEach((ln, i) => text.append(el("tspan", { x, dy: i ? 12 : 0 }, ln)));
       svg.append(text);
