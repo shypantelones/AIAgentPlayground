@@ -1533,6 +1533,7 @@ def topo_run_view(r, full=False):
     v["egress"] = {k: (r.get("egress") or {}).get(k) for k in ("domains", "extra", "port")} if r.get("egress") else None
     v["changes"] = r.get("changes") or []
     v["budget"] = r.get("budget")
+    v["mail"] = (r.get("mail_log") or [])[-60:]
     v["team"] = [{k: m[k] for k in ("agent", "nodes", "stage", "brief")} for m in r["team"]] if r.get("team") else None
     v["plan_first"] = bool(r.get("plan_first"))
     v["plan"] = r.get("plan")
@@ -1773,6 +1774,97 @@ def validate_team(raw, node_names):
     return members
 
 
+TEAM_MAIL_PER_PAIR = 4                       # messages one member may send another in a lab
+TEAM_MAIL_ROUNDS = 6                         # delivery rounds after each stage: a message chain can't run on forever
+TEAM_MAIL_MAX_CHARS = 1000
+TEAM_MAIL_OUTBOX = "/home/node/.openclaw/workspace/.peer-outbox"
+
+
+def peer_msg_script(agent, names):
+    """The ./peer-msg command in a member's workspace: queues a message to a teammate. The panel reads the queue
+    after the member's turn and delivers it in a later round. The text travels base64-encoded, one line per message."""
+    return ("#!/bin/sh\n"
+            "# Send a message to a teammate. Usage: ./peer-msg <name> <message>\n"
+            "to=\"$1\"; shift\n"
+            "case \" " + " ".join(names) + " \" in *\" $to \"*) ;; *) echo \"no teammate called '$to'; teammates are: "
+            + ", ".join(names) + "\" >&2; exit 2;; esac\n"
+            "[ \"$to\" = \"" + agent + "\" ] && { echo \"that is you\" >&2; exit 2; }\n"
+            "[ $# -gt 0 ] || { echo \"usage: ./peer-msg <name> <message>\" >&2; exit 2; }\n"
+            "printf '%s\\t%s\\n' \"$to\" \"$(printf '%s' \"$*\" | base64 | tr -d '\\n')\" >> " + TEAM_MAIL_OUTBOX + "\n"
+            "echo \"queued for $to; it reads it in a later round\"\n")
+
+
+def take_member_outbox(agent):
+    """The messages a member queued during its turn, as [(to, text)]. The outbox is emptied as it's read."""
+    rc, out, _ = dc(agent, "exec", "-T", "gateway", "sh", "-c",
+                    f"cat {TEAM_MAIL_OUTBOX} 2>/dev/null; : > {TEAM_MAIL_OUTBOX}", timeout=20)
+    msgs = []
+    for line in (out or "").splitlines():
+        to, _, b64 = line.partition("\t")
+        if not to or not b64:
+            continue
+        try:
+            msgs.append((to, base64.b64decode(b64).decode("utf-8", errors="replace")))
+        except ValueError:
+            continue
+    return msgs
+
+
+def queue_team_mail(r, sender, messages):
+    """Queue a member's messages for delivery. A pair that has used its messages gets a refusal in the lab's log."""
+    rnd = r.get("mail_round", 0)
+    with TOPO_LOCK:
+        pairs = r.setdefault("mail_pairs", {})
+        for to, text in messages:
+            key = f"{sender}>{to}"
+            text = text[:TEAM_MAIL_MAX_CHARS]
+            entry = {"round": rnd, "from": sender, "to": to, "text": text[:300]}
+            if pairs.get(key, 0) >= TEAM_MAIL_PER_PAIR:
+                r.setdefault("mail_log", []).append(dict(entry, status=f"refused: {sender} has sent {to} "
+                                                                       f"{TEAM_MAIL_PER_PAIR} already"))
+                continue
+            pairs[key] = pairs.get(key, 0) + 1
+            r.setdefault("mail_queue", []).append(dict(entry, text=text))
+            r.setdefault("mail_log", []).append(dict(entry, status="queued"))
+    save_topo_run(r)
+
+
+def deliver_team_mail(r, topology, node_ports, priv, team, stopped):
+    """Deliver queued messages in rounds: each recipient gets one turn with its messages. Replies queued during those
+    turns go out in the next round, up to TEAM_MAIL_ROUNDS."""
+    for rnd in range(1, TEAM_MAIL_ROUNDS + 1):
+        with TOPO_LOCK:
+            queue, r["mail_queue"] = r.get("mail_queue") or [], []
+        if not queue or stopped():
+            break
+        r["mail_round"] = rnd
+        by_to = {}
+        for msg in queue:
+            by_to.setdefault(msg["to"], []).append(msg)
+        for to, msgs in by_to.items():
+            m = next((x for x in team if x["agent"] == to), None)
+            if m is None or stopped():
+                continue
+            lines = "\n".join(f"- from {x['from']}: {x['text']}" for x in msgs)
+            prompt = (f"Messages from your teammates, sent during the last round:\n{lines}\n\n"
+                      "Reply in this turn: run ./peer-msg <name> '<message>' for each one you need to answer. Then keep "
+                      "working on your task, and say what you did.")
+            topo_log(r, f"delivering {len(msgs)} message(s) to {to} (round {rnd})...")
+            for x in msgs:
+                with TOPO_LOCK:
+                    r.setdefault("mail_log", []).append(dict(x, round=rnd, status="delivered"))
+            err = topo_member_turn(r, topology, node_ports, priv, m, team, prompt=prompt)
+            if err:
+                topo_log(r, err)
+    with TOPO_LOCK:
+        left = r.get("mail_queue") or []
+        r["mail_queue"] = []
+    if left:
+        topo_log(r, f"{len(left)} message(s) not delivered: the lab stopped after {TEAM_MAIL_ROUNDS} rounds")
+    r["mail_round"] = 0
+    save_topo_run(r)
+
+
 def member_prompt(r, task, m, team):
     """What one team member is told: the shared goal, its own role and nodes, who the others are, and what the lab
     allows. Kept short: it's sent to a paid model on every turn."""
@@ -1797,6 +1889,11 @@ def member_prompt(r, task, m, team):
     if (r.get("egress") or {}).get("port"):
         parts.append(f"Internet: documentation and package sites only, through the proxy {le.proxy_url(r['egress']['port'])}; "
                      "apt and pip already use it.")
+    if len(team) > 1:
+        parts.append("To message a teammate during your turn: ./peer-msg <name> '<message>' (teammates: "
+                     + ", ".join(x["agent"] for x in team if x is not m)
+                     + f"; up to {TEAM_MAIL_PER_PAIR} messages to each, {TEAM_MAIL_MAX_CHARS} characters each). "
+                     "They read it in a later round, and answer on their own turn.")
     if r.get("intents"):
         parts.append("Lab intents, checked from the source node after the team's work:\n" + li.summary_for_prompt(r["intents"]))
     return "\n\n".join(parts)
@@ -1825,13 +1922,15 @@ def member_keys_set(r, node_ports, rid, m, pub_text, remove=False):
                 raise RuntimeError(f"could not install {m['agent']}'s key on {name}")
 
 
-def topo_member_turn(r, topology, node_ports, priv, m, team):
+def topo_member_turn(r, topology, node_ports, priv, m, team, prompt=None):
     """One team member's turn: its own key (for its role's VM login only), its relay and vmrun wrappers covering its own
     nodes, one turn, then the key is taken back off the nodes and the agent is detached. Returns an error, or None."""
     agent, nodes = m["agent"], m["nodes"]
     topo_log(r, f"attaching {agent} to {', '.join(nodes)}...")
     member_dir = topo_run_dir(r["id"]) / "members" / agent
     member_dir.mkdir(parents=True, exist_ok=True)
+    for old_key in (member_dir / "id_ed25519", member_dir / "id_ed25519.pub"):
+        old_key.unlink(missing_ok=True)                    # ssh-keygen won't overwrite a key file without asking
     mpriv, mpub = vr.gen_keypair(member_dir)
     try:
         member_keys_set(r, node_ports, r["id"], m, mpub.read_text())
@@ -1857,8 +1956,14 @@ def topo_member_turn(r, topology, node_ports, priv, m, team):
     if rc != 0:
         detach_topo_agent(agent)
         return f"{agent}: could not attach its relay (see transcript)"
+    if len(team) > 1:
+        dc(agent, "exec", "-T", "gateway", "sh", "-c",
+           "cat > /home/node/.openclaw/workspace/peer-msg && chmod +x /home/node/.openclaw/workspace/peer-msg",
+           input=peer_msg_script(agent, [x["agent"] for x in team]), timeout=20)
     try:
-        res = topo_agent_turn(r, member_prompt(r, r.get("_task"), m, team), member=m)
+        res = topo_agent_turn(r, prompt or member_prompt(r, r.get("_task"), m, team), member=m)
+        if len(team) > 1:
+            queue_team_mail(r, agent, take_member_outbox(agent))
         return None if res.get("ok") else f"{agent}: its turn failed (see transcript)"
     finally:
         topo_log(r, f"detaching {agent} from this lab...")
@@ -1897,6 +2002,7 @@ def topo_team_phase(r, topology, node_ports, priv, task, stopped):
             t.start()
         for t in threads:
             t.join()
+        deliver_team_mail(r, topology, node_ports, priv, team, stopped)
     r.pop("_task", None)
     if r.get("intents") and not stopped():
         check_and_log_intents(r, priv)
