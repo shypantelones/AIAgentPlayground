@@ -295,7 +295,13 @@ sec addresses; ip -br addr
 sec links; ip -br link
 sec routes; ip route show; echo "# ipv6"; ip -6 route show
 sec forwarding; sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding 2>/dev/null
-if command -v bridge >/dev/null; then sec bridge; bridge link 2>/dev/null; echo "# vlans"; bridge vlan show 2>/dev/null; fi
+if command -v bridge >/dev/null; then
+  sec bridge
+  for b in /sys/class/net/*/bridge; do [ -d "$b" ] && echo "$(basename "$(dirname "$b")") vlan_filtering $(cat "$b/vlan_filtering")"; done
+  bridge link 2>/dev/null; echo "# vlans"; bridge vlan show 2>/dev/null
+fi
+sec "vlan interfaces"
+ip -o -d link show type vlan 2>/dev/null | sed -E 's/^[0-9]+: ([^:]+):.* vlan protocol ([^ ]+) id ([0-9]+).*/\1 \2 \3/'
 if command -v nft >/dev/null; then sec nftables; sudo -n nft list ruleset 2>&1; fi
 if command -v iptables-save >/dev/null; then sec iptables; sudo -n iptables-save 2>&1 | grep -v '^#'; fi
 if command -v vtysh >/dev/null; then
@@ -407,6 +413,7 @@ def render_apply_script(sections):
     alone. Every value is checked and quoted, and file and ruleset contents travel base64-encoded, so a lab file from
     someone else can't inject shell commands. Returns (script, skipped lines)."""
     q, cmds, skipped = shlex.quote, [], []
+    cmds += _vlan_commands(sections, skipped)
     for line in sections.get("addresses", "").splitlines():
         parts = line.split()
         if len(parts) < 2:
@@ -473,6 +480,68 @@ def render_apply_script(sections):
     return f"{body}echo done\n", skipped
 
 
+VLAN_PROTOS = ("802.1Q", "802.1ad")
+VLAN_IF_RE = re.compile(r"^([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+) (802\.1Q|802\.1ad) (\d+)$")
+
+
+def parse_bridge_vlans(text):
+    """The "bridge" snapshot section -> ({bridge: vlan_filtering 0/1}, {port: [(vid, pvid, untagged), ...]}).
+    `bridge vlan show` prints a port's first VLAN on its own line and each further one on an indented line."""
+    filtering, table, port, in_vlans = {}, {}, None, False
+    for line in text.splitlines():
+        toks = line.split()
+        if not toks:
+            continue
+        if line.startswith("# vlans"):
+            in_vlans = True
+            continue
+        if not in_vlans:
+            if len(toks) == 3 and toks[1] == "vlan_filtering" and toks[2] in ("0", "1"):
+                filtering[toks[0]] = int(toks[2])
+            continue
+        if toks[0] == "port":                              # the table's header
+            continue
+        if not line[0].isspace():
+            port, toks = toks[0], toks[1:]
+        if port is None or not toks or not toks[0].isdigit():
+            continue
+        table.setdefault(port, []).append((int(toks[0]), "PVID" in toks, "Untagged" in toks))
+    return filtering, table
+
+
+def _vlan_commands(sections, skipped):
+    """Commands that recreate 802.1Q subinterfaces (e.g. enp0s8.10 on a router) and a bridge's VLAN setup (filtering
+    on, then each port's VLANs: an access port is "pvid untagged", a trunk carries tagged VLANs)."""
+    q, cmds = shlex.quote, []
+    for line in sections.get("vlan interfaces", "").splitlines():
+        if not line.strip():
+            continue
+        m = VLAN_IF_RE.match(line.strip())
+        if not m or not 1 <= int(m.group(4)) <= 4094 or m.group(2) in SETUP_IFACES:
+            skipped.append(f"vlan interface: {line.strip()}")
+            continue
+        name, parent, proto, vid = m.groups()
+        cmds.append(f"ip link show {q(name)} >/dev/null 2>&1 || sudo -n ip link add link {q(parent)} name {q(name)} "
+                    f"type vlan protocol {proto} id {vid}")
+        cmds.append(f"sudo -n ip link set {q(name)} up")
+    filtering, table = parse_bridge_vlans(sections.get("bridge", ""))
+    for br, on in filtering.items():
+        if APPLY_TOKEN_RE.match(br):
+            cmds.append(f"sudo -n ip link set {q(br)} type bridge vlan_filtering {on}")
+    if any(filtering.values()):                            # with filtering off the table is the default, nothing to do
+        for port, vlans in table.items():
+            if not APPLY_TOKEN_RE.match(port) or port in SETUP_IFACES:
+                continue
+            self_ = " self" if port in filtering else ""     # the bridge's own entry
+            for vid, pvid, untagged in vlans:
+                if 1 <= vid <= 4094:
+                    cmds.append(f"sudo -n bridge vlan add dev {q(port)} vid {vid}" + (" pvid" if pvid else "")
+                                + (" untagged" if untagged else "") + self_)
+            if 1 not in [v[0] for v in vlans]:
+                cmds.append(f"sudo -n bridge vlan del dev {q(port)} vid 1{self_}")
+    return cmds
+
+
 def _compare_view(sec, text):
     """What has to match between the lab file and the rebuilt node: lab interfaces and static routes only (MACs,
     link-local and setup-NIC addresses legitimately differ between two VMs)."""
@@ -489,6 +558,10 @@ def _compare_view(sec, text):
             if any(t in SETUP_IFACES for t in toks) or "fe80::/64" in toks or _route_proto(toks) in DAEMON_PROTOS:
                 continue                                  # daemon-learned routes reconverge on their own time
         lines.append(" ".join(toks))
+    if sec == "bridge":                                   # the VLAN setup only (port state/cost lines can vary)
+        filtering, table = parse_bridge_vlans(text)
+        return sorted([f"{b} vlan_filtering {v}" for b, v in filtering.items()] +
+                      [f"{p} {vid} {pv} {un}" for p, vl in table.items() for vid, pv, un in vl])
     return sorted(lines)
 
 
@@ -496,7 +569,7 @@ def config_mismatches(wanted, live):
     """Sections of a node's lab-file config that the rebuilt node doesn't match (addresses, routes, forwarding,
     firewall). [] means the rebuild is faithful."""
     out = []
-    for sec in ("addresses", "routes", "forwarding", "nftables", "frr"):
+    for sec in ("addresses", "routes", "forwarding", "nftables", "frr", "bridge", "vlan interfaces"):
         if sec in wanted and _usable(wanted[sec]) and _compare_view(sec, wanted[sec]) != _compare_view(sec, live.get(sec, "")):
             out.append(sec)
     return out
