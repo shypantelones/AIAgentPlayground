@@ -867,6 +867,19 @@ VM_PROMPT_MAX = 20_000
 VM_FOLLOWUP_REMINDER = "\n\n(Use ./vmrun as before; check output before replying.)"
 
 
+def agent_attachments(agent_name):
+    """The VM and network-lab runs an agent is working in right now, for the agent's window header."""
+    out = []
+    for r in list(VM_RUNS.values()):
+        if r.get("agent") == agent_name and r["state"] in VM_LIVE_STATES:
+            out.append({"kind": "vm", "id": r["id"], "title": r.get("task_title") or ("own prompt" if r.get("custom_prompt") else "scratch VM"),
+                        "state": r["state"]})
+    for r in list(TOPO_RUNS.values()):
+        if agent_holds_lab(r, agent_name):
+            out.append({"kind": "network", "id": r["id"], "title": r.get("topology_title") or "lab", "state": r["state"]})
+    return out
+
+
 def stop_vm_runs_for(agent_name):
     # VM_OCCUPYING_STATES (not the narrower VM_LIVE_STATES): this can only ever match an agent-attached run (the
     # agent_name filter excludes no-agent runs entirely), and for those, "ready" is a momentary transit state on
@@ -3392,7 +3405,8 @@ def build_state():
                       "cloudModel": m.get("cloud_model", ""), "rate": m.get("rate", 30),
                       "upstream": m.get("upstream", ""), "tokenSet": has_token(n),
                       "created": m.get("created"), "status": status,
-                      "services": {k: v["state"] for k, v in svc.items()}})
+                      "services": {k: v["state"] for k, v in svc.items()},
+                      "attachments": agent_attachments(n)})
     return {"docker": True, "shared": shared_info, "instances": insts,
             "platform": {"os": ps.OS_NAME, "secretStore": STORE.label, "secretKind": STORE.kind},
             "legacy": "openclaw-sandbox" in states and any(s["state"] == "running" for s in states["openclaw-sandbox"].values()),
