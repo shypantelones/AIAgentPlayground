@@ -942,6 +942,69 @@ class LabFileRunTests(VmTopoBase):
         self.assertTrue(self.applied, "configs were applied before the agent's turn")
 
 
+class RouterPromptTests(VmTopoBase):
+    def prompt_for(self, topology_id):
+        self.add_agent("alpha")
+        prompts = []
+        with mock.patch.object(app, "run_turn", lambda name, chat, msg, *a, **k: prompts.append(msg) or {"reply": "ok", "ok": True}):
+            rid = app.create_topo_run({"topology_id": topology_id, "agent": "alpha", "custom_prompt": "x"})
+            self.assertTrue(self.finished(rid))
+        return prompts[0]
+
+    def test_labs_with_routers_tell_the_agent_about_frr(self):
+        self.assertIn("vtysh", self.prompt_for("r2s2h2"))
+
+    def test_every_lab_prompt_warns_about_the_setup_network(self):
+        self.assertIn("10.0.2.0/24", self.prompt_for("s1h2"))
+
+    def test_labs_without_routers_do_not(self):
+        self.assertNotIn("vtysh", self.prompt_for("s1h2"))
+
+
+class PortCollisionTests(VmTopoBase):
+    """Vagrant refusing a node's forwarded port because something else answered on it: that node gets a new port and
+    `vagrant up` runs again, instead of the whole lab failing (found building a 6-node lab on Windows)."""
+
+    def collide(self, node, times=1):
+        state = {"left": times}
+        real = self.fake_vagrant_stream
+        renders = []
+
+        def stream(run_dir, *args, on_line=None, timeout=120, cancel=None):
+            if args[0] == "up" and state["left"]:
+                state["left"] -= 1
+                rid = run_dir.name
+                port = app.TOPO_RUNS[rid]["nodes"][node]["ssh_port"]
+                self.calls.append(("vagrant", args))
+                return 1, f"Vagrant cannot forward the specified ports on this VM... The forwarded port to {port} is already in use\non the host machine.", ""
+            return real(run_dir, *args, on_line=on_line, timeout=timeout, cancel=cancel)
+        return stream, renders
+
+    def test_the_colliding_node_gets_a_new_port_and_the_build_continues(self):
+        stream, _ = self.collide("sw1")
+        renders = []
+        with mock.patch.object(vr, "vagrant_stream", stream), \
+             mock.patch.object(vr, "render_topology_vagrantfile", lambda d, rid, topo, ports, *a, **k: renders.append(dict(ports))):
+            rid = app.create_topo_run({"topology_id": "s1h2"})
+            self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] in ("ready", "error")))
+        r = app.TOPO_RUNS[rid]
+        self.assertEqual(r["state"], "ready", r.get("reason"))
+        self.assertEqual(len(renders), 2, "re-rendered once with the new port")
+        self.assertNotEqual(renders[0]["sw1"], renders[1]["sw1"])
+        self.assertEqual({n: p for n, p in renders[0].items() if n != "sw1"}, {n: p for n, p in renders[1].items() if n != "sw1"})
+        self.assertEqual(r["nodes"]["sw1"]["ssh_port"], renders[1]["sw1"])
+        self.assertIn("was taken by something else", r["vm_log"])
+        self.assertEqual(len([c for c in self.calls if c[0] == "vagrant" and c[1][0] == "up"]), 2)
+
+    def test_it_gives_up_after_a_few_tries(self):
+        stream, _ = self.collide("sw1", times=99)
+        with mock.patch.object(vr, "vagrant_stream", stream):
+            rid = app.create_topo_run({"topology_id": "s1h2"})
+            self.assertTrue(wait_for(lambda: app.TOPO_RUNS[rid]["state"] in ("ready", "error")))
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "error")
+        self.assertEqual(len([c for c in self.calls if c[0] == "vagrant" and c[1][0] == "up"]), vr.PORT_COLLISION_RETRIES + 1)
+
+
 class TaskWithAgentTests(VmTopoBase):
     def test_agent_must_exist_and_be_running(self):
         with self.assertRaises(KeyError):

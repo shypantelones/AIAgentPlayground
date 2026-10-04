@@ -271,6 +271,75 @@ class LabFileTests(unittest.TestCase):
         self.assertEqual(vr.config_mismatches(wanted, dict(live, forwarding="net.ipv4.ip_forward = 0\n")), ["forwarding"])
 
 
+class FrrTests(unittest.TestCase):
+    """FRR on router nodes: installed with OSPF/OSPFv3/BGP available, its running config captured in snapshots and
+    restored from lab files, and routes it learns treated as derived rather than static config."""
+
+    def test_routers_get_frr_hosts_do_not(self):
+        router = vr._topo_provision_script("router", "KEY")
+        self.assertIn(" frr", router)
+        self.assertIn("(ospfd|ospf6d|bgpd)=no", router)
+        self.assertIn("usermod -aG frrvty,frr bench", router)
+        self.assertIn("systemctl restart frr", router)
+        self.assertLess(router.index("useradd"), router.index("usermod"), "bench must exist before joining frrvty")
+        host = vr._topo_provision_script("host", "KEY")
+        self.assertNotIn("frr", host)
+        result = subprocess.run(["sh", "-n"], input=router, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_snapshots_capture_the_running_config(self):
+        self.assertIn("vtysh -c 'show running-config'", vr.SNAPSHOT_SCRIPT)
+        out = vr.parse_snapshot("### frr\nfrr version 8.1\nhostname r1\nrouter ospf\n network 10.0.0.0/30 area 0\n!\n")
+        self.assertIn("network 10.0.0.0/30 area 0", out["frr"])
+
+    def test_lab_files_restore_the_running_config_and_skip_learned_routes(self):
+        secs = {"frr": "hostname r1\nrouter ospf\n network 10.0.0.0/30 area 0\n",
+                "file /etc/frr/frr.conf": "hostname stale\n", "file /etc/frr/daemons": "ospfd=yes\n",
+                "routes": "10.0.2.0/24 nhid 12 via 10.0.0.2 dev enp0s9 proto ospf metric 20\n"
+                          "10.0.9.0/24 via 10.0.0.2 dev enp0s9 proto bgp metric 20\n10.0.7.0/24 via 10.0.0.2 dev enp0s9\n"}
+        script, skipped = vr.render_apply_script(secs)
+        import base64
+        self.assertIn(base64.b64encode(secs["frr"].encode()).decode(), script)
+        self.assertNotIn(base64.b64encode(b"hostname stale\n").decode(), script, "the running config wins over a stale file")
+        self.assertIn("tee /etc/frr/daemons", script)
+        self.assertIn("systemctl restart frr", script)
+        self.assertIn("ip route replace 10.0.7.0/24 via 10.0.0.2 dev enp0s9", script)
+        self.assertNotIn("10.0.2.0/24", script, "OSPF-learned routes come back from OSPF, not by hand")
+        self.assertNotIn("10.0.9.0/24", script)
+        self.assertEqual(skipped, [])
+
+    def test_rebuild_check_compares_frr_config_not_learned_routes(self):
+        wanted = {"routes": "10.0.2.0/24 via 10.0.0.2 dev enp0s9 proto ospf metric 20\n", "frr": "router ospf\n network 10.0.0.0/30 area 0\n"}
+        live = {"routes": "", "frr": "router ospf\n network 10.0.0.0/30 area 0\n"}
+        self.assertEqual(vr.config_mismatches(wanted, live), [], "OSPF reconverges on its own time; not a mismatch")
+        self.assertEqual(vr.config_mismatches(wanted, dict(live, frr="router ospf\n")), ["frr"])
+
+    def test_ospf_task_is_in_the_catalog_and_its_check_parses(self):
+        task = vr.get_topology_task("r2s2h2-ospf")
+        topo = vr.get_topology(task["topology_id"])
+        self.assertIn(task["check_node"], [n["name"] for n in topo["nodes"]])
+        self.assertEqual(next(n["role"] for n in topo["nodes"] if n["name"] == task["check_node"]), "router")
+        result = subprocess.run(["sh", "-n"], input=task["check"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Full", task["check"])
+        self.assertIn("proto ospf", task["check"])
+
+    def test_ospf_task_stays_clear_of_the_setup_network(self):
+        # regression: its first addressing plan put a LAN on 10.0.2.0/24, the VirtualBox NAT subnet on every node's
+        # setup NIC, so r1 preferred that connected route over the OSPF-learned one and the lab could never pass
+        task = vr.get_topology_task("r2s2h2-ospf")
+        self.assertNotIn("10.0.2.", task["prompt"] + task["check"])
+
+
+class PortCollisionParseTests(unittest.TestCase):
+    def test_parses_vagrants_message(self):
+        msg = ("Vagrant cannot forward the specified ports on this VM, since they\nwould collide with some other "
+               "application that is already listening\non these ports. The forwarded port to 62416 is already in use\non the host machine.")
+        self.assertEqual(vr.port_collision(msg), 62416)
+        self.assertIsNone(vr.port_collision("some other failure"))
+        self.assertIsNone(vr.port_collision(None))
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to
