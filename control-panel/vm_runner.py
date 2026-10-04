@@ -799,7 +799,12 @@ def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None, de
         # commands in at once under parallel load here. No EXIT trap: the pipeline's subshells inherit it.
         budget = (f"if [ -f \"{budget_file}\" ]; then\n"
                   f"  lock=\"{budget_file}.lock\"\n"
-                  "  while ! ( set -C; : > \"$lock\" ) 2>/dev/null; do sleep 0.05; done\n"
+                  # a lock older than a minute was left by a command that died inside it: take it over, or every later
+                  # command in this workspace would wait forever. find -mmin works on GNU and BSD systems alike.
+                  "  while ! ( set -C; : > \"$lock\" ) 2>/dev/null; do\n"
+                  "    if [ -n \"$(find \"$lock\" -mmin +1 2>/dev/null)\" ]; then rm -f \"$lock\"; fi\n"
+                  "    sleep 0.05\n"
+                  "  done\n"
                   f"  n=$(cat \"{budget_file}\" 2>/dev/null)\n"
                   "  case \"$n\" in ''|*[!0-9]*) n=0;; esac\n"
                   "  if [ \"$n\" -le 0 ]; then\n"
