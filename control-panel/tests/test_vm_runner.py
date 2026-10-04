@@ -340,6 +340,74 @@ class PortCollisionParseTests(unittest.TestCase):
         self.assertIsNone(vr.port_collision(None))
 
 
+class VlanTests(unittest.TestCase):
+    """VLANs: a switch's bridge VLAN setup and 802.1Q subinterfaces are captured, restored from lab files (subinterfaces
+    before their addresses) and compared in the rebuild check."""
+
+    BRIDGE = ("br0 vlan_filtering 1\n3: enp0s8: <BROADCAST,UP> mtu 1500 master br0 state forwarding priority 32 cost 4\n"
+              "# vlans\nport              vlan-id\nenp0s8            10 PVID Egress Untagged\nenp0s9            20 PVID Egress Untagged\n"
+              "enp0s10           10\n                  20\nbr0               1 PVID Egress Untagged\n")
+
+    def test_parse_bridge_vlans(self):
+        filtering, table = vr.parse_bridge_vlans(self.BRIDGE)
+        self.assertEqual(filtering, {"br0": 1})
+        self.assertEqual(table["enp0s8"], [(10, True, True)])
+        self.assertEqual(table["enp0s10"], [(10, False, False), (20, False, False)], "continuation lines belong to the port above")
+        self.assertEqual(table["br0"], [(1, True, True)])
+
+    def test_snapshot_captures_filtering_and_subinterfaces(self):
+        self.assertIn("vlan_filtering", vr.SNAPSHOT_SCRIPT)
+        self.assertIn('sec "vlan interfaces"', vr.SNAPSHOT_SCRIPT)
+
+    def test_apply_restores_vlans_before_addresses(self):
+        script, skipped = vr.render_apply_script({"bridge": self.BRIDGE,
+                                                  "vlan interfaces": "enp0s8.10@enp0s8 802.1Q 10\n",
+                                                  "addresses": "enp0s8.10@enp0s8 UP 192.168.10.1/24\n"})
+        self.assertIn("ip link add link enp0s8 name enp0s8.10 type vlan protocol 802.1Q id 10", script)
+        self.assertLess(script.index("type vlan"), script.index("ip addr replace 192.168.10.1/24 dev enp0s8.10"))
+        self.assertIn("ip link set br0 type bridge vlan_filtering 1", script)
+        self.assertIn("bridge vlan add dev enp0s8 vid 10 pvid untagged", script)
+        self.assertIn("bridge vlan del dev enp0s8 vid 1", script)
+        self.assertIn("bridge vlan add dev enp0s10 vid 20\n", script.replace(" ||", "\n"))
+        self.assertIn("bridge vlan add dev br0 vid 1 pvid untagged self", script)
+        self.assertNotIn("bridge vlan del dev br0", script, "the bridge itself keeps VLAN 1")
+        self.assertEqual(skipped, [])
+        self.assertEqual(subprocess.run(["sh", "-n"], input=script, capture_output=True, text=True).returncode, 0)
+
+    def test_an_unfiltered_switch_needs_no_vlan_commands(self):
+        plain = "br0 vlan_filtering 0\n# vlans\nport vlan-id\nenp0s8 1 PVID Egress Untagged\nbr0 1 PVID Egress Untagged\n"
+        script, _ = vr.render_apply_script({"bridge": plain})
+        self.assertIn("vlan_filtering 0", script)
+        self.assertNotIn("bridge vlan add", script)
+        self.assertNotIn("bridge vlan del", script)
+
+    def test_bad_vlan_lines_are_refused(self):
+        script, skipped = vr.render_apply_script({"vlan interfaces": "x;reboot@enp0s8 802.1Q 10\nenp0s8.9999@enp0s8 802.1Q 9999\n"
+                                                                     "enp0s3.5@enp0s3 802.1Q 5\n"})
+        self.assertNotIn("reboot", script)
+        self.assertNotIn("9999", script)
+        self.assertNotIn("enp0s3", script, "never on the setup NIC")
+        self.assertEqual(len(skipped), 3)
+
+    def test_rebuild_check_compares_the_vlan_setup_not_port_state(self):
+        live = self.BRIDGE.replace("state forwarding", "state learning")
+        self.assertEqual(vr.config_mismatches({"bridge": self.BRIDGE}, {"bridge": live}), [])
+        self.assertEqual(vr.config_mismatches({"bridge": self.BRIDGE}, {"bridge": self.BRIDGE.replace("vlan_filtering 1", "vlan_filtering 0")}), ["bridge"])
+        self.assertEqual(vr.config_mismatches({"vlan interfaces": "enp0s8.10@enp0s8 802.1Q 10\n"}, {"vlan interfaces": ""}), ["vlan interfaces"])
+
+    def test_vlan_task_is_in_the_catalog_and_its_check_parses(self):
+        task = vr.get_topology_task("r1s1h2-vlans")
+        topo = vr.get_topology(task["topology_id"])
+        self.assertEqual(next(n["role"] for n in topo["nodes"] if n["name"] == task["check_node"]), "router")
+        self.assertEqual(subprocess.run(["sh", "-n"], input=task["check"], capture_output=True, text=True).returncode, 0)
+        self.assertNotIn("10.0.2.", task["prompt"] + task["check"])
+        # the port map in the prompt must match the topology's link order (it decides sw1's interface names)
+        sw_links = [l for l in topo["links"] if "sw1" in (l["a"], l["b"])]
+        for i, link in enumerate(sw_links):
+            peer = link["a"] if link["b"] == "sw1" else link["b"]
+            self.assertIn(f"enp0s{8 + i} {'connects ' if i == 0 else ''}to {peer}", task["prompt"])
+
+
 class SshBaseTests(unittest.TestCase):
     def test_user_known_hosts_file_option_is_a_single_well_formed_argument(self):
         """Regression (found via real boot testing - 100% reproducible, not flaky VM timing): the ternary used to

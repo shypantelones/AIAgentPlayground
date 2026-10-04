@@ -957,6 +957,11 @@ class RouterPromptTests(VmTopoBase):
     def test_every_lab_prompt_warns_about_the_setup_network(self):
         self.assertIn("10.0.2.0/24", self.prompt_for("s1h2"))
 
+    def test_lab_prompts_explain_vlans_on_switches(self):
+        p = self.prompt_for("s1h2")
+        self.assertIn("vlan_filtering 1", p)
+        self.assertIn("pvid untagged", p)
+
     def test_labs_without_routers_do_not(self):
         self.assertNotIn("vtysh", self.prompt_for("s1h2"))
 
