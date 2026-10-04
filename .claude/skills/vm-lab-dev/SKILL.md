@@ -471,6 +471,20 @@ generated shell in each node's provision script.
 - Verified: a router lab exported, deleted and rebuilt from its file matches on every node, pings across the router, and
   keeps ufw active. Not verified: a file from a snapshot taken before this change.
 
+## Agent roles (lab_roles.py)
+
+- `ROLES` maps a role name to `for`, `refuses` (plain words for the prompt), and `denied` (ERE patterns for grep).
+  `ALWAYS_DENIED` (power and disk operations) applies to every role, and to members with no role.
+- A team line takes its role from the brief: `[web-admin] ...`. `role_of` strips it; `validate_team` stores `role`.
+- `topo_member_turn` passes `deny=lr.denied_patterns(role)` to `vmrun_script`. The wrapper checks the argument string
+  (or the script on stdin) before anything runs: a match logs `REFUSED by this agent's role` and exits 4.
+- **Gotcha:** the wrapper uses `grep -Eq` with `\b`. GNU grep 3.8 (Debian in the agent image) handles it; busybox
+  may not. Check the image's grep before adding a pattern that depends on `\b`.
+- **Guard vs boundary:** the guard is a pattern check, and the agent holds the lab key. Hard enforcement means VM-side users
+  with restricted sudo, one per role. Not built yet.
+- **Tested:** unit tests for parsing and the prompt; the real wrapper with a fake ssh; a live router test with network-admin
+  and web-admin (intents and score passed, no refusals in the real run). Not tested live: firewall-admin, client-dev, tool-dev.
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:
