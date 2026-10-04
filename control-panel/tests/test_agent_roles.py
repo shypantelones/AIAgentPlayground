@@ -64,7 +64,6 @@ class GuardTests(unittest.TestCase):
         try:
             priv = tmp / "id_ed25519"; priv.write_text("key")
             (tmp / "topo-runs").mkdir()
-            (tmp / "topo-runs").mkdir()
             topo = vr.get_topology("s1h2")
             m = {"agent": "beta", "nodes": ["h2"], "stage": 1, "brief": "x", "role": "web-admin", "chat": "c"}
             r = {"id": "rl", "nodes": {"h2": {"role": "host"}, "h1": {"role": "host"}, "sw1": {"role": "switch"}},

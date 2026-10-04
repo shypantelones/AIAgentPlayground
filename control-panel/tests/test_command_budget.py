@@ -119,7 +119,7 @@ class WrapperBudgetTests(unittest.TestCase):
     def test_the_wrapper_takes_one_from_the_budget_and_refuses_at_zero(self):
         self.assertIn('echo $((n - 1)) > "/w/.vmrun-budget.tmp" && mv "/w/.vmrun-budget.tmp" "/w/.vmrun-budget"',
                       vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
-        self.assertIn("flock 9", vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
+        self.assertIn("set -C", vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
         self.assertIn('"$n" -le 0', vr.vmrun_script("/k", 1, "h", "/l", node="h1", budget_file="/w/.vmrun-budget"))
 
     def test_a_wrapper_without_a_budget_file_is_unchanged(self):
