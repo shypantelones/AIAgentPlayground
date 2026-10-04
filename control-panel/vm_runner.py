@@ -729,17 +729,9 @@ def vmrun_script(key_path, port, host, log_path):
             f"printf '%s\\n' \"$script\" | {ssh} 'bash -s' 2>&1 | tee -a \"$LOG\"\n")
 
 
-VMRUN_HOWTO = (
-    "Your own shell expands $variables inside double quotes before the command reaches the machine, so pass a "
-    "one-line command in single quotes, and send anything longer, or anything containing $, as a script on "
-    "standard input with a quoted heredoc - nothing inside it is changed:\n"
-    "{cmd} <<'EOF'\n"
-    "cat > /tmp/example.sh <<'INNER'\n"
-    "for i in 1 2 3; do echo \"$i\"; done\n"
-    "INNER\n"
-    "chmod +x /tmp/example.sh && /tmp/example.sh\n"
-    "EOF"
-)
+# Sent to the agent with every VM/lab prompt, so kept short (each word costs tokens on every run).
+VMRUN_HOWTO = ("Use single quotes for one-liners; send longer scripts or anything with $ as a quoted heredoc "
+               "(arrives unchanged): {cmd} <<'EOF' ... EOF")
 
 
 def relay_port_for_node(topology, name):
