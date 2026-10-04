@@ -209,7 +209,8 @@ async function loadVTDetail() {
   let r; try { r = await api("/api/vmtopo/runs/" + vtSelRun); } catch { vtSelRun = null; return; }
   const key = [r.id, r.state, r.transcript.length, r.score && r.score.passed,
               Object.values(r.nodes).map(n => n.terminal.active).join(","), (r.conversation || []).length,
-              (r.captures || []).map(c => c.state).join(","), (r.intent_results || []).map(x => x.passed).join(",")].join("|");
+              (r.captures || []).map(c => c.state).join(","), (r.intent_results || []).map(x => x.passed).join(","),
+              (r.changes || []).map(c => `${c.turn}${c.rolled_back ? "x" : ""}`).join(","), r.restoring].join("|");
   if (key === vtSig.detail) return;
   vtSig.detail = key;
   const live = ["queued", "provisioning", "working", "attached", "scoring", "resuming"].includes(r.state);
@@ -288,6 +289,7 @@ async function loadVTDetail() {
     })));
   }
   if (["ready", "working", "attached", "done"].includes(r.state)) parts.push(vtCaptures(r));
+  if ((r.changes || []).length) parts.push(vtChanges(r));
   parts.push(h("div", { class: "hint" }, "Live transcript:"));
   parts.push(h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)"));
   replaceKeepingFocus(VT.detail, parts);
@@ -332,6 +334,32 @@ function vtAttachBox(r) {
    download it as a zip, or compare any two. The picks and the open view survive the detail view's redraws. */
 let vtSnap = { rid: null, picks: [], view: null };
 const VT_SNAP_STATES = ["ready", "working", "attached", "scoring", "done", "stopped"];
+
+/* Change log: the agent's commands per node and turn, with a rollback point before each turn. Rolling back restores
+   every node to how it was before that turn; the turns after it are kept, marked as rolled back. */
+function vtChanges(r) {
+  const canRollBack = r.state === "ready" && !r.restoring && !r.agent_holds;
+  const turns = r.changes.slice().reverse().map(c => {
+    const rows = c.commands.map(x => h("details", {}, h("summary", {}, `${x.node || "?"} $ ${x.command}`),
+      h("pre", {}, x.output || "(no output)")));
+    const more = c.command_count > c.commands.length ? h("div", { class: "hint" }, `…and ${c.command_count - c.commands.length} more not listed`) : null;
+    const rollBtn = c.point && !c.rolled_back ? h("button", { disabled: !canRollBack, onclick: async () => {
+      if (!confirm(`Roll every node back to how it was before turn ${c.turn}? The turns after it are kept as a record, but their changes are undone.`)) return;
+      try { await api(`/api/vmtopo/runs/${r.id}/rollback`, { turn: c.turn }); vtSig.detail = ""; vtLoad(); }
+      catch (e) { alert(e.message); }
+    } }, `Roll back to before turn ${c.turn}`) : null;
+    return h("div", { class: "col" + (c.rolled_back ? " hint" : "") },
+      h("div", { class: "row" }, h("b", {}, `Turn ${c.turn}${c.rolled_back ? " (rolled back)" : ""}`),
+        h("span", { class: "status" }, `${c.command_count} command${c.command_count === 1 ? "" : "s"}${c.point ? "" : " · no rollback point"}`),
+        h("span", { class: "sp" }), rollBtn),
+      ...rows, more);
+  });
+  return h("div", { class: "col bench" },
+    h("b", {}, "Change log"),
+    h("p", { class: "hint" }, "Every command the agent ran, per node and per turn. Rolling back needs the lab to be ready with no agent in it."),
+    r.restoring ? h("div", { class: "hint" }, "Rolling back...") : null,
+    ...turns);
+}
 
 /* Packet capture: tcpdump on one node's interface for a set time. The .pcap downloads for Wireshark. */
 function vtCaptures(r) {
