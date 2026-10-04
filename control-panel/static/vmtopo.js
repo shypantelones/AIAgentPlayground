@@ -139,13 +139,14 @@ function vtBuildSection() {
   VT.newKeep = h("input", { type: "checkbox" });
   VT.newInteractive = h("input", { type: "checkbox" });
   VT.newPlanFirst = h("input", { type: "checkbox" });
+  VT.newDomains = h("textarea", { rows: 2, placeholder: "e.g. docs.example.org (one per line, for a niche tool)" });
   VT.newMsg = h("div", { class: "fail" });
   const create = h("button", { class: "primary", onclick: async () => {
     VT.newMsg.textContent = "";
     const agents = [...VT.newAgents.querySelectorAll("input:checked")].map(x => x.value);
     if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
     const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked, intents: VT.newIntents.value,
-                   plan_first: VT.newPlanFirst.checked };
+                   plan_first: VT.newPlanFirst.checked, extra_domains: VT.newDomains.value };
     if (VT.fileOn.checked) {
       if (!VT.labfile) { VT.newMsg.textContent = "Choose a lab file first."; return; }
       body.labfile = VT.labfile;
@@ -203,7 +204,9 @@ function vtBuildSection() {
         h("div", { class: "hint" }, "The agent keeps its access to every node after its first reply so you can send it more guidance. It ends when you press End session, or after 2 hours with no new message."),
         h("label", { class: "row" }, VT.newPlanFirst, "plan first"),
         h("div", { class: "hint" }, "The agent writes its plan with no access to the nodes. Nothing runs until you approve the plan on the lab's page. Needs an agent.")),
-      vtGroup("5. Keep the VMs?", null,
+      vtGroup("5. Internet", "The lab's VMs reach documentation and package sites for their roles, through a proxy that checks each hostname. Add a site here if a niche tool needs one.",
+        VT.newDomains),
+      vtGroup("6. Keep the VMs?", null,
         h("label", { class: "row" }, VT.newKeep, "keep these VMs running afterward, for later inspection")),
       VT.newMsg, h("div", { class: "row" }, create)),
     vtFold("Draft a lab from a diagram", false, vtDraftSection()),
@@ -311,8 +314,13 @@ async function loadVTDetail() {
     h("div", { class: r.score.passed ? "pass" : "fail" }, r.score.passed ? "PASS" : "FAIL", ` (${r.score.duration_s}s)`),
     h("pre", {}, r.score.output)] : [];
 
+  const eg = r.egress;
   parts.push(vtSection("Status", [
-    r.custom_prompt ? h("pre", {}, r.custom_prompt) : null]));
+    r.custom_prompt ? h("pre", {}, r.custom_prompt) : null,
+    eg ? h("div", { class: "hint" }, eg.port
+      ? `Internet: ${eg.domains.length} documentation and package sites through the proxy on 192.168.56.1:${eg.port}` +
+        (eg.extra && eg.extra.length ? `, including ${eg.extra.join(", ")} (added for this lab)` : "") + "."
+      : "Internet: the proxy starts when the lab is built.") : null]));
   parts.push(vtSection("Topology", [
     r.diagram ? h("details", { open: "" }, h("summary", {}, "Topology diagram"),
       renderTopologyDiagram(r.diagram),

@@ -21,6 +21,7 @@ PROTO_RE = re.compile(r"^(icmp|tcp/(\d{1,5}))\s+(reach|block)$")
 PATH_RE = re.compile(r"^path\s+via\b\s*(.*)$")
 # Addresses that aren't part of the lab: the setup network every VM has, loopback and link-local.
 SETUP_NET = ipaddress.ip_network("10.0.2.0/24")
+PROXY_NET = ipaddress.ip_network("192.168.56.0/24")   # the host-only link to the lab's internet proxy
 
 
 def parse_intent(line, node_names=None):
@@ -94,7 +95,7 @@ def parse_addresses(output):
     for m in re.finditer(r"\binet (\d+\.\d+\.\d+\.\d+)/\d+", output or ""):
         ip = m.group(1)
         addr = ipaddress.IPv4Address(ip)
-        if addr in SETUP_NET or addr.is_loopback or addr.is_link_local:
+        if addr in SETUP_NET or addr in PROXY_NET or addr.is_loopback or addr.is_link_local:
             continue
         found.append(ip)
     return found
