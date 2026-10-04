@@ -772,7 +772,7 @@ def vm_name_for_node(rid, name):
     return f"aiagentplayground-vmtopo-{rid}-{name}"
 
 
-def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None):
+def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None, deny=None):
     """The `vmrun` wrapper put in an agent's workspace: runs commands on a VM through its relay and logs them.
     With `node`, each log entry names the node too ("=== <time> <node> $ <command>"), so a lab's change log can say
     which node a command ran on. Without it the entries are "=== <time> $ <command>", as before.
@@ -800,11 +800,26 @@ def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None):
                   "  fi\n"
                   f"  echo $((n - 1)) > \"{budget_file}\"\n"
                   "fi\n")
+    # A role guard (see lab_roles): a command matching one of the role's patterns is refused and logged as refused.
+    # Patterns are ERE for grep; none may contain a single quote.
+    guard = ""
+    if deny:
+        pat = "|".join(deny)
+        if "'" in pat:
+            raise ValueError("a guard pattern can't contain a single quote")
+        guard = (f"  if printf '%s' \"$1\" | grep -Eq '{pat}'; then\n"
+                 "    echo \"=== $ts " + label + "\\$ REFUSED by this agent's role: $*\" >> \"$LOG\"\n"
+                 "    echo \"refused: this command is outside your role. Ask the member who owns it.\" >&2\n"
+                 "    exit 4\n"
+                 "  fi\n")
+    arg_guard = guard.replace('"$1"', '"$*"')
+    script_guard = guard.replace('"$1"', '"$script"').replace("$*", "(script on stdin)")
     return ("#!/bin/sh\n"
             f"LOG={log_path}\n"
             + budget +
             "ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n"
             "if [ $# -gt 0 ]; then\n"
+            + arg_guard +
             "  echo \"=== $ts " + label + "\\$ $*\" >> \"$LOG\"\n"
             f"  {ssh} \"$@\" 2>&1 | tee -a \"$LOG\"\n"
             "  exit 0\n"
@@ -816,6 +831,7 @@ def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None):
             "if [ -z \"$script\" ]; then\n"
             "  echo \"usage: $0 'command'   or   $0 <<'EOF' (script lines) EOF\" >&2; exit 2\n"
             "fi\n"
+            + script_guard.replace("  if printf", "if printf").replace("\n  ", "\n") +
             "printf '=== %s " + label + "$ (script on stdin)\\n%s\\n' \"$ts\" \"$script\" >> \"$LOG\"\n"
             f"printf '%s\\n' \"$script\" | {ssh} 'bash -s' 2>&1 | tee -a \"$LOG\"\n")
 
