@@ -843,6 +843,7 @@ def store_token(name, token):
 #   - vm-terminal: a standalone, on-demand web terminal (ttyd) for the PERSON using the panel; started only when they
 #     click "Open terminal", published to 127.0.0.1 only, with a fresh random credential each time.
 import vm_runner as vr  # noqa: E402  (Vagrant/VirtualBox lifecycle; pure logic is testable without Docker/VirtualBox)
+import lab_intents as li  # noqa: E402  (intent lines -> checks run from each source node; pure logic, tested alone)
 
 VMR_DIR = ROOT / "data" / "vm-runs"
 VMR_DIR.mkdir(parents=True, exist_ok=True)
@@ -1500,6 +1501,8 @@ def topo_run_view(r, full=False):
     v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
     if full:
         v["diagram"] = topo_run_diagram(r)
+    v["intents"] = [i["text"] for i in r.get("intents") or []]
+    v["intent_results"] = r.get("intent_results")
     v["from_labfile"] = (r.get("labfile") or {}).get("title")
     v["labfile_check"] = r.get("labfile_check")
     v.update({k: r.get(k) for k in ("saved_at", "resumed", "agent_done")})
@@ -1578,6 +1581,11 @@ def create_topo_run(form):
             raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
     elif interactive:
         raise ValueError("attach an agent to start a session")
+    # Intents are checked by name against this lab's nodes, so a typo fails here instead of as a red X later.
+    intents = li.parse_intents(labfile["intents"] if labfile else form.get("intents"),
+                               [n["name"] for n in topology["nodes"]])
+    if labfile:
+        labfile["intents"] = [i["text"] for i in intents]
     s = vmb_settings()
     rid = uuid.uuid4().hex[:8]
     nodes = {n["name"]: {"role": n["role"], "ssh_port": None, "terminal": {"active": False, "port": None}}
@@ -1591,7 +1599,8 @@ def create_topo_run(form):
          "interactive": interactive, "idle_since": None,
          "chat": f"vmtopo-{rid}" if agent else None,
          "agent_model": agent_model_id(load_meta(agent)) if agent else None,
-         "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": ""}
+         "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": "",
+         "intents": intents, "intent_results": None}
     TOPO_RUNS[rid] = r
     save_topo_run(r)
     threading.Thread(target=topo_run_runner, args=(rid,), daemon=True).start()
@@ -1805,13 +1814,25 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         "Your user may send more guidance after you reply; the lab stays available until they end the session."
         if r.get("interactive") else "",
     ]
+    if r.get("intents"):
+        hints.append("Your lab has to meet these intents. They're checked from the source node after each of your "
+                     "turns:\n" + li.summary_for_prompt(r["intents"]))
     prompt = (f"{task['prompt'] if task else r['custom_prompt']}\n\nLab nodes (commands run from your working "
               f"directory):\n{node_lines}\n" + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n"
               + "\n".join(h for h in hints if h))
     topo_agent_turn(r, prompt)
+    if r.get("intents"):
+        failing = [x for x in check_and_log_intents(r, priv) if not x["passed"]]
+        if failing and r.get("interactive") and not stopped():
+            # Interactive sessions get one round of feedback: the failures go back to the agent in the same
+            # conversation, then the intents are checked again. Single-turn runs just report.
+            topo_agent_turn(r, intent_feedback(failing))
+            check_and_log_intents(r, priv)
     if r.get("interactive"):
         agent_session_loop(r, stopped, TOPO_FOLLOWUPS, TOPO_END, lambda line: topo_log(r, line),
                            lambda: save_topo_run(r), lambda m: topo_agent_turn(r, m), TOPO_FOLLOWUP_REMINDER)
+        if r.get("intents") and not stopped():
+            check_and_log_intents(r, priv)              # the session may have changed things after the last check
     topo_log(r, f"detaching {r['agent']} from this lab...")
     detach_topo_agent(r["agent"])
 
@@ -1822,7 +1843,46 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         r["score"] = score_run(node_ports[task["check_node"]], priv, task)
         save_topo_run(r)
         topo_log(r, f"score: {'PASS' if r['score']['passed'] else 'FAIL'}\n{r['score']['output']}")
+    elif r.get("intent_results") and not stopped():
+        # No task check to score by: a lab whose intents are all met passes.
+        r["score"] = intents_score(r["intent_results"])
+        save_topo_run(r)
+        topo_log(r, f"score: {'PASS' if r['score']['passed'] else 'FAIL'}\n{r['score']['output']}")
     return None
+
+
+def intent_run_on(r, priv):
+    """How the intent checks reach a node: over SSH, through the lab's own port for that node."""
+    def run_on(node, command, timeout):
+        rc, out, err = vr.ssh_run(r["nodes"][node]["ssh_port"], priv, command, timeout=timeout)
+        if rc == 255:                                   # ssh itself failed: the node isn't reachable, not a failed probe
+            raise OSError(err.strip()[-200:] or "ssh failed")
+        return rc, out
+    return run_on
+
+
+def check_and_log_intents(r, priv):
+    """Check every intent now, keep the results on the run, and log them. Returns the results."""
+    results = li.run_intent_checks(r["intents"], list(r["nodes"]), intent_run_on(r, priv))
+    r["intent_results"] = results
+    save_topo_run(r)
+    topo_log(r, "intents:\n" + "\n".join(intent_lines(results)))
+    return results
+
+
+def intent_lines(results):
+    return [f"{'PASS' if x['passed'] else 'FAIL'}  {x['text']}  ({x['detail']})" for x in results]
+
+
+def intents_score(results):
+    return {"passed": all(x["passed"] for x in results), "output": "\n".join(intent_lines(results))[-4000:],
+            "duration_s": 0}
+
+
+def intent_feedback(failing):
+    return ("These intents still fail, checked from the source node just now:\n"
+            + "\n".join(f"- {x['text']}: {x['detail']}" for x in failing)
+            + "\nFix them, then say what you changed.")
 
 
 # ---------------------------------------------------------------- config snapshots
@@ -1964,7 +2024,7 @@ def labfile_for_lab(rid, sid=None):
     snap = load_topo_snapshot(rid, sid)
     topology = vr.get_topology(r["topology_id"]) if r["topology_id"] else r["topology"]
     title = (r.get("labfile") or {}).get("title") or r["topology_title"]
-    intents = (r.get("labfile") or {}).get("intents") or []
+    intents = [i["text"] for i in r.get("intents") or []]
     lf = vr.build_labfile(title, topology, {n: {s: t for s, t in secs.items() if s != "_error"} for n, secs in snap["nodes"].items()},
                           intents, {"lab": rid, "snapshot": sid, "snapshot_label": snap.get("label") or snap.get("trigger"),
                                     "exported": time.strftime("%Y-%m-%d %H:%M:%S")})
@@ -2034,6 +2094,28 @@ def end_topo_session(rid):
     if not r:
         raise KeyError("unknown run")
     request_session_end(r, TOPO_END)
+
+
+def topo_intents_now(rid):
+    """Check the lab's intents on demand, with or without an agent: read-only probes, so a lab an agent is working in
+    can be checked too. Lets a person who built the lab by hand see where it stands."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r["state"] not in ("ready", "done", "working", "attached"):
+        raise ValueError("the lab isn't ready yet")
+    if not r.get("intents"):
+        raise ValueError("this lab has no intents to check")
+    priv = topo_run_dir(rid) / "id_ed25519"
+    if not priv.exists():
+        raise ValueError("this run's lab is gone")
+
+    def job(log):
+        log("checking intents...")
+        results = check_and_log_intents(r, priv)
+        log(f"{sum(x['passed'] for x in results)} of {len(results)} intents pass")
+        return results
+    return start_job(f"Check intents {rid}", job)
 
 
 def topo_score_now(rid):
@@ -3292,6 +3374,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"ok": True})
                 if parts[4] == "score":
                     return self.send_json({"job": topo_score_now(parts[3])})
+                if parts[4] == "intents":
+                    return self.send_json({"job": topo_intents_now(parts[3])})
                 if parts[4] == "message":
                     return self.send_json(send_topo_followup(parts[3], b.get("text")))
                 if parts[4] == "save":

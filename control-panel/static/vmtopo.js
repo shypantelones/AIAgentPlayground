@@ -57,6 +57,7 @@ function vtBuildSection() {
   VT.newTaskInfo = h("div", { class: "hint" });
   VT.promptOn = h("input", { type: "checkbox" });
   VT.customPrompt = h("textarea", { rows: 3, placeholder: "Describe what you want the agent to configure...", hidden: true });
+  VT.newIntents = h("textarea", { rows: 3, placeholder: "h1 -> h2 icmp reach\nh2 -> web1 tcp/22 block\nh1 -> 10.2.0.10 path via r1, r2" });
   const refillTasks = () => {
     const matching = vtData.tasks.filter(t => t.topology_id === VT.newTopo.value);
     VT.newTask.replaceChildren(h("option", { value: "" }, "— no task: just a scratch lab —"),
@@ -128,7 +129,7 @@ function vtBuildSection() {
     VT.newMsg.textContent = "";
     const agents = [...VT.newAgents.querySelectorAll("input:checked")].map(x => x.value);
     if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
-    const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked };
+    const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked, intents: VT.newIntents.value };
     if (VT.fileOn.checked) {
       if (!VT.labfile) { VT.newMsg.textContent = "Choose a lab file first."; return; }
       body.labfile = VT.labfile;
@@ -172,6 +173,9 @@ function vtBuildSection() {
       h("label", { class: "row" }, VT.fileOn, "build from a lab file"), fileBox,
       custBuilder,
       taskRow, VT.newTaskInfo, promptRow, VT.customPrompt,
+      h("div", {}, "Intents (optional, one per line): what the lab must do. Each is checked from its source node after the agent's work, and a lab with intents and no task check is scored by them."),
+      h("div", { class: "hint" }, "reach or block a node or address over icmp or tcp/<port>, or check the route: 'h1 -> h2 icmp reach', 'h2 -> web1 tcp/22 block', 'h1 -> 10.2.0.10 path via r1, r2'. Lab files carry their own intents."),
+      VT.newIntents,
       h("div", {}, "Attach agent(s) (optional — tick more than one to benchmark them side by side on the same task)"),
       h("div", { class: "hint" }, "An agent has to run commands to work a VM, and local models often only describe them: a cloud model is recommended. Each agent shows what its model has done in VM Labs here."), VT.newAgents,
       h("label", { class: "row" }, VT.newInteractive, "interactive session"),
@@ -218,6 +222,7 @@ async function loadVTDetail() {
   const live = ["queued", "provisioning", "working", "attached", "scoring", "resuming"].includes(r.state);
   const canTerminal = ["ready", "working", "attached", "scoring", "done"].includes(r.state);
   const canScore = r.task_id && ["ready", "working", "attached", "done"].includes(r.state);
+  const canIntents = (r.intents || []).length > 0 && ["ready", "working", "attached", "done"].includes(r.state);
   const canStop = live || r.state === "ready";
   const canDelete = !live && r.state !== "saving";
   const canSave = r.has_vms && ["ready", "done", "stopped"].includes(r.state) && !(r.state === "ready" && r.agent_holds);
@@ -242,6 +247,7 @@ async function loadVTDetail() {
     } }, n.terminal.active ? "Open terminal (running)" : "Open terminal")));
 
   const scoreBtn = h("button", { disabled: !canScore, onclick: () => action(`/api/vmtopo/runs/${r.id}/score`, `Score ${r.id}`, {}, () => { vtSig.detail = ""; vtLoad(); }) }, "Score now");
+  const intentsBtn = h("button", { disabled: !canIntents, onclick: () => action(`/api/vmtopo/runs/${r.id}/intents`, `Check intents ${r.id}`, {}, () => { vtSig.detail = ""; vtLoad(); }) }, "Check intents");
   const stopBtn = h("button", { class: "danger", disabled: !canStop, onclick: async () => { try { await api(`/api/vmtopo/runs/${r.id}/stop`, {}); vtSig.runs = ""; vtSig.detail = ""; vtLoad(); } catch (e) { alert(e.message); } } }, "Stop");
   const delBtn = h("button", { disabled: !canDelete, onclick: async () => {
     if (!confirm(r.state === "saved" ? "Delete this saved lab? Its VMs, and everything configured on them, are destroyed."
@@ -250,7 +256,7 @@ async function loadVTDetail() {
   } }, "Delete");
 
   const parts = [h("div", { class: "row" }, h("b", {}, `Lab ${r.id}`), h("span", { class: "chip " + r.state }, VB_STATE_LABEL[r.state] || r.state),
-    h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), saveBtn, scoreBtn, stopBtn, delBtn)];
+    h("span", { class: "status" }, r.reason || ""), h("span", { class: "sp" }), saveBtn, scoreBtn, intentsBtn, stopBtn, delBtn)];
   const taskDesc = r.task_title ? " · task: " + r.task_title
     : r.custom_prompt ? " · custom prompt (no automated score)" : " · no task (scratch lab)";
   parts.push(h("div", { class: "hint" }, `${r.topology_title}${taskDesc}${r.agent ? ` · agent: ${r.agent} (${r.agent_model || "?"})` : " · no agent attached"}${r.agent_turns ? ` · ran ${r.agent_commands ?? "?"} commands in ${r.agent_turns} turn${r.agent_turns === 1 ? "" : "s"}` : ""}${r.interactive ? " · interactive session" : ""} · started ${vtFmtTime(r.started)} · elapsed ${vtElapsed(r)}`));
@@ -277,6 +283,16 @@ async function loadVTDetail() {
   if (r.score) {
     parts.push(h("div", { class: r.score.passed ? "pass" : "fail" }, r.score.passed ? "PASS" : "FAIL", ` (${r.score.duration_s}s)`));
     parts.push(h("pre", {}, r.score.output));
+  }
+  if ((r.intents || []).length) {
+    // One row per intent: what was asked, and whether the last check (from its source node) met it.
+    const res = r.intent_results || [];
+    parts.push(h("b", {}, `Intents${res.length ? ` (${res.filter(x => x.passed).length} of ${res.length} pass)` : " (not checked yet)"}`));
+    parts.push(h("div", { class: "col" }, ...r.intents.map((text, i) => {
+      const x = res.find(y => y.text === text);
+      return h("div", { class: x ? (x.passed ? "pass" : "fail") : "hint" },
+        `${x ? (x.passed ? "PASS" : "FAIL") : "—"}  ${text}${x ? `  (${x.detail})` : ""}`);
+    })));
   }
   parts.push(h("div", { class: "hint" }, "Live transcript:"));
   parts.push(h("pre", { style: "max-height:30vh" }, r.transcript || "(nothing yet)"));
