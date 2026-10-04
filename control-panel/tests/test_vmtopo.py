@@ -742,6 +742,17 @@ class SnapshotTests(VmTopoBase):
     def port(self, rid, node):
         return app.TOPO_RUNS[rid]["nodes"][node]["ssh_port"]
 
+    def test_lab_view_has_a_diagram_labeled_from_the_newest_snapshot(self):
+        rid = self.ready_lab()
+        d = app.topo_run_view(app.TOPO_RUNS[rid], full=True)["diagram"]
+        self.assertIsNone(d["snapshot"])
+        self.assertEqual({n["name"] for n in d["nodes"]}, {"h1", "h2", "sw1"})
+        self.node_config = {self.port(rid, "h1"): "enp0s8 UP 10.0.0.1/24"}
+        sid = app.take_topo_snapshot(app.TOPO_RUNS[rid], "x")["id"]
+        d = app.topo_run_view(app.TOPO_RUNS[rid], full=True)["diagram"]
+        self.assertEqual(d["snapshot"]["id"], sid)
+        self.assertEqual(d["addresses"]["h1"]["enp0s8"], ["10.0.0.1/24"])
+
     def test_snapshot_captures_every_node_and_lists_it(self):
         rid = self.ready_lab()
         self.node_config = {self.port(rid, "h1"): "enp0s8 UP 10.0.0.1/24"}

@@ -21,6 +21,8 @@ function vtBuildSection() {
   // -- topology: a catalog template, or the structured builder (role counts + wiring pattern) --
   VT.newTopo = h("select", {}, ...vtData.topologies.map(t => h("option", { value: t.id }, t.title)));
   const topoRow = h("div", { class: "row" }, "Topology", VT.newTopo);
+  VT.preview = h("div", { class: "col" });
+  const showPreview = topo => VT.preview.replaceChildren(topo ? renderTopologyDiagram(vtDiagramOf(topo)) : "");
   VT.customOn = h("input", { type: "checkbox" });
   VT.custCounts = {};
   for (const role of ["host", "router", "switch", "loadbalancer", "firewall", "server", "upstream"]) {
@@ -62,6 +64,7 @@ function vtBuildSection() {
     VT.newTask.dispatchEvent(new Event("change"));
   };
   VT.newTopo.addEventListener("change", refillTasks);
+  VT.newTopo.addEventListener("change", () => showPreview(vtData.topologies.find(t => t.id === VT.newTopo.value)));
   VT.newTask.addEventListener("change", () => {
     const t = vtData.tasks.find(x => x.id === VT.newTask.value);
     VT.newTaskInfo.textContent = t ? t.prompt : "No task: open a terminal on any node and wire the lab up however you like.";
@@ -82,6 +85,7 @@ function vtBuildSection() {
       const lf = JSON.parse(await f.text());
       if (lf.format !== "aiagentplayground-lab") throw new Error("this isn't an AI Agent Playground lab file");
       VT.labfile = lf;
+      showPreview(lf.topology);
       const nodes = (lf.topology?.nodes || []).map(n => `${n.name} (${n.role})`);
       const cfg = Object.keys(lf.configs || {});
       VT.fileInfo.className = "hint";
@@ -94,6 +98,8 @@ function vtBuildSection() {
   const customRow = h("label", { class: "row" }, VT.customOn, "build a custom topology instead");
   const syncCustomModes = () => {
     if (VT.fileOn.checked) VT.customOn.checked = false;
+    showPreview(VT.fileOn.checked ? (VT.labfile && VT.labfile.topology) : VT.customOn.checked ? null
+      : vtData.topologies.find(t => t.id === VT.newTopo.value));
     const fromFile = VT.fileOn.checked, custom = VT.customOn.checked;
     topoRow.hidden = custom || fromFile;
     customRow.hidden = fromFile;
@@ -156,7 +162,7 @@ function vtBuildSection() {
       "A small group of real VMs wired together with virtual cabling: routers, switches (real VMs doing real L2 bridging, not simulated devices), hosts, load balancers and firewalls. Nothing is pre-addressed except the switches, which just forward frames - assigning IPs, enabling routing/filtering and adding routes is the task. Attach an agent, or open a terminal on any node and do it yourself."),
     h("h5", {}, "New lab"),
     h("div", { class: "col" },
-      topoRow,
+      topoRow, VT.preview,
       customRow,
       h("label", { class: "row" }, VT.fileOn, "build from a lab file"), fileBox,
       custBuilder,
@@ -250,6 +256,10 @@ async function loadVTDetail() {
         : `Differs from the file in ${bad.map(([n, m]) => `${n}: ${m.join(", ")}`).join("; ")} (see the transcript).`)));
   }
   if (r.custom_prompt) parts.push(h("pre", {}, r.custom_prompt));
+  if (r.diagram) parts.push(h("details", { open: "" }, h("summary", {}, "Topology diagram"),
+    renderTopologyDiagram(r.diagram),
+    h("div", { class: "hint" }, r.diagram.snapshot ? `Addresses from snapshot ${r.diagram.snapshot.id} (${new Date(r.diagram.snapshot.ts * 1000).toLocaleString()}).`
+      : "Addresses appear here once the lab has a snapshot.")));
   parts.push(...nodeRows);
   if (r.state === "ready" && r.has_vms && !r.agent_holds) parts.push(vtAttachBox(r));
   parts.push(vtSnapshots(r));
@@ -374,4 +384,12 @@ function vtSnapshots(r) {
       h("a", { href: `/api/vmtopo/runs/${r.id}/labfile`, download: "", title: "This lab's topology and the newest snapshot's configs, as a file you can rebuild the lab from" }, "Export lab file")),
     h("p", { class: "hint" }, "Every node's addresses, routes, forwarding, bridges and VLANs, firewall rules and service configs (netplan, FRR, nginx). Snapshots are kept after the lab's VMs are gone; Delete removes them."),
     list, out);
+}
+
+/* A topology that isn't built yet, ready to draw: each end of a link gets the interface it will have (a node's lab
+   links are its NICs 2, 3, ... in link order; see vm_runner.lab_iface_names). */
+function vtDiagramOf(topo) {
+  const slots = [8, 9, 10, 16, 17, 18, 19], used = {};
+  const next = n => { const i = used[n] = (used[n] ?? -1) + 1; return i < slots.length ? `enp0s${slots[i]}` : `nic${i + 2}`; };
+  return { nodes: topo.nodes, links: topo.links.map(l => ({ ...l, a_if: next(l.a), b_if: next(l.b) })) };
 }

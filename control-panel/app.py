@@ -1498,6 +1498,8 @@ def topo_run_view(r, full=False):
     v["interactive"] = bool(r.get("interactive"))
     v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
     v["has_vms"] = (topo_run_dir(r["id"]) / "Vagrantfile").exists()
+    if full:
+        v["diagram"] = topo_run_diagram(r)
     v["from_labfile"] = (r.get("labfile") or {}).get("title")
     v["labfile_check"] = r.get("labfile_check")
     v.update({k: r.get(k) for k in ("saved_at", "resumed", "agent_done")})
@@ -1508,6 +1510,16 @@ def topo_run_view(r, full=False):
             msgs = load_chats(r["agent"]).get(r["chat"], {}).get("messages", [])[-100:]
             v["conversation"] = [{"role": m.get("role"), "text": m.get("text", "")[-20000:], "ts": m.get("ts")} for m in msgs]
     return v
+
+
+def topo_run_diagram(r):
+    """The lab's diagram, labeled with interface addresses from its newest snapshot (if any)."""
+    topology = vr.get_topology(r["topology_id"]) if r["topology_id"] else r["topology"]
+    snaps = list_topo_snapshots(r["id"])
+    snap = load_topo_snapshot(r["id"], snaps[0]["id"]) if snaps else None
+    d = vr.topology_diagram(topology, (snap or {}).get("nodes"))
+    d["snapshot"] = {"id": snap["id"], "ts": snap["ts"]} if snap else None
+    return d
 
 
 def topo_taken_ports(rng):
