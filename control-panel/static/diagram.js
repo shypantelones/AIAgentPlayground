@@ -4,7 +4,7 @@
    each end's box with that node's interface and, when a snapshot is available, its addresses. Shared by the lab view and the new-lab previews. No external libraries: the panel
    only loads its own files. */
 
-const TDG = { colW: 290, rowH: 110, boxW: 112, boxH: 44, pad: 40, labelW: 150 };
+const TDG = { colW: 250, rowH: 110, boxW: 112, boxH: 44, pad: 40, labelW: 150 };
 const TDG_ROLE_MARK = { router: "R", switch: "SW", host: "H", firewall: "FW", loadbalancer: "LB", server: "SRV", upstream: "NET" };
 
 /* `d`: {nodes: [{name, role}], links: [{a, b, a_if?, b_if?}], addresses?: {node: {iface: [cidr]}}} */
