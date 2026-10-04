@@ -349,6 +349,8 @@ async function loadVTDetail() {
     `${a}: ${Math.max(0, n - (r.budget.used[a] || 0))} of ${n} commands left (budget $${r.budget.usd.toFixed(2)})`))));
   if (r.team) parts.push(vtSection("Team", r.team.map(m => h("div", { class: "hint" },
     `stage ${m.stage} · ${m.agent} · nodes ${m.nodes.join(", ")} · ${m.brief}`))));
+  if ((r.mail || []).length) parts.push(vtSection("Messages between members", r.mail.map(x => h("div", { class: x.status === "delivered" || x.status === "queued" ? "hint" : "fail" },
+    `round ${x.round || "-"} · ${x.from} → ${x.to}: ${x.text} (${x.status})`))));
   parts.push(vtSection("Agent session", [
     r.conversation && r.conversation.length ? sessionConversation(r, "lab") : null,
     r.interactive && ["attached", "working"].includes(r.state)
