@@ -230,6 +230,19 @@ Trade-offs and gaps:
   and unit tests only.
 - **Prompt cost:** each member's prompt now carries its role line (about 60 tokens).
 
+#### Messages between team members
+A team member can message a teammate during its turn with `./peer-msg <name> '<message>'`. The panel reads each member's
+queue after its turn and delivers each recipient one follow-up turn with its messages, in rounds after each stage.
+- **Limits:** 4 messages from one member to another per lab, 6 delivery rounds per stage (so a ping-pong ends), 1000
+  characters per message. A refused message is in the lab's message log with the reason.
+- **Cost:** every delivery is a full turn, charged to the sender's and recipient's budgets like any other turn.
+- **Trade-offs:** a message is seen in the recipient's next turn, not during the turn that sent it. Members in the same
+  stage don't see each other's messages until the stage finishes. Messages are not peering links: there's no approval step
+  and no per-link policy yet.
+- **Live test** (firewall lab: alpha as network-admin, beta as firewall-admin, both in stage 1): beta asked alpha for the
+  addresses and gateways; alpha answered; beta wrote the rules and asked alpha to test; alpha reported. Messages went both
+  ways over 6 rounds, the fourth message from alpha to beta was refused by the limit, and all three intents passed.
+
 #### Teams: several agents in one lab
 A lab can take a **team** instead of one agent (the "Team" group in the new-lab form, one member per line:
 `agent | nodes | stage | brief`). Each member gets its own relay and `vmrun` commands for its nodes only, and its own

@@ -504,6 +504,19 @@ generated shell in each node's provision script.
   older than a minute (`find -mmin +1`) is taken over. Found live: all of an agent's commands hung and the turn logged zero.
 - **Live:** firewall-admin on `h1 - fw1 - h2` passed all three intents and the score (27 commands, about $0.36 by estimate).
 
+## Team messages (team_mail)
+
+- `peer_msg_script(agent, names)` writes `peer-msg` into each member's workspace (team of 2+). It validates the name,
+  refuses self, and appends `<name>\t<base64 text>` to `TEAM_MAIL_OUTBOX`.
+- `topo_member_turn` takes the outbox after the turn (`take_member_outbox`) and queues the messages (`queue_team_mail`:
+  the per-pair limit `TEAM_MAIL_PER_PAIR`, text cut to `TEAM_MAIL_MAX_CHARS`). `r["mail_queue"]`, `r["mail_pairs"]`,
+  `r["mail_log"]` (shown in the lab view).
+- `topo_team_phase` calls `deliver_team_mail` after each stage: up to `TEAM_MAIL_ROUNDS` rounds; each recipient gets one
+  `topo_member_turn` with `prompt=` listing its messages.
+- **Gotcha, found live:** `ssh-keygen` refuses to overwrite a key file non-interactively, so a member's second turn in one
+  lab failed. Keys are removed before each new one.
+- **Live:** alpha/beta on the firewall lab passed all intents and the score, with messages both ways and the limit enforced.
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:
