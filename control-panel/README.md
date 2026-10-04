@@ -148,6 +148,25 @@ Topology labs are built to be worked in and kept, not only run once. From a lab'
   agent; the drafting, checking and building around it have.)
 - **Attach an agent to a lab that already exists**, and benchmark several agents on the same topology task.
 
+#### Teams: several agents in one lab
+A lab can take a **team** instead of one agent (the "Team" group in the new-lab form, one member per line:
+`agent | nodes | stage | brief`). Each member gets its own relay and `vmrun` commands for its nodes only, and its own
+brief, plus the shared goal and the names of the other members.
+- **Stages:** members of the same stage work at the same time. Stage 2 starts when stage 1 is finished, so a network
+  admin can finish routing before the client and server start.
+- **Scoring:** after all members finish, the lab's intents are checked and the lab is scored, the same as a single agent.
+- **Trade-offs:** one turn per member for now (no interactive sessions and no plan-first for teams). Members can't
+  message each other: they're told the others' names and roles, and the user relays between them. Peering isn't
+  wired into teams yet. Members in the same stage run in parallel, so a rollback point taken during a parallel stage
+  includes whatever the other member changed at the same time. Use stages for clean points.
+- **Cost:** each member is a full agent turn, and an agent turn makes one model call per command. One test run of a
+  three-node lab with two members (alpha: 112 commands in 509 seconds) is the expensive case to remember: a member
+  that works a long time costs in proportion to its commands.
+- **Concurrency:** snapshots and VM operations are serialized by `VAGRANT_UP_LOCK`, so two members' turns can't drive
+  VirtualBox at the same time. Each member's turn still runs in parallel with the others'.
+- **Not yet verified:** a team with more than two stages, a team lab that is saved and resumed, and a member that
+  fails its relay start inside a real lab.
+
 #### Internet access for labs
 Lab VMs don't get open internet. A lab reaches documentation and package sites for its roles, plus any domains you
 add for a niche tool (the "Internet" group in the new-lab form). Presets are in `lab_egress.py`:

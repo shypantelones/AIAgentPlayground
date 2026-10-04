@@ -1448,10 +1448,17 @@ TOPO_FOLLOWUP_REMINDER = "\n\n(Use the ./vmrun-<node> commands as before; check 
 TOPO_RELAY_FILES = ["-f", str(TPL / "instance.compose.yml"), "-f", str(TPL / "vm-relay-topo.compose.yml")]
 
 
+def lab_agents(r):
+    """The agents a lab is set up for: its team's members, or its single agent."""
+    if r.get("team"):
+        return [m["agent"] for m in r["team"]]
+    return [r["agent"]] if r.get("agent") else []
+
+
 def agent_holds_lab(r, agent):
     """Is `agent` attached to (or about to work in) this lab? A resumed lab, or one an attached agent has finished
     with, still names that agent, for its conversation, but the agent has no access to it any more."""
-    return r.get("agent") == agent and r["state"] in TOPO_OCCUPYING_STATES and r["state"] not in ("saving", "resuming") \
+    return agent in lab_agents(r) and r["state"] in TOPO_OCCUPYING_STATES and r["state"] not in ("saving", "resuming") \
         and not r.get("resumed") and not r.get("agent_done")
 
 
@@ -1521,6 +1528,7 @@ def topo_run_view(r, full=False):
                      for c in r.get("captures") or []]
     v["egress"] = {k: (r.get("egress") or {}).get(k) for k in ("domains", "extra", "port")} if r.get("egress") else None
     v["changes"] = r.get("changes") or []
+    v["team"] = [{k: m[k] for k in ("agent", "nodes", "stage", "brief")} for m in r["team"]] if r.get("team") else None
     v["plan_first"] = bool(r.get("plan_first"))
     v["plan"] = r.get("plan")
     v["plan_approved"] = bool(r.get("plan_approved"))
@@ -1605,6 +1613,19 @@ def create_topo_run(form):
             raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
     elif interactive:
         raise ValueError("attach an agent to start a session")
+    team = validate_team(form.get("team"), [n["name"] for n in topology["nodes"]]) if form.get("team") else None
+    if team:
+        if agent or interactive or form.get("plan_first"):
+            raise ValueError("a team lab takes its members instead of one agent; sessions and plans are single-agent for now")
+        if not task and not custom_prompt:
+            raise ValueError("pick a task or write a shared goal for the team")
+        for m in team:
+            load_meta(m["agent"])                     # raises KeyError if unknown
+            if not agent_running(m["agent"]):
+                raise ValueError(f"{m['agent']} is not running; start it first")
+            busy = [x for x in TOPO_RUNS.values() if agent_holds_lab(x, m["agent"])]
+            if busy:
+                raise ValueError(f"{m['agent']} is already attached to lab {busy[0]['id']}; end or stop that lab first")
     plan_first = bool(form.get("plan_first"))
     if plan_first and not agent:
         raise ValueError("a plan needs an agent to write it")
@@ -1637,6 +1658,7 @@ def create_topo_run(form):
          "agent_model": agent_model_id(load_meta(agent)) if agent else None,
          "score": None, "benchmark_id": form.get("benchmark_id"), "nodes": nodes, "vm_log": "",
          "intents": intents, "intent_results": None,
+         "team": [dict(m, chat=f"vmtopo-{rid}-{m['agent']}") for m in team] if team else None,
          "plan_first": plan_first, "plan": None, "plan_approved": False,
          "egress": {"domains": egress_domains, "extra": extra, "port": None}}
     TOPO_RUNS[rid] = r
@@ -1682,6 +1704,153 @@ def egress_down(rid):
     compose = topo_run_dir(rid) / "egress" / "compose.yml"
     if compose.exists():
         run([DOCKER, "compose", "-p", egress_project(rid), "-f", str(compose), "down"], timeout=120)
+
+
+TEAM_MAX = 6
+
+
+def validate_team(raw, node_names):
+    """A team: one member per line (or a list of dicts), `agent | nodes | stage | brief`. Each member gets its own
+    agent, the nodes it may touch (comma-separated), a stage (members of the same stage run together, and stages run
+    in order), and a brief. Returns the members as plain dicts, or ValueError saying what to fix."""
+    if isinstance(raw, str):
+        rows = []
+        for n, line in enumerate(raw.splitlines(), 1):
+            if not line.strip():
+                continue
+            parts = line.split("|", 3)
+            if len(parts) != 4:
+                raise ValueError(f"team line {n}: write it as 'agent | nodes | stage | brief'")
+            rows.append({"agent": parts[0], "nodes": parts[1], "stage": parts[2], "brief": parts[3]})
+        raw = rows
+    members = []
+    for n, m in enumerate(raw or [], 1):
+        agent = str(m.get("agent") or "").strip().lower()
+        if not agent:
+            raise ValueError(f"team member {n} needs an agent")
+        nodes = m.get("nodes") or []
+        if isinstance(nodes, str):
+            nodes = [x.strip() for x in nodes.split(",") if x.strip()]
+        if not nodes:
+            raise ValueError(f"{agent} needs at least one node")
+        for node in nodes:
+            if node not in node_names:
+                raise ValueError(f"{agent}: no node called '{node}' in this lab")
+        try:
+            stage = int(str(m.get("stage") or 1).strip())
+        except ValueError:
+            raise ValueError(f"{agent}: the stage has to be a number")
+        if not 1 <= stage <= 9:
+            raise ValueError(f"{agent}: the stage has to be 1 to 9")
+        brief = str(m.get("brief") or "").strip()
+        if not brief:
+            raise ValueError(f"{agent} needs a brief: what this agent is responsible for")
+        if len(brief) > 1000:
+            raise ValueError(f"{agent}'s brief is too long (max 1000 characters)")
+        members.append({"agent": agent, "nodes": list(nodes), "stage": stage, "brief": brief})
+    if not members:
+        raise ValueError("a team needs at least one member")
+    if len(members) > TEAM_MAX:
+        raise ValueError(f"a team has at most {TEAM_MAX} members")
+    agents = [m["agent"] for m in members]
+    if len(set(agents)) != len(agents):
+        raise ValueError("each agent can be a member of a team once")
+    return members
+
+
+def member_prompt(r, task, m, team):
+    """What one team member is told: the shared goal, its own role and nodes, who the others are, and what the lab
+    allows. Kept short: it's sent to a paid model on every turn."""
+    goal = task["prompt"] if task else r["custom_prompt"]
+    node_lines = "\n".join(f"- {n} ({r['nodes'][n]['role']}): ./vmrun-{n} '<cmd>'" for n in m["nodes"])
+    others = "; ".join(f"{x['agent']} ({', '.join(x['nodes'])}): {x['brief']}" for x in team if x is not m) or "none"
+    parts = [f"Shared goal (the whole team works on this):\n{goal}",
+             f"Your role: {m['brief']}",
+             f"Your nodes (run commands from your working directory):\n{node_lines}\n"
+             + vr.VMRUN_HOWTO.format(cmd=f"./vmrun-{m['nodes'][0]}"),
+             f"Other team members, each on their own nodes: {others}. You can't message them; say in your reply what you "
+             "need from them.",
+             "Lab links are each node's 2nd+ interfaces, unaddressed. Leave enp0s3 alone and don't use 10.0.2.0/24."]
+    if (r.get("egress") or {}).get("port"):
+        parts.append(f"Internet: documentation and package sites only, through the proxy {le.proxy_url(r['egress']['port'])}; "
+                     "apt and pip already use it.")
+    if r.get("intents"):
+        parts.append("Lab intents, checked from the source node after the team's work:\n" + li.summary_for_prompt(r["intents"]))
+    return "\n\n".join(parts)
+
+
+def topo_member_turn(r, topology, node_ports, priv, m, team):
+    """One team member's turn: its relay and vmrun wrappers cover its own nodes only, then one turn, then it's
+    detached. Returns an error message, or None."""
+    agent, nodes = m["agent"], m["nodes"]
+    topo_log(r, f"attaching {agent} to {', '.join(nodes)}...")
+    dc(agent, "exec", "-T", "gateway", "sh", "-c",
+       "mkdir -p /home/node/.openclaw/workspace/.vmkey-topo && "
+       "cat > /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519 && "
+       "chmod 600 /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", input=priv.read_text(), timeout=20)
+    for name in nodes:
+        wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519",
+                                  vr.relay_port_for_node(topology, name), "bench@vm-relay-topo",
+                                  "/home/node/.openclaw/workspace/vm-session-topo.log", node=name)
+        dc(agent, "exec", "-T", "gateway", "sh", "-c",
+           f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
+           input=wrapper, timeout=20)
+    env = dict(os.environ, VM_RELAY_TOPO_CMD=vr.relay_command(topology, {n: node_ports[n] for n in nodes}))
+    rc, out, err = run([DOCKER, "compose", "-p", proj(agent), "--env-file", str(env_file(agent)),
+                        *TOPO_RELAY_FILES, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
+    if rc != 0:
+        detach_topo_agent(agent)
+        return f"{agent}: could not attach its relay (see transcript)"
+    try:
+        res = topo_agent_turn(r, member_prompt(r, r.get("_task"), m, team), member=m)
+        return None if res.get("ok") else f"{agent}: its turn failed (see transcript)"
+    finally:
+        topo_log(r, f"detaching {agent} from this lab...")
+        detach_topo_agent(agent)
+
+
+def topo_team_phase(r, topology, node_ports, priv, task, stopped):
+    """Run a team lab: each stage's members work at the same time, and the next stage starts when they're all done.
+    Then the lab's intents are checked and the lab is scored, the same as a single agent's lab."""
+    team = r["team"]
+    r["state"] = "working"
+    r["_task"] = task
+    save_topo_run(r)
+    errors, lock = [], threading.Lock()
+
+    def run_member(m):
+        try:
+            err = topo_member_turn(r, topology, node_ports, priv, m, team)
+        except Exception as e:  # noqa - one member failing is recorded; the others still run
+            err = f"{m['agent']}: {e}"
+        if err:
+            with lock:
+                errors.append(err)
+
+    for stage in sorted({m["stage"] for m in team}):
+        if stopped():
+            break
+        members = [m for m in team if m["stage"] == stage]
+        topo_log(r, f"stage {stage}: {', '.join(m['agent'] for m in members)} working at the same time...")
+        threads = [threading.Thread(target=run_member, args=(m,), daemon=True) for m in members]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    r.pop("_task", None)
+    if r.get("intents") and not stopped():
+        check_and_log_intents(r, priv)
+    if task and task.get("check") and not stopped():
+        r["state"] = "scoring"
+        save_topo_run(r)
+        r["score"] = score_run(node_ports[task["check_node"]], priv, task)
+        save_topo_run(r)
+        topo_log(r, f"score: {'PASS' if r['score']['passed'] else 'FAIL'}\n{r['score']['output']}")
+    elif r.get("intent_results") and not stopped():
+        r["score"] = intents_score(r["intent_results"])
+        save_topo_run(r)
+        topo_log(r, f"score: {'PASS' if r['score']['passed'] else 'FAIL'}\n{r['score']['output']}")
+    return "; ".join(errors) or None
 
 
 def topo_run_runner(rid):
@@ -1795,7 +1964,7 @@ def topo_run_runner(rid):
         # Decide BEFORE "ready" whether this run has its own agent: once the lab is ready, attach_agent_to_lab() may set
         # r["agent"] from another thread, and reading it after that would run the attached agent a second time here
         # (and then finish - and tear down - the lab it was attached to).
-        own_agent = r["agent"]
+        own_agent = r["agent"] or r.get("team")       # a team lab has members instead of one agent
         r["state"] = "ready"
         save_topo_run(r)
         task = vr.get_topology_task(r["task_id"]) if r["task_id"] else None
@@ -1808,7 +1977,8 @@ def topo_run_runner(rid):
             return
         if stopped():
             return finish("stopped", "stopped before the agent's turn")
-        err = topo_agent_phase(r, topology, node_ports, priv, task, stopped)
+        err = topo_team_phase(r, topology, node_ports, priv, task, stopped) if r.get("team") \
+            else topo_agent_phase(r, topology, node_ports, priv, task, stopped)
         if err == PLAN_WAITING:
             # The plan is in; the lab stays up (not finished, so nothing is torn down) until you approve or delete it.
             r.update(state="ready", agent_done=True)
@@ -2370,23 +2540,43 @@ def topo_rollback(rid, turn):
     return start_job(f"Roll back {rid} to turn {turn}", job)
 
 
-def topo_agent_turn(r, message):
+def topo_agent_turn(r, message, member=None):
+    """One agent turn in a lab. `member` (a team member) makes it that member's turn: its own agent, chat and log.
+    Snapshots are taken under VAGRANT_UP_LOCK, so team members' turns can't drive VirtualBox at the same moment."""
     t0 = time.time()
+    agent = member["agent"] if member else r["agent"]
+    chat = member["chat"] if member else r["chat"]
     # The lab's own turn counter: agent_turns restarts at 0 on every attach, and snapshot names must stay unique.
-    n = r["change_seq"] = (r.get("change_seq") or 0) + 1
+    with TOPO_LOCK:
+        n = r["change_seq"] = (r.get("change_seq") or 0) + 1
     point = f"before-turn-{n}"
-    usable = snapshot_lab_vms(r, point)                  # rollback point: the lab as this turn found it
-    before = read_agent_log(r["agent"], TOPO_CHANGE_LOG)
-    res = counted_agent_turn(r, message, TOPO_CHANGE_LOG, lambda: run_turn(
-        r["agent"], r["chat"], message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200))
-    after = read_agent_log(r["agent"], TOPO_CHANGE_LOG)
+    with VAGRANT_UP_LOCK:
+        usable = snapshot_lab_vms(r, point)              # rollback point: the lab as this turn found it
+    before = read_agent_log(agent, TOPO_CHANGE_LOG)
+    turn = lambda: run_turn(agent, chat, message, {"via": "vmtopo", "run": r["id"]}, lambda s: topo_log(r, s), timeout=1200)
+    if member is None:
+        res = counted_agent_turn(r, message, TOPO_CHANGE_LOG, turn)
+    else:
+        b_cmds = count_vm_commands(agent, TOPO_CHANGE_LOG)
+        res = turn()
+        a_cmds = count_vm_commands(agent, TOPO_CHANGE_LOG)
+        with TOPO_LOCK:
+            r["agent_turns"] = (r.get("agent_turns") or 0) + 1
+            if b_cmds is not None and a_cmds is not None:
+                ran = max(0, a_cmds - b_cmds)
+                r["agent_commands"] = (r.get("agent_commands") or 0) + ran
+                r["agent_turns_with_commands"] = (r.get("agent_turns_with_commands") or 0) + (1 if ran else 0)
+    after = read_agent_log(agent, TOPO_CHANGE_LOG)
     commands = lc.new_entries(before, after) if before is not None and after is not None else []   # unknown: none listed
-    r.setdefault("changes", []).append({"turn": n, "point": point if usable else None, "rolled_back": False,
-                                        "commands": commands[:lc.MAX_PER_TURN], "command_count": len(commands)})
+    with TOPO_LOCK:
+        r.setdefault("changes", []).append({"turn": n, "agent": agent, "point": point if usable else None,
+                                            "rolled_back": False, "commands": commands[:lc.MAX_PER_TURN],
+                                            "command_count": len(commands)})
     save_topo_run(r)
-    topo_log(r, f"agent turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
+    topo_log(r, f"{agent}'s turn finished in {time.time()-t0:.0f}s (ok={res['ok']}, commands run so far: {r.get('agent_commands', '?')})")
     try:                                    # what this turn left configured on the nodes, for review and diffs
-        snap = take_topo_snapshot(r, f"after {r['agent']}'s turn {r.get('agent_turns', '?')}")
+        with VAGRANT_UP_LOCK:
+            snap = take_topo_snapshot(r, f"after {agent}'s turn {n}")
         topo_log(r, f"config snapshot {snap['id']} taken")
     except Exception as e:  # noqa - a snapshot is a convenience; never let it break the agent's run
         topo_log(r, f"config snapshot skipped: {e}")
@@ -2601,6 +2791,8 @@ def attach_agent_to_lab(rid, form):
         raise KeyError("unknown run")
     if r["state"] != "ready" or r.get("restoring") or (r.get("agent") and agent_holds_lab(r, r["agent"])):
         raise ValueError("an agent can only be attached to a lab that's ready, with no agent at work in it")
+    if r.get("team"):
+        raise ValueError("a team lab's agents are set when it's created; attach to a single-agent lab")
     if r.get("plan_first") and not r.get("plan_approved"):
         raise ValueError("approve the lab's plan first: its agent has no access to the nodes until then")
     d = topo_run_dir(rid)
