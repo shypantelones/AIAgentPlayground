@@ -397,9 +397,20 @@ generated shell in each node's provision script.
 - **Verified on real VMs (two hosts, one switch):** allowed sites 200 through
   the proxy; off-list site 403 from squid; direct internet times out; apt
   updates through the proxy.
-- **Not yet verified:** router forwarding between labs, and isolation between
-  two labs on the host-only network. Record the results in the README when
-  tested.
+- **Verified with a router and two labs:** routing through the router; each
+  host's proxy access on its own adapter; the router forwarding block (a host
+  reaching the proxy through the router times out); no direct internet from
+  router or hosts; no ICMP or TCP between labs on the host-only network (checked
+  with outbound open on the sending side). Details are in the README.
+- **ufw gotcha:** ufw accepts ICMP echo before its user rules, so `deny in` on
+  an adapter doesn't stop ping. `firewall_script` adds an `iptables -I INPUT 1
+  ... --ctstate NEW -j DROP` for the host-only adapter; only NEW is matched so
+  proxy replies still arrive.
+- **Serialized builds:** `VAGRANT_UP_LOCK` makes `vagrant up` one lab at a time.
+  Two labs booting together failed with a VirtualBox machine-lock error.
+- **Not yet verified:** a lab-file rebuild with the host-only adapter present
+  (the extra address may show up in configs); presets for real apps beyond
+  apt/pip; the panel's slot limit under many labs.
 - **Gotchas hit:** a shell `\n` inside a Python f-string is written `\\n`
   in the source (the f-string turns it into `\n` for the shell). The
   PowerShell wrapper used to run `vagrant` from WSL treats `{...}` as a

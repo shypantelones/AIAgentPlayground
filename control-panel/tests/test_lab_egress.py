@@ -80,6 +80,9 @@ class VmScriptTests(unittest.TestCase):
         self.assertIn("ufw deny in on \"$HO\"", fw)                 # no inbound on the proxy network
         self.assertIn("ufw route deny out on enp0s3", fw)            # routers can't forward out past the proxy
         self.assertIn("ufw route deny out on \"$HO\"", fw)
+        # ICMP is accepted by ufw before its user rules, so the drop for new connections must sit ahead of ufw.
+        self.assertIn('iptables -I INPUT 1 -i "$HO" -m conntrack --ctstate NEW -j DROP', fw)
+        self.assertGreater(fw.index("ufw --force enable"), fw.index("ufw deny in"))
         self.assertIn("ufw default allow routed", fw)
         self.assertLess(fw.index("ufw default deny outgoing"), fw.index("ufw --force enable"))
 

@@ -184,12 +184,25 @@ Trade-offs (decided, and why):
   host-only adapter to reach the proxy, so a host behind a router still gets documentation with `curl -x` or apt.
 - **Names are resolved by the proxy.** The VMs don't resolve internet names themselves. Tools that ignore proxy settings
   (anything but apt, pip and explicit `curl -x`) can't reach the internet at all.
+- **Labs can't reach each other through the host-only network, but ufw alone didn't prove it.** ufw accepts ICMP
+  echo requests before its own rules, so a "deny in" on the host-only adapter still let another lab ping a VM. The
+  firewall also drops new inbound connections on that adapter, ahead of ufw. Replies to a VM's own proxy requests still
+  get through, because only `NEW` connections are dropped.
+- **Labs with internet build one at a time.** `vagrant up` is serialized across labs: two labs booting together hit
+  VirtualBox machine locks and one failed. Each lab's own build is still sequential, but a lab waiting for its turn
+  can't be cancelled until the one ahead of it finishes.
 - **Presets are a starting list.** Some sites load assets from other hosts (CDNs, package mirrors); a page can render
   partly. Add the host to the lab's extra domains.
 - **Labs with internet take longer to build**: apt goes through the proxy, and the proxy is an extra container per lab.
 
-Not yet verified on real VMs: a router forwarding traffic between two labs, and that two labs' VMs can't reach each
-other through the host-only network. Results will be recorded here once tested.
+**Verified on real VMs** (lab A: `h1 - r1 - h2` with a router; lab B: two hosts on one link, both built at once):
+- Routing: h1 and h2 reach each other through r1 in both directions.
+- Proxy: each host reaches an allowed docs site through its own host-only adapter, including the host behind the router.
+  An off-list site gets a 403 from the proxy.
+- Forwarding: a host that tries to reach the proxy *through* the router times out.
+- Internet: the router and both hosts time out on direct internet access.
+- Labs: VMs of lab A can't ping or connect to lab B's VMs, with outbound open on the sending side too (so the inbound
+  rule is what blocks them). Lab A's and lab B's own internal traffic still works.
 
 ## Development: record features and trade-offs in every PR
 Every PR that changes behaviour updates this README (the feature section and its trade-offs) and the `vm-lab-dev` skill

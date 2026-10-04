@@ -156,4 +156,9 @@ def firewall_script(port, lab_ifaces, vm_ip):
     # NAT and host-only interfaces are closed to forwarding too; otherwise a client behind a router could skip the proxy.
     lines += ["ufw default allow routed", f"ufw route deny out on {NAT_IFACE}", "ufw route deny out on \"$HO\""]
     lines.append("ufw --force enable")
+    # ufw accepts ICMP echo requests before its own user rules, so "deny in" alone lets another lab ping this VM.
+    # A rule ahead of ufw's chains drops new inbound connections on the host-only adapter. Only NEW is matched:
+    # replies to this VM's own proxy requests arrive on the same adapter and must still get through.
+    lines += ['iptables -I INPUT 1 -i "$HO" -m conntrack --ctstate NEW -j DROP',
+              'ip6tables -I INPUT 1 -i "$HO" -m conntrack --ctstate NEW -j DROP 2>/dev/null || true']
     return "\n".join(lines) + "\n"

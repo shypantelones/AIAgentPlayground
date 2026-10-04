@@ -1434,6 +1434,7 @@ TOPOR_DIR = ROOT / "data" / "topo-runs"
 TOPOR_DIR.mkdir(parents=True, exist_ok=True)
 TOPO_RUNS = {}           # run id -> live record (also persisted to data/topo-runs/<id>.json)
 TOPO_LOCK = threading.RLock()
+VAGRANT_UP_LOCK = threading.Lock()      # serializes `vagrant up` across labs (see topo_run_runner)
 TOPO_TERM_CREDS = {}     # "<run id>:<node>" -> current terminal credential; kept in memory only, never persisted
 TOPO_STOP = {}           # run id -> bool, polled by the runner thread at phase boundaries
 TOPO_RUN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
@@ -1754,8 +1755,11 @@ def topo_run_runner(rid):
             if idx != -1:
                 topo_log(r, line[idx:])
         for attempt in range(vr.PORT_COLLISION_RETRIES + 1):
-            rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
-                                             on_line=on_vagrant_line, cancel=stopped)
+            # One lab's `vagrant up` at a time: two labs booting together hit VirtualBox's machine locks ("unexpected
+            # process has tried to lock the machine") and one lab fails. Each lab's own build is still sequential.
+            with VAGRANT_UP_LOCK:
+                rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
+                                                 on_line=on_vagrant_line, cancel=stopped)
             busy = vr.port_collision(out) if rc != 0 and not stopped() else None
             node = next((n for n, p in node_ports.items() if p == busy), None)
             if node is None or attempt == vr.PORT_COLLISION_RETRIES:
