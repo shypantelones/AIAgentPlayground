@@ -1709,13 +1709,17 @@ def topo_run_runner(rid):
                 return finish("error", f"node '{name}' booted but never accepted SSH")
         if r.get("labfile"):
             apply_labfile(r, node_ports, priv)
+        # Decide BEFORE "ready" whether this run has its own agent: once the lab is ready, attach_agent_to_lab() may set
+        # r["agent"] from another thread, and reading it after that would run the attached agent a second time here
+        # (and then finish - and tear down - the lab it was attached to).
+        own_agent = r["agent"]
         r["state"] = "ready"
         save_topo_run(r)
         task = vr.get_topology_task(r["task_id"]) if r["task_id"] else None
         topo_log(r, "ready." + (f" Task: {task['title']}" if task else " Your own prompt for the agent." if r.get("custom_prompt")
                                 else " No task attached: open a terminal on any node to use this lab directly."))
 
-        if not r["agent"]:
+        if not own_agent:
             # No agent attached: this lab is for YOU - open terminals, do the task (if any), then use "Score now"
             # whenever you like. Stay in "ready" and return without tearing anything down; Stop/Delete handle that.
             return

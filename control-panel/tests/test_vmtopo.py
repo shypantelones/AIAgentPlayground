@@ -702,6 +702,23 @@ class AttachAgentTests(VmTopoBase):
                     t.join(timeout=8)
                 self.assertEqual(len(self.destroys()), destroyed)
 
+    def test_attach_right_as_the_lab_becomes_ready_runs_the_agent_once(self):
+        """Regression (found as a 1-in-8 flake on Windows): the lab's own build thread read r["agent"] after setting
+        "ready", so an attach landing in between ran the agent twice and the build thread then finished the lab."""
+        real_log = app.topo_log
+
+        def log_then_attach(r, line):
+            real_log(r, line)
+            if line.startswith("ready."):
+                (app.topo_run_dir(r["id"]) / "Vagrantfile").write_text("# fake")
+                app.attach_agent_to_lab(r["id"], {"agent": "alpha", "custom_prompt": "go"})
+        with mock.patch.object(app, "topo_log", log_then_attach):
+            rid = app.create_topo_run({"topology_id": "s1h2"})
+            self.back_to_ready(rid)
+        self.assertEqual(len(self.turns), 1, "the agent ran once, by the attach")
+        self.assertEqual(app.TOPO_RUNS[rid]["state"], "ready")
+        self.assertFalse(self.destroys(), "the build thread must not finish and tear down the lab")
+
     def test_validation(self):
         app.update_vmb_settings({"max_concurrent": 6})           # room for two 3-node labs at once
         rid = self.scratch_lab(task_id="s1h2-connectivity")
