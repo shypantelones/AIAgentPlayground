@@ -10,7 +10,7 @@ Isolation posture for every VM this module creates:
   - Clipboard, drag-and-drop and audio are disabled (same as the original vm-sandbox/Vagrantfile).
 A VM never gets a route to the host, to another VM, or to any agent other than the one it was created for.
 """
-import base64, json, os, re, secrets, shlex, shutil, signal, socket, subprocess, sys, threading, time
+import base64, ipaddress, json, os, re, secrets, shlex, shutil, signal, socket, subprocess, sys, threading, time
 from pathlib import Path
 
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -881,6 +881,156 @@ def build_custom_topology(counts, wiring, links=None):
     topology = {"id": "custom", "title": f"Custom: {summary} ({wiring})", "nodes": nodes, "links": gen_links}
     return validate_topology(topology)
 
+
+
+# ---------------------------------------------------------------- diagram -> lab: an agent's lab spec -> a lab file
+# An agent reading a diagram writes a compact spec (much easier to get right than snapshot-format configs):
+#   {"title", "nodes": [{"name", "role", "routes": ["<dst|default> via <gw>"]}],
+#    "links": [{"a", "b", "a_ip": "10.1.0.1/24", "b_ip": ...}], "notes": ["what the lab can't model"]}
+# Addresses sit on link ends, so the panel (which knows the NIC order) picks the interface names, never the agent.
+SPEC_ROLE_ALIASES = {"pc": "host", "client": "host", "workstation": "host", "laptop": "host", "fw": "firewall",
+                     "lb": "loadbalancer", "load-balancer": "loadbalancer", "internet": "upstream", "isp": "upstream",
+                     "wan": "upstream", "cloud": "upstream", "l2switch": "switch", "bridge": "switch"}
+SPEC_FORWARDING_ROLES = ("router", "firewall")
+SETUP_NET = ipaddress.ip_network("10.0.2.0/24")          # every node's NAT/setup NIC lives here
+UPSTREAM_ADDR = "198.51.100.1/30"                         # what UPSTREAM_SETUP gives an upstream node
+MAX_LAB_LINKS = len(NIC_PCI_SLOTS) - 1                    # VirtualBox's 8 adapters, minus the setup NIC
+
+
+def spec_to_labfile(spec, configured=True, source=None):
+    """Validate an agent's lab spec -> (lab file, diagram data, warnings). Raises ValueError with a message meant
+    to be sent back to the agent. configured=False keeps the topology only (addresses and routes are dropped)."""
+    if not isinstance(spec, dict) or not isinstance(spec.get("nodes"), list) or not isinstance(spec.get("links"), list):
+        raise ValueError('the spec needs "nodes" and "links" lists')
+    warnings, nodes = [], []
+    for n in spec["nodes"]:
+        if not isinstance(n, dict):
+            raise ValueError("each node must be an object")
+        name, role = str(n.get("name", "")).strip().lower(), str(n.get("role", "")).strip().lower()
+        role = SPEC_ROLE_ALIASES.get(role, role)
+        if not NODE_NAME_RE.match(name):
+            raise ValueError(f"bad node name {name!r}: lowercase letters and digits, starting with a letter, max 15")
+        if role not in NODE_ROLES:
+            raise ValueError(f"{name}: unknown role {role!r} (use one of: {', '.join(NODE_ROLES)})")
+        nodes.append({"name": name, "role": role})
+    if not 2 <= len(nodes) <= MAX_CUSTOM_NODES:
+        raise ValueError(f"a lab needs 2 to {MAX_CUSTOM_NODES} nodes (the spec has {len(nodes)})")
+    roles = {n["name"]: n["role"] for n in nodes}
+    links, ends = [], []                                  # ends: (node, address or None) per link end, in order
+    for l in spec["links"]:
+        if not isinstance(l, dict):
+            raise ValueError("each link must be an object")
+        a, b = str(l.get("a", "")).strip().lower(), str(l.get("b", "")).strip().lower()
+        if a not in roles or b not in roles:
+            raise ValueError(f"link {a}-{b} names a node that isn't in nodes")
+        links.append({"a": a, "b": b})
+        for side, node in (("a", a), ("b", b)):
+            ip = l.get(f"{side}_ip") if configured else None
+            if ip in (None, ""):
+                ends.append((node, None))
+                continue
+            try:
+                addr = ipaddress.ip_interface(str(ip).strip())
+            except ValueError:
+                raise ValueError(f"link {a}-{b}: {ip!r} is not an address with a prefix length, e.g. 10.1.0.1/24")
+            if addr.version != 4:
+                raise ValueError(f"link {a}-{b}: IPv4 only for now (put {ip} in notes)")
+            if addr.network.overlaps(SETUP_NET):
+                raise ValueError(f"link {a}-{b}: {ip} overlaps 10.0.2.0/24, the nodes' setup network; renumber it")
+            if roles[node] == "switch":
+                warnings.append(f"{node}: dropped {ip} (switches only bridge)")
+                addr = None
+            elif roles[node] == "upstream" and str(addr) != UPSTREAM_ADDR:
+                warnings.append(f"{node}: kept its fixed {UPSTREAM_ADDR} instead of {ip}")
+                addr = None
+            ends.append((node, addr))
+    if not links:
+        raise ValueError("the spec has no links")
+    if len(links) > LABFILE_MAX_LINKS:
+        raise ValueError(f"too many links ({len(links)})")
+    for name in roles:
+        if sum(1 for node, _ in ends if node == name) > MAX_LAB_LINKS:
+            raise ValueError(f"{name} has more than {MAX_LAB_LINKS} links (a VM has {MAX_LAB_LINKS} lab NICs)")
+    title = str(spec.get("title") or "Lab from a diagram").strip()[:120]
+    topology = validate_topology({"id": "custom", "title": f"From diagram: {title}", "nodes": nodes, "links": links})
+
+    configs, pos = {}, {}
+    iface_of = {}                                          # per node: [(iface, address or None)] in link order
+    for node, addr in ends:
+        names = lab_iface_names(topology, node)
+        i = pos[node] = pos.get(node, -1) + 1
+        iface_of.setdefault(node, []).append((names[i], addr))
+    spec_routes = {str(n.get("name", "")).strip().lower(): n.get("routes") or [] for n in spec["nodes"]}
+    for name, role in roles.items():
+        nics = iface_of.get(name, [])
+        routes = spec_routes.get(name) if configured else []
+        if not isinstance(routes, list):
+            raise ValueError(f"{name}: routes must be a list")
+        if role in ("switch", "upstream"):
+            if routes:
+                warnings.append(f"{name}: ignored its routes ({role} nodes are set up by the lab)")
+            continue
+        if not any(a for _, a in nics):
+            if routes:
+                warnings.append(f"{name}: ignored its routes (it has no addresses)")
+            continue
+        addr_lines = [f"{ifc} UP {a}" if a else f"{ifc} UP" for ifc, a in nics]
+        route_lines = [f"{a.network} dev {ifc} proto kernel scope link src {a.ip}" for ifc, a in nics if a]
+        for rt in routes:
+            m = re.match(r"^\s*(\S+)\s+via\s+(\S+)\s*$", str(rt))
+            if not m:
+                raise ValueError(f"{name}: route {rt!r} should look like '10.2.0.0/24 via 10.1.0.2' or 'default via 10.1.0.1'")
+            try:
+                dst = "default" if m.group(1) in ("default", "0.0.0.0/0") else str(ipaddress.ip_network(m.group(1), strict=False))
+                gw = ipaddress.ip_address(m.group(2))
+            except ValueError:
+                raise ValueError(f"{name}: route {rt!r} has a bad network or gateway")
+            dev = next((ifc for ifc, a in nics if a and gw in a.network), None)
+            if not dev:
+                raise ValueError(f"{name}: gateway {gw} in route {rt!r} isn't on any of {name}'s subnets")
+            route_lines.append(f"{dst} via {gw} dev {dev}")
+        configs[name] = {"addresses": "\n".join(addr_lines) + "\n", "routes": "\n".join(route_lines + ["# ipv6"]) + "\n"}
+        if role in SPEC_FORWARDING_ROLES:
+            configs[name]["forwarding"] = "net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 0\n"
+    notes = [str(x)[:500] for x in (spec.get("notes") or []) if str(x).strip()][:50] if isinstance(spec.get("notes"), list) else []
+    lf = build_labfile(title, topology, configs, [], dict(source or {}, notes=notes, warnings=warnings))
+    parse_labfile(lf)                                      # the same checks a lab file from anyone else gets
+    return lf, topology_diagram(topology, configs), warnings
+
+
+def drawio_summary(text, max_lines=400):
+    """A draw.io/diagrams.net file -> a few short lines ("node <label> [shape]", "link <a> -- <b>: <label>"), so the
+    agent reads labels and wiring instead of kilobytes of XML. Compressed diagrams are expanded first. None if the
+    text isn't a draw.io file (it's then sent as it is)."""
+    import html, urllib.parse, zlib
+    import xml.etree.ElementTree as ET
+    if "<mxfile" not in text and "<mxGraphModel" not in text:
+        return None
+    try:
+        root = ET.fromstring(text)
+        models = root.findall(".//mxGraphModel") if root.tag != "mxGraphModel" else [root]
+        for d in root.iter("diagram"):
+            body = (d.text or "").strip()
+            if body and not models:
+                raw = zlib.decompress(base64.b64decode(body), -15).decode("utf-8")
+                models.append(ET.fromstring(urllib.parse.unquote(raw)))
+    except Exception:
+        return None
+    clean = lambda v: re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", v or ""))).strip()[:120]
+    lines = []
+    for model in models:
+        cells = {c.get("id"): c for c in model.iter("mxCell")}
+        label = lambda cid: clean(cells[cid].get("value")) or cid if cid in cells else str(cid)
+        for c in cells.values():
+            style = c.get("style") or ""
+            if c.get("vertex") == "1":
+                shape = next((kv.split("=", 1)[1].split(".")[-1] for kv in style.split(";") if kv.startswith(("shape=", "image="))), "")
+                if clean(c.get("value")) or shape:
+                    lines.append(f"node {label(c.get('id'))}" + (f" [{shape[:40]}]" if shape else ""))
+            elif c.get("edge") == "1" and c.get("source") and c.get("target"):
+                lines.append(f"link {label(c.get('source'))} -- {label(c.get('target'))}" +
+                             (f": {clean(c.get('value'))}" if clean(c.get("value")) else ""))
+    return "\n".join(lines[:max_lines]) if lines else None
 
 ROUTER_FRR_SETUP = """
 sed -i -E 's/^(ospfd|ospf6d|bgpd)=no/\\1=yes/' /etc/frr/daemons
