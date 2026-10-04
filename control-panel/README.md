@@ -226,8 +226,10 @@ Trade-offs and gaps:
   commands by their words. Non-sudo commands (reading, ssh to a host the member can reach as its own login) aren't limited.
 - **Patterns are words, not intent.** A command that builds a firewall rule some other way (a script that writes an nft
   file, for example) is not caught by the word match.
-- **Not tested live:** firewall-admin, client-dev and tool-dev. The role catalog and guards are tested with the wrapper
-  and unit tests only.
+- **Tested live:** firewall-admin (firewall node, all intents passed) and client-dev (h1 fetched a page from h2 across a
+  router; its guard refused `sudo ufw disable`). Checked directly on a lab: `clientdev` and `member` have no sudo at all,
+  `fwadmin` runs `nft` with sudo and is refused `id`. The guard refused the ufw command in the client run, not the VM.
+- **Not tested live:** tool-dev, and a member whose key install fails on a real node.
 - **Prompt cost:** each member's prompt now carries its role line (about 60 tokens).
 
 #### Messages between team members
