@@ -9,6 +9,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import vm_runner as vr  # noqa: E402
 
 
+
+def without_role_logins(text):
+    """A provision script minus the role logins' lines: their sudo lists name firewall tools, which only the
+    firewall login may run, so keyword checks about a host's own firewall ignore them."""
+    names = ("netadmin", "fwadmin", "webadmin", "clientdev", "tooldev", "member", "92-")
+    return "\n".join(l for l in text.splitlines() if not any(n in l for n in names))
+
 class PortAllocationTests(unittest.TestCase):
     def test_skips_taken_ports(self):
         with mock.patch.object(vr, "port_free", return_value=True):
@@ -823,7 +830,7 @@ class RenderTopologyVagrantfileTests(unittest.TestCase):
         vr.render_topology_vagrantfile(self.tmp, "deadbeef", self.topo, node_ports, "k", 1024, 1)
         for name in ("h1", "r1"):
             prov = (self.tmp / f"provision-{name}.sh").read_text()
-            self.assertNotIn("ufw", prov)
+            self.assertNotIn("ufw", without_role_logins(prov))
             self.assertNotIn("ip_forward", prov)
             self.assertIn("iputils-ping", prov)
         router_prov = (self.tmp / "provision-r1.sh").read_text()
@@ -836,6 +843,7 @@ class RenderTopologyVagrantfileTests(unittest.TestCase):
         prov = (self.tmp / "provision-fw1.sh").read_text()
         self.assertIn("nftables", prov)
         self.assertIn("systemctl enable nftables", prov)
+        prov = without_role_logins(prov)
         self.assertNotIn("iptables", prov)          # nftables only - the single CLI surface for this appliance
         self.assertNotIn("ufw", prov)
         self.assertNotIn("ip_forward", prov)

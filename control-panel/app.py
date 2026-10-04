@@ -1788,6 +1788,12 @@ def member_prompt(r, task, m, team):
              "need from them.",
              "Lab links are each node's 2nd+ interfaces, unaddressed. Leave enp0s3 alone and don't use 10.0.2.0/24."]
     parts = [p for p in parts if p]
+    allow = lr.SUDO_ALLOW.get(m.get("role")) or []
+    if allow:
+        # Your login can't open a root shell: each privileged command is run on its own, with sudo -n.
+        parts.append("Privileged commands: your login may run these with sudo, one command at a time: "
+                     + ", ".join(allow) + ". Write e.g. `sudo -n iptables -A FORWARD ...`; `sudo bash` and other "
+                     "shells are refused, so don't wrap commands in one.")
     if (r.get("egress") or {}).get("port"):
         parts.append(f"Internet: documentation and package sites only, through the proxy {le.proxy_url(r['egress']['port'])}; "
                      "apt and pip already use it.")
@@ -1796,18 +1802,49 @@ def member_prompt(r, task, m, team):
     return "\n\n".join(parts)
 
 
+def member_key_script(user, pub, remove=False):
+    """Shell (run as bench on a node) that adds or removes one member's public key in its role user's authorized_keys.
+    The key travels base64-encoded, so nothing in it reaches the shell unquoted."""
+    b64 = base64.b64encode(pub.strip().encode()).decode()
+    path = f"/home/{user}/.ssh/authorized_keys"
+    if remove:
+        return (f"K=$(echo {b64} | base64 -d); sudo -n grep -v -F -x \"$K\" {path} > /tmp/ak.$$; "
+                f"sudo -n cp /tmp/ak.$$ {path}; rm -f /tmp/ak.$$\n")
+    return f"echo {b64} | base64 -d | sudo -n tee -a {path} >/dev/null\n"
+
+
+def member_keys_set(r, node_ports, rid, m, pub_text, remove=False):
+    """Install (or remove) a member's public key on each of its nodes, for its role's login there."""
+    user = lr.user_for(m.get("role"))
+    bench_priv = topo_run_dir(rid) / "id_ed25519"
+    for name in m["nodes"]:
+        rc, out, err = vr.ssh_script(node_ports[name], bench_priv, member_key_script(user, pub_text, remove), timeout=60)
+        if rc != 0:
+            topo_log(r, f"  {name}: could not {'remove' if remove else 'install'} {m['agent']}'s key: {(err or out).strip()[-200:]}")
+            if not remove:
+                raise RuntimeError(f"could not install {m['agent']}'s key on {name}")
+
+
 def topo_member_turn(r, topology, node_ports, priv, m, team):
-    """One team member's turn: its relay and vmrun wrappers cover its own nodes only, then one turn, then it's
-    detached. Returns an error message, or None."""
+    """One team member's turn: its own key (for its role's VM login only), its relay and vmrun wrappers covering its own
+    nodes, one turn, then the key is taken back off the nodes and the agent is detached. Returns an error, or None."""
     agent, nodes = m["agent"], m["nodes"]
     topo_log(r, f"attaching {agent} to {', '.join(nodes)}...")
+    member_dir = topo_run_dir(r["id"]) / "members" / agent
+    member_dir.mkdir(parents=True, exist_ok=True)
+    mpriv, mpub = vr.gen_keypair(member_dir)
+    try:
+        member_keys_set(r, node_ports, r["id"], m, mpub.read_text())
+    except RuntimeError as e:
+        return f"{agent}: {e}"
+    user = lr.user_for(m.get("role"))
     dc(agent, "exec", "-T", "gateway", "sh", "-c",
        "mkdir -p /home/node/.openclaw/workspace/.vmkey-topo && "
        "cat > /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519 && "
-       "chmod 600 /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", input=priv.read_text(), timeout=20)
+       "chmod 600 /home/node/.openclaw/workspace/.vmkey-topo/id_ed25519", input=mpriv.read_text(), timeout=20)
     for name in nodes:
         wrapper = vr.vmrun_script("/home/node/.openclaw/workspace/.vmkey-topo/id_ed25519",
-                                  vr.relay_port_for_node(topology, name), "bench@vm-relay-topo",
+                                  vr.relay_port_for_node(topology, name), f"{user}@vm-relay-topo",
                                   "/home/node/.openclaw/workspace/vm-session-topo.log", node=name,
                                   budget_file=TOPO_BUDGET_FILE if r.get("budget") else None,
                                   deny=lr.denied_patterns(m.get("role")))
@@ -1826,6 +1863,10 @@ def topo_member_turn(r, topology, node_ports, priv, m, team):
     finally:
         topo_log(r, f"detaching {agent} from this lab...")
         detach_topo_agent(agent)
+        try:
+            member_keys_set(r, node_ports, r["id"], m, mpub.read_text(), remove=True)
+        except Exception:  # noqa - a key left behind is removed with the lab; never let cleanup break the run
+            pass
 
 
 def topo_team_phase(r, topology, node_ports, priv, task, stopped):

@@ -13,6 +13,13 @@ import lab_egress as le  # noqa: E402
 import vm_runner as vr  # noqa: E402
 
 
+def without_role_logins(text):
+    """A provision script minus the role logins' lines: their sudo lists name firewall tools, which only the
+    firewall login may run, so keyword checks about a host's own firewall ignore them."""
+    names = ("netadmin", "fwadmin", "webadmin", "clientdev", "tooldev", "member", "92-")
+    return "\n".join(l for l in text.splitlines() if not any(n in l for n in names))
+
+
 class DomainTests(unittest.TestCase):
     def test_domains_are_normalised_and_bad_ones_refused(self):
         self.assertEqual(le.normalize_domain("  Docs.Example.ORG "), "docs.example.org")
@@ -89,7 +96,7 @@ class VmScriptTests(unittest.TestCase):
     def test_provision_script_gets_the_egress_block_only_when_asked(self):
         plain = vr._topo_provision_script("host", "ssh-ed25519 KEY")
         self.assertNotIn("95lab-proxy", plain)
-        self.assertNotIn("ufw", plain)
+        self.assertNotIn("ufw", without_role_logins(plain))
         with_eg = vr._topo_provision_script("host", "ssh-ed25519 KEY", egress_port=62500, lab_ifaces=["enp0s8"],
                                             vm_ip="192.168.56.20")
         self.assertLess(with_eg.index("95lab-proxy"), with_eg.index("apt-get update"))

@@ -14,6 +14,7 @@ import base64, ipaddress, json, os, re, secrets, shlex, shutil, signal, socket, 
 from pathlib import Path
 
 import lab_egress  # the internet policy for labs (presets, proxy and VM firewall config)
+import lab_roles   # per-role VM logins and their sudo lists
 
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOWS = sys.platform.startswith("win")
@@ -792,13 +793,22 @@ def vmrun_script(key_path, port, host, log_path, node=None, budget_file=None, de
     # agent shares this workspace, so it isn't a security boundary.
     budget = ""
     if budget_file:
+        # Agents run commands in parallel within a turn: the read and the write are one step under a lock, and the
+        # count is written to a temporary file and renamed into place, so no two commands can read the same count.
+        # The lock is an exclusive file create (set -C), released by hand. A directory lock (mkdir/rmdir) let two
+        # commands in at once under parallel load here. No EXIT trap: the pipeline's subshells inherit it.
         budget = (f"if [ -f \"{budget_file}\" ]; then\n"
-                  f"  n=$(cat \"{budget_file}\" 2>/dev/null || echo 0)\n"
+                  f"  lock=\"{budget_file}.lock\"\n"
+                  "  while ! ( set -C; : > \"$lock\" ) 2>/dev/null; do sleep 0.05; done\n"
+                  f"  n=$(cat \"{budget_file}\" 2>/dev/null)\n"
+                  "  case \"$n\" in ''|*[!0-9]*) n=0;; esac\n"
                   "  if [ \"$n\" -le 0 ]; then\n"
+                  "    rm -f \"$lock\"\n"
                   "    echo \"command budget used up for this agent in this lab: stop and tell the user what is left to do\" >&2\n"
                   "    exit 3\n"
                   "  fi\n"
-                  f"  echo $((n - 1)) > \"{budget_file}\"\n"
+                  f"  echo $((n - 1)) > \"{budget_file}.tmp\" && mv \"{budget_file}.tmp\" \"{budget_file}\"\n"
+                  "  rm -f \"$lock\"\n"
                   "fi\n")
     # A role guard (see lab_roles): a command matching one of the role's patterns is refused and logged as refused.
     # Patterns are ERE for grep; none may contain a single quote.
@@ -1146,7 +1156,7 @@ echo '{pubkey}' > /home/bench/.ssh/authorized_keys
 chmod 700 /home/bench/.ssh && chmod 600 /home/bench/.ssh/authorized_keys
 chown -R bench:bench /home/bench
 echo 'bench ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/90-bench
-{extra}{egress_after}"""
+{users}{extra}{egress_after}"""
     if role == "switch":
         # Config-free "unmanaged switch" by default: bridge every lab-facing NIC (anything but the NAT nic1,
         # which is always the interface already configured with an address) into one L2 broadcast domain.
@@ -1213,7 +1223,7 @@ ip link set br0 up
         pkgs += " ufw"
         egress_before = lab_egress.egress_script(egress_port, vm_ip)
         egress_after = lab_egress.firewall_script(egress_port, lab_ifaces, vm_ip)
-    return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra,
+    return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra, users=lab_roles.provision_users_script(),
                          egress_before=egress_before, egress_after=egress_after)
 
 
