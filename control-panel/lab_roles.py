@@ -69,3 +69,46 @@ def describe(role):
     if not spec:
         return ""
     return f"Your role is {role}: {spec['for']}. Your guard refuses {spec['refuses']}."
+
+
+# VM-side users: each role has its own login on every lab VM. A member's key only opens its role's user, and that
+# user's sudo is limited to the commands the role needs (below). The guard above still applies on top.
+ROLE_USERS = {
+    "network-admin": "netadmin",
+    "firewall-admin": "fwadmin",
+    "web-admin": "webadmin",
+    "client-dev": "clientdev",
+    "tool-dev": "tooldev",
+}
+NO_ROLE_USER = "member"                  # a member without a role: a login with no sudo at all
+
+# Commands each role's user may run with sudo (absolute paths; sudoers NOPASSWD). Reading the network needs no sudo.
+SUDO_ALLOW = {
+    "network-admin": ["/usr/sbin/ip", "/usr/sbin/sysctl", "/usr/sbin/bridge", "/usr/bin/systemctl", "/usr/bin/vtysh",
+                      "/usr/bin/tee"],
+    "firewall-admin": ["/usr/sbin/nft", "/usr/sbin/iptables", "/usr/sbin/iptables-save", "/usr/sbin/iptables-restore",
+                       "/usr/sbin/ufw", "/usr/sbin/sysctl", "/usr/bin/systemctl", "/usr/bin/tee", "/usr/sbin/ip"],
+    "web-admin": ["/usr/bin/apt-get", "/usr/bin/systemctl", "/usr/bin/tee", "/usr/sbin/nginx"],
+    "client-dev": [],
+    "tool-dev": ["/usr/bin/apt-get"],
+}
+
+
+def user_for(role):
+    """The VM login a member with this role uses (NO_ROLE_USER if it has no role)."""
+    return ROLE_USERS.get(role, NO_ROLE_USER)
+
+
+def provision_users_script():
+    """Shell run on every lab VM at provision: each role's login, and its sudo list. A sudoers file that fails
+    `visudo -c` is removed, so a bad entry can't break sudo for the VM."""
+    lines = []
+    for role, user in list(ROLE_USERS.items()) + [(None, NO_ROLE_USER)]:
+        allow = SUDO_ALLOW.get(role, []) if role else []
+        lines.append(f"id -u {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}")
+        lines.append(f"mkdir -p /home/{user}/.ssh && touch /home/{user}/.ssh/authorized_keys")
+        lines.append(f"chmod 700 /home/{user}/.ssh && chmod 600 /home/{user}/.ssh/authorized_keys && chown -R {user}:{user} /home/{user}")
+        if allow:
+            f = f"/etc/sudoers.d/92-{user}"
+            lines.append(f"echo '{user} ALL=(root) NOPASSWD: {', '.join(allow)}' > {f} && chmod 440 {f} && visudo -cf {f} >/dev/null || rm -f {f}")
+    return "\n".join(lines) + "\n"

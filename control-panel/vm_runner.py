@@ -14,6 +14,7 @@ import base64, ipaddress, json, os, re, secrets, shlex, shutil, signal, socket, 
 from pathlib import Path
 
 import lab_egress  # the internet policy for labs (presets, proxy and VM firewall config)
+import lab_roles   # per-role VM logins and their sudo lists
 
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOWS = sys.platform.startswith("win")
@@ -1146,7 +1147,7 @@ echo '{pubkey}' > /home/bench/.ssh/authorized_keys
 chmod 700 /home/bench/.ssh && chmod 600 /home/bench/.ssh/authorized_keys
 chown -R bench:bench /home/bench
 echo 'bench ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/90-bench
-{extra}{egress_after}"""
+{users}{extra}{egress_after}"""
     if role == "switch":
         # Config-free "unmanaged switch" by default: bridge every lab-facing NIC (anything but the NAT nic1,
         # which is always the interface already configured with an address) into one L2 broadcast domain.
@@ -1213,7 +1214,7 @@ ip link set br0 up
         pkgs += " ufw"
         egress_before = lab_egress.egress_script(egress_port, vm_ip)
         egress_after = lab_egress.firewall_script(egress_port, lab_ifaces, vm_ip)
-    return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra,
+    return common.format(pkgs=pkgs, pubkey=pubkey_text, extra=extra, users=lab_roles.provision_users_script(),
                          egress_before=egress_before, egress_after=egress_after)
 
 
