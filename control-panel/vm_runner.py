@@ -460,6 +460,11 @@ def render_apply_script(sections):
             cmds.append(f"sudo -n sysctl -q -w {q(m.group(1) + '=' + m.group(2))}")
     b64 = lambda text: base64.b64encode(text.encode()).decode()
     nft, ipt = sections.get("nftables", ""), sections.get("iptables", "")
+    # A ruleset with ufw's chains belongs to the lab's own firewall (its outbound default-deny and proxy rules, which the
+    # VM's provisioning builds). Restoring it would flush that firewall, so it's skipped and the VM keeps its own.
+    if "ufw-" in nft or "ufw-" in ipt:
+        skipped.append("firewall rules (managed by the lab's ufw)")
+        nft = ipt = ""
     if _usable(nft):
         cmds.append(f"echo {b64('flush ruleset' + chr(10) + nft)} | base64 -d | sudo -n nft -f -")
     elif _usable(ipt):

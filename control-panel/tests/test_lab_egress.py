@@ -124,6 +124,19 @@ class VmScriptTests(unittest.TestCase):
         thread.assert_not_called()
 
 
+class LabFileFirewallTests(unittest.TestCase):
+    def test_a_ufw_ruleset_in_a_lab_file_is_not_restored(self):
+        ruleset = "table ip filter {\n\tchain ufw-before-input {\n\t}\n}\n"
+        script, skipped = vr.render_apply_script({"nftables": ruleset})
+        self.assertNotIn("nft -f", script)
+        self.assertTrue(any("ufw" in x for x in skipped), skipped)
+
+    def test_a_firewall_role_ruleset_without_ufw_is_still_restored(self):
+        ruleset = "table inet filter {\n\tchain forward {\n\t\tdrop\n\t}\n}\n"
+        script, _ = vr.render_apply_script({"nftables": ruleset})
+        self.assertIn("nft -f", script)
+
+
 class CreateLabEgressTests(unittest.TestCase):
     def test_a_bad_extra_domain_stops_the_lab_before_anything_is_built(self):
         with mock.patch.object(app.threading, "Thread") as thread:
