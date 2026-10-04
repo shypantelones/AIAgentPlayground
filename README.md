@@ -33,6 +33,16 @@ and path checks run from each node), write a **plan** that waits for approval be
 lab back to any earlier turn, record **packet captures** for Wireshark, save and resume, and export the lab as a
 file. These are in the [Network workbench](control-panel/README.md#network-workbench) section.
 
+## Feature highlights (VM Labs)
+- **Intents:** say what a lab must and must not do (reach, block and path checks run from each node). See [Network workbench](control-panel/README.md#network-workbench).
+- **Plan first:** the agent writes its plan with no access to the nodes until you approve it.
+- **Change log and rollback:** every agent command per node and turn, with a snapshot to roll back to.
+- **Packet captures:** tcpdump on any node, downloadable as a `.pcap` for Wireshark.
+- **Teams:** several agents in one lab, each with its own nodes, brief and stage.
+- **Internet access for labs:** documentation and package sites only, through a per-lab proxy.
+- **Cost budget:** each cloud agent gets a dollar budget, and the model decides how many commands that buys.
+- **Lab files, save and resume:** export a lab and rebuild it, or suspend its VMs and resume them later.
+
 ## Layout
 ```
 aiagentplayground/
