@@ -143,6 +143,10 @@ function vtBuildSection() {
   VT.newBudget = h("input", { type: "number", min: 0.01, max: 20, step: 0.01, value: "0.50", style: "width:6em" });
   VT.newTeam = h("textarea", { rows: 3, placeholder: "alpha | h1,r1 | 1 | network admin: builds the routing\nbeta | h2 | 2 | web server: serves the feed" });
   VT.newDomains = h("textarea", { rows: 2, placeholder: "e.g. docs.example.org (one per line, for a niche tool)" });
+  VT.newBuild = h("select", {},
+    h("option", { value: "vm" }, "VMs (VirtualBox)"),
+    h("option", { value: "full" }, "Containers (Docker, no VirtualBox)"),
+    h("option", { value: "mixed", disabled: "disabled" }, "Mixed: containers for network devices, VMs for hosts (not built yet)"));
   VT.newMsg = h("div", { class: "fail" });
   const create = h("button", { class: "primary", onclick: async () => {
     VT.newMsg.textContent = "";
@@ -150,6 +154,7 @@ function vtBuildSection() {
     if (VT.newInteractive.checked && !agents.length) { VT.newMsg.textContent = "Tick the agent to attach."; return; }
     const body = { keep: VT.newKeep.checked, interactive: VT.newInteractive.checked, intents: VT.newIntents.value,
                    plan_first: VT.newPlanFirst.checked, extra_domains: VT.newDomains.value,
+                   build_mode: VT.newBuild.value,
                    budget_usd: VT.newBudget.value, command_cap: VT.newCap.value };
     if (VT.fileOn.checked) {
       if (!VT.labfile) { VT.newMsg.textContent = "Choose a lab file first."; return; }
@@ -199,7 +204,9 @@ function vtBuildSection() {
       vtGroup("1. Where the lab comes from", "A catalog topology, one you build from role counts, or a lab file.",
         topoRow, VT.preview, customRow,
         h("label", { class: "row" }, VT.fileOn, "build from a lab file"), fileBox,
-        custBuilder),
+        custBuilder,
+        h("label", { class: "row" }, "Nodes run as", VT.newBuild),
+        h("div", { class: "hint" }, "Containers start in seconds and need no VirtualBox, so they suit a low-resource machine or a Mac. A container lab has no internet access, can't be saved or rolled back, and takes no team yet.")),
       vtGroup("2. What the agent does", "A catalog task, or your own prompt. Custom topologies and lab files take a prompt.",
         taskRow, VT.newTaskInfo, promptRow, VT.customPrompt),
       vtGroup("3. Checks (optional)",

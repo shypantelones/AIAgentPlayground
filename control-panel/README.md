@@ -264,6 +264,19 @@ brief, plus the shared goal and the names of the other members.
 - **Not yet verified:** a team with more than two stages, a team lab that is saved and resumed, and a member that
   fails its relay start inside a real lab.
 
+#### Container labs ("Nodes run as: containers")
+
+A lab can run its nodes as Docker containers instead of VirtualBox VMs. Pick it in step 1 of the new-lab form. Each node is a container from one shared image (Ubuntu 24.04 with the same tools a VM host has, minus FRR and ufw) and runs sshd on 127.0.0.1, so the agent, the terminals, captures and the change log work as they do for VMs. Only creation and teardown differ.
+
+- **What it needs:** Docker running on the panel's machine. No VirtualBox. Works on Linux, WSL2, Docker Desktop on Windows, and Docker Desktop on macOS (the Mac has not been tested yet).
+- **Networking:** each lab link is a veth pair (a point-to-point cable), created by a small root helper, `control-panel/lab_node/link.sh`. Its two ends go into the two nodes' network namespaces and become `eth1`, `eth2`, ... in link order. There is no Docker network or bridge per link, so frames can't leak between links. A switch node bridges its own links. Every node also has a management network with no masquerade, which carries the published ssh port and nothing else, so a node has no route out.
+- **Root helpers:** `link.sh` (creates a link) and `forward.sh` (turns IP forwarding on or off in one node) need root. The panel runs them through `sudo -n`. Install both, once, with `sudo sh control-panel/lab_node/install-helpers.sh <your user>`: it copies each helper root-owned to `/usr/local/sbin/ag-lab-link` and `/usr/local/sbin/ag-lab-forward`, and adds a sudoers line that allows only those two paths for that user. Both helpers check their own arguments and refuse anything that isn't a lab node.
+- **Linux only:** the helpers need Linux network namespaces, so container labs run on a Linux Docker host (or WSL2 with Docker Engine). Docker Desktop on Windows and macOS is not supported for this (its VM hides the namespaces the helpers use, and ICMP between containers failed there).
+- **Forwarding:** Docker turns forwarding on in every container. The lab sets it off at build, and a router is switched on through the lab page, which runs `forward.sh`. The agent can't change it from inside the node.
+- **Trade-offs:** no internet (the egress proxy and ufw need a VM), no save/suspend, no rollback points for the change log, no teams yet (member logins are VM-only), one shared host key across the image, and links are point-to-point: a segment with several hosts needs a switch node.
+- **Mixed labs (containers for network devices, VMs for hosts)** are not built yet. They need a Docker host VM bridged onto the VirtualBox networks; see the container-router spike. The option is shown but disabled.
+- Code: `control-panel/container_lab.py`, the image in `control-panel/lab_node/`.
+
 #### Internet access for labs
 Lab VMs don't get open internet. A lab reaches documentation and package sites for its roles, plus any domains you
 add for a niche tool (the "Internet" group in the new-lab form). Presets are in `lab_egress.py`:

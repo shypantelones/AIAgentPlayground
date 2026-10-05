@@ -15,6 +15,7 @@ from pathlib import Path
 
 import lab_egress  # the internet policy for labs (presets, proxy and VM firewall config)
 import lab_roles   # per-role VM logins and their sudo lists
+import container_lab  # container nodes for "full" labs (Docker instead of VirtualBox); see its docstring
 
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOWS = sys.platform.startswith("win")
@@ -737,11 +738,14 @@ def lab_iface_names(topology, name, snapshot_links=""):
     return [f"enp0s{NIC_PCI_SLOTS[i + 1]}" if i + 1 < len(NIC_PCI_SLOTS) else f"nic{i + 2}" for i in range(n)]
 
 
-def topology_diagram(topology, snapshot_nodes=None):
+def topology_diagram(topology, snapshot_nodes=None, container_nodes=()):
     """What the panel draws: nodes, links with each end's interface name, and per-node interface addresses (lab ones
-    only: no loopback, setup NIC or link-local) from a snapshot's "addresses" section, if given."""
+    only: no loopback, setup NIC or link-local) from a snapshot's "addresses" section, if given. `container_nodes`:
+    names of nodes that are containers (container_lab), whose lab NICs are eth1.. rather than enp0s8..."""
     snapshot_nodes = snapshot_nodes or {}
-    ifaces = {n["name"]: lab_iface_names(topology, n["name"], snapshot_nodes.get(n["name"], {}).get("links", ""))
+    ifaces = {n["name"]: (container_lab.lab_iface_names(len(links_for_node(topology, n["name"])))
+                          if n["name"] in container_nodes else
+                          lab_iface_names(topology, n["name"], snapshot_nodes.get(n["name"], {}).get("links", "")))
               for n in topology["nodes"]}
     pos = {n["name"]: 0 for n in topology["nodes"]}
     links = []
