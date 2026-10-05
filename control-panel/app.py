@@ -1526,6 +1526,7 @@ def topo_run_view(r, full=False):
     v = {k: r[k] for k in ("id", "state", "reason", "keep", "memory_mb", "cpus", "created", "started", "ended",
                            "agent", "topology_id", "topology_title", "task_id", "task_title", "custom_prompt",
                            "chat", "score", "benchmark_id", "nodes")}
+    v["build_mode"] = r.get("build_mode")          # older lab records have none: they are VM labs
     v.update({k: r.get(k) for k in ("agent_model", "agent_turns", "agent_turns_with_commands", "agent_commands")})
     v["interactive"] = bool(r.get("interactive"))
     v["idle_deadline"] = (r["idle_since"] + VM_SESSION_IDLE_S) if r["state"] == "attached" and r.get("idle_since") else None
