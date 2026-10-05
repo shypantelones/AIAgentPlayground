@@ -297,7 +297,15 @@ async function loadVTDetail() {
         showTerminalLogin(`Node ${name} in lab ${r.id}`, t);
         vtSig.detail = ""; vtLoad();
       } catch (e) { alert(e.message); }
-    } }, n.terminal.active ? "Open terminal (running)" : "Open terminal")));
+    } }, n.terminal.active ? "Open terminal (running)" : "Open terminal"),
+    r.build_mode === "full" ? h("button", { disabled: !canTerminal,
+      title: "Turn IP forwarding on or off in this container. Docker turns it on by default; a router needs it on to pass traffic between its links. The agent can't change it from inside the node.",
+      onclick: async () => {
+        try {
+          await api(`/api/vmtopo/runs/${r.id}/forwarding`, { node: name, on: !n.forwarding });
+          vtSig.detail = ""; vtLoad();
+        } catch (e) { alert(e.message); }
+      } }, n.forwarding ? "Forwarding on (turn off)" : "Forwarding off (turn on)") : ""));
 
   const scoreBtn = h("button", { disabled: !canScore, onclick: () => action(`/api/vmtopo/runs/${r.id}/score`, `Score ${r.id}`, {}, () => { vtSig.detail = ""; vtLoad(); }) }, "Score now");
   const intentsBtn = h("button", { disabled: !canIntents, onclick: () => action(`/api/vmtopo/runs/${r.id}/intents`, `Check intents ${r.id}`, {}, () => { vtSig.detail = ""; vtLoad(); }) }, "Check intents");

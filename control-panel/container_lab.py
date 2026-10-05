@@ -169,6 +169,12 @@ def up(rid, topology, node_ports, pubkey_text, memory_mb, cpus, log):
         rc, out, err = docker("exec", c["container"], "/usr/local/bin/lab-wire", timeout=60)
         if rc != 0:
             return rc, out + err
+    # Docker turns forwarding on in every container; a VM starts with it off. Set it off here, through the helper, so
+    # the lab starts the way a VM lab does and the lab page's state is right from the start.
+    for c in p["containers"]:
+        rc, out = set_forwarding(c["container"], False)
+        if rc != 0:
+            return rc, out
     return 0, ""
 
 

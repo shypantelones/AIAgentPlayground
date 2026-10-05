@@ -87,8 +87,15 @@ class UpTests(unittest.TestCase):
             self.links.append((idx, ca, ia, cb, ib))
             return 0, ""
 
+        self.forwarding = []
+
+        def fake_forwarding(container, on, helper=None):
+            self.forwarding.append((container, on))
+            return 0, ""
+
         self.patches = [mock.patch.object(cm, "docker", side_effect=fake_docker),
-                        mock.patch.object(cm, "make_link", side_effect=fake_link)]
+                        mock.patch.object(cm, "make_link", side_effect=fake_link),
+                        mock.patch.object(cm, "set_forwarding", side_effect=fake_forwarding)]
         for p in self.patches:
             p.start()
 
@@ -136,6 +143,11 @@ class UpTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("already has eth1", out)
         self.assertFalse(any(c[0] == "exec" for c in self.calls))
+
+    def test_every_node_starts_with_forwarding_off_through_the_helper(self):
+        cm.up("abc", TOPO, PORTS, "k", 512, 1, self.logged.append)
+        self.assertEqual(sorted(self.forwarding), sorted([("aglab-abc-h1", False), ("aglab-abc-r1", False),
+                                                          ("aglab-abc-h2", False)]))
 
     def test_the_image_is_built_once_when_missing(self):
         def no_image(*args, input=None, timeout=120):
