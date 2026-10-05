@@ -2295,6 +2295,10 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
            f"cat > /home/node/.openclaw/workspace/vmrun-{name} && chmod +x /home/node/.openclaw/workspace/vmrun-{name}",
            input=wrapper, timeout=20)
+    if r.get("build_mode") == "full":
+        dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
+           "cat > /home/node/.openclaw/workspace/forward && chmod +x /home/node/.openclaw/workspace/forward",
+           input=forward_script(list(r["nodes"])), timeout=20)
     relay_cmd = vr.relay_command(topology, node_ports)
     env = dict(os.environ, VM_RELAY_TOPO_CMD=relay_cmd)
     rc, out, err = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
@@ -2332,6 +2336,10 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         hints.append("Your lab has to meet these intents. They're checked from the source node after each of your "
                      "turns:\n" + li.summary_for_prompt(r["intents"]))
     opening = r.pop("pending_opening", None) or (task["prompt"] if task else r["custom_prompt"])
+    if r.get("build_mode") == "full":
+        # container labs: routers start with forwarding off (as on a VM). Only the panel can switch it.
+        hints.insert(0, "To turn IP forwarding on or off in a node (a router needs it on to pass traffic): "
+                        "./forward <node> on|off. It waits for the panel's answer; ok means it's done.")
     prompt = (f"{opening}\n\nLab nodes (commands run from your working "
               f"directory):\n{node_lines}\n" + vr.VMRUN_HOWTO.format(cmd="./vmrun-h1") + "\n"
               + "\n".join(h for h in hints if h))
@@ -2759,6 +2767,81 @@ def set_topo_forwarding(rid, node, on):
     topo_log(r, f"{node}: IP forwarding {'on' if on else 'off'} (set from the lab page)")
     save_topo_run(r)
     return {"node": node, "forwarding": bool(on)}
+
+
+# The agent's ./forward command (container labs only). The agent appends "<id> <node> on|off" to the outbox and waits
+# for "<id> ok ..." or "<id> error ..." in the result file. The panel answers from serve_forward_requests(). The
+# agent gets no host access: the panel applies the change through set_topo_forwarding, for this lab's nodes only.
+FORWARD_OUTBOX = "/home/node/.openclaw/workspace/.forward-outbox"
+FORWARD_RESULT = "/home/node/.openclaw/workspace/.forward-result"
+FORWARD_POLL_S = 3
+FORWARD_MAX_CHANGES = 20          # per lab: a runaway agent can't flip a router all day
+
+
+def forward_script(names):
+    """The ./forward command in an agent's workspace: ./forward <node> on|off."""
+    return ("#!/bin/sh\n"
+            "# Turn IP forwarding on or off in one of this lab's nodes. Usage: ./forward <node> on|off\n"
+            "# The panel applies it and answers here; this waits up to a minute for the answer.\n"
+            "node=\"$1\"; want=\"$2\"\n"
+            "case \"$want\" in on|off) ;; *) echo \"usage: ./forward <node> on|off\" >&2; exit 2;; esac\n"
+            "case \" " + " ".join(names) + " \" in *\" $node \"*) ;; *) echo \"no node called '$node'; this lab's nodes are: "
+            + ", ".join(names) + "\" >&2; exit 2;; esac\n"
+            "id=\"$(date +%s)$$\"\n"
+            "echo \"$id $node $want\" >> " + FORWARD_OUTBOX + "\n"
+            "i=0\n"
+            "while [ $i -lt 60 ]; do\n"
+            "  line=\"$(grep \"^$id \" " + FORWARD_RESULT + " 2>/dev/null | tail -1)\"\n"
+            "  if [ -n \"$line\" ]; then\n"
+            "    echo \"${line#$id }\"\n"
+            "    case \"$line\" in \"$id ok \"*) exit 0;; *) exit 1;; esac\n"
+            "  fi\n"
+            "  sleep 1; i=$((i + 1))\n"
+            "done\n"
+            "echo \"no answer from the panel yet; check the lab page\" >&2; exit 3\n")
+
+
+def take_forward_requests(agent):
+    """The requests the agent queued, as [(id, node, on)]. The outbox is emptied as it's read."""
+    rc, out, _ = dc(agent, "exec", "-T", "gateway", "sh", "-c",
+                    f"cat {FORWARD_OUTBOX} 2>/dev/null; : > {FORWARD_OUTBOX}", timeout=20)
+    reqs = []
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0].isdigit() and parts[2] in ("on", "off"):
+            reqs.append((parts[0], parts[1], parts[2] == "on"))
+    return reqs
+
+
+def answer_forward(agent, text):
+    dc(agent, "exec", "-T", "gateway", "sh", "-c", f"cat >> {FORWARD_RESULT}",
+       input=" ".join(text.split()) + "\n", timeout=20)
+
+
+def serve_forward_requests_once():
+    for r in list(TOPO_RUNS.values()):
+        if r.get("build_mode") != "full" or not r.get("agent") or r["state"] not in TOPO_LIVE_STATES:
+            continue
+        for rid_, node, on in take_forward_requests(r["agent"]):
+            if r.get("forward_changes", 0) >= FORWARD_MAX_CHANGES:
+                answer_forward(r["agent"], f"{rid_} error this lab has already changed forwarding "
+                                           f"{FORWARD_MAX_CHANGES} times; ask the user")
+                continue
+            try:
+                set_topo_forwarding(r["id"], node, on)
+                r["forward_changes"] = r.get("forward_changes", 0) + 1
+                answer_forward(r["agent"], f"{rid_} ok {node} {'on' if on else 'off'}")
+            except Exception as e:  # noqa - the agent gets the reason, the panel keeps serving
+                answer_forward(r["agent"], f"{rid_} error {e}")
+
+
+def serve_forward_requests():
+    while True:
+        try:
+            serve_forward_requests_once()
+        except Exception:  # noqa - one bad lab must not stop the others being served
+            pass
+        time.sleep(FORWARD_POLL_S)
 
 
 def topo_rollback(rid, turn):
@@ -4322,6 +4405,7 @@ def main():
     load_vm_runs()
     load_topo_runs()
     load_lab_drafts()
+    threading.Thread(target=serve_forward_requests, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PANEL_PORT), Handler)
     print(f"AI Agent control panel: http://127.0.0.1:{PANEL_PORT}  (Ctrl+C to stop)")
     try:
