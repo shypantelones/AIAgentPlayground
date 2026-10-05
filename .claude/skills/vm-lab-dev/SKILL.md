@@ -517,6 +517,19 @@ generated shell in each node's provision script.
   lab failed. Keys are removed before each new one.
 - **Live:** alpha/beta on the firewall lab passed all intents and the score, with messages both ways and the limit enforced.
 
+## Container labs (container_lab.py, "full" build)
+
+- A lab's `build_mode` is `vm` (default), `full` (every node a container), or `mixed` (not built: refused at create). `cm.node_backend(mode, role)` says which backend a node gets; `validate_build_mode` refuses bad modes and over-linked nodes.
+- `cm.up()`: one management network (no masquerade, carries only the published ssh port), then the containers (`--cap-add NET_ADMIN NET_RAW`, memory and cpus caps, `-p 127.0.0.1:<ssh_port>:22`), each started; then one link per lab link through `make_link` -> the root helper `lab_node/link.sh` (a veth pair, each end renamed `ethN` inside its node's netns); then `lab-wire` in every node (brings the NICs up, bridges a switch). `cm.teardown(rid)` removes containers and networks by label `aiagentplayground-lab=<rid>` and is safe to repeat; link ends go with the containers' namespaces.
+- Helpers (root, installed root-owned outside the repo, called through `sudo -n` by the panel): `link.sh` and `forward.sh`. Both validate their arguments (lab id, node name must belong to that lab and be running, interface `eth1..eth99`, value 0/1) before touching anything. Paths: `AG_LAB_LINK_HELPER` / `AG_LAB_FORWARD_HELPER` env overrides, defaults `/usr/local/sbin/ag-lab-link` and `/usr/local/sbin/ag-lab-forward`.
+- Forwarding: Docker turns it on in every container. `lab-wire` doesn't set it; the lab page's `POST /api/vmtopo/runs/<id>/forwarding` runs `forward.sh`. Writing it from inside a node fails (`/proc/sys` is read-only there once networks are attached), so the agent can't switch it.
+- Refused or skipped for container labs: team (member logins are VM-only), extra internet domains, egress proxy, save/suspend, VirtualBox rollback points (`snapshot_lab_vms` returns False).
+- Interface names: `topology_diagram(..., container_nodes=...)` labels container NICs `eth1..`; VM NICs stay `enp0s8..`.
+- Image: `control-panel/lab_node/` (Dockerfile, `start.sh` = sshd only, `wire.sh` = `lab-wire`). `start.sh` takes `AG_PUBKEY` from the environment.
+- Why veth and not Docker networks: with a Docker network per link, frames sometimes reached the wrong container's link on this Linux host (about 13% first-link loss, not tied to `--internal`, and not reproduced with plain busybox on a standard bridge). Point-to-point veths had no loss in 30 trials per link, and the full lab passed 10 of 10 builds.
+- Tests: `tests/test_container_lab.py` (mocked docker and helpers, plus the helpers run for real against stub `docker`, `ip`, `nsenter`). The live checks used `/tmp` copies on the Linux host; `spike/container-router/` holds the older spike scripts.
+- Unverified: macOS (no Linux host, Docker Desktop not supported for the helpers), mixed labs, and any role beyond host, router and switch in the image.
+
 ## Recording changes (required in every PR)
 
 Every PR that changes lab behaviour records, in the same PR:

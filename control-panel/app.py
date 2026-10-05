@@ -848,6 +848,7 @@ import lab_roles as lr  # noqa: E402  (what each team role is for, and what its 
 import agent_costs as ac  # noqa: E402  (what an agent's commands cost, and how many a budget buys)
 import lab_egress as le  # noqa: E402  (what a lab VM may reach on the internet, and the proxy that enforces it)
 import lab_changes as lc  # noqa: E402  (a lab's change log: the agent's commands per node and turn; pure logic)
+import container_lab as cm  # noqa: E402  (container nodes for "full" labs: Docker instead of VirtualBox)
 
 VMR_DIR = ROOT / "data" / "vm-runs"
 VMR_DIR.mkdir(parents=True, exist_ok=True)
@@ -1558,7 +1559,9 @@ def topo_run_diagram(r):
     topology = vr.get_topology(r["topology_id"]) if r["topology_id"] else r["topology"]
     snaps = list_topo_snapshots(r["id"])
     snap = load_topo_snapshot(r["id"], snaps[0]["id"]) if snaps else None
-    d = vr.topology_diagram(topology, (snap or {}).get("nodes"))
+    mode = r.get("build_mode") or "vm"
+    containers = {n["name"] for n in topology["nodes"] if cm.node_backend(mode, n["role"]) == "container"}
+    d = vr.topology_diagram(topology, (snap or {}).get("nodes"), container_nodes=containers)
     d["snapshot"] = {"id": snap["id"], "ts": snap["ts"]} if snap else None
     return d
 
@@ -1619,6 +1622,12 @@ def create_topo_run(form):
             raise ValueError(f"{agent} is already attached to lab {busy[0]['id']}; end or stop that lab first")
     elif interactive:
         raise ValueError("attach an agent to start a session")
+    # Where the nodes run: VMs (default), containers for network devices (mixed, not built yet), or all containers
+    # (full). Validated here so a bad choice fails at Start, not as a red X later.
+    build_mode = (form.get("build_mode") or "vm").strip()
+    cm.validate_build_mode(build_mode, topology)
+    if build_mode == "full" and form.get("team"):
+        raise ValueError("a container lab can't take a team yet (member logins are VM-only); use one agent, or none")
     team = validate_team(form.get("team"), [n["name"] for n in topology["nodes"]]) if form.get("team") else None
     budget_members = [(agent, agent_model_id(load_meta(agent)))] if agent else []
     if team:
@@ -1641,11 +1650,17 @@ def create_topo_run(form):
     # Internet for the lab's VMs: documentation and package sites for its roles, plus any domains typed in for a niche
     # tool. The port (and so the proxy) is picked when the lab is built; see topo_run_runner.
     extra = [x for x in str(form.get("extra_domains") or "").splitlines() if x.strip()]
-    egress_domains = le.allowlist_for(sorted({n["role"] for n in topology["nodes"]}), extra)
+    if build_mode == "full":
+        # container nodes have no internet: no proxy, no ufw (see container_lab)
+        if extra:
+            raise ValueError("a container lab has no internet access, so it takes no extra domains")
+        egress_domains = []
+    else:
+        egress_domains = le.allowlist_for(sorted({n["role"] for n in topology["nodes"]}), extra)
     # The proxy is reached over a host-only adapter, which takes one of VirtualBox's 8 adapter slots (the NAT one is
     # the first): a node with internet can have at most 6 lab links.
     busiest = max((len(vr.links_for_node(topology, n["name"])) for n in topology["nodes"]), default=0)
-    if busiest > 6:
+    if busiest > 6 and build_mode != "full":
         raise ValueError(f"a lab with internet access allows 6 links per node, and one node here has {busiest}")
     # Intents are checked by name against this lab's nodes, so a typo fails here instead of as a red X later.
     intents = li.parse_intents(labfile["intents"] if labfile else form.get("intents"),
@@ -1659,7 +1674,7 @@ def create_topo_run(form):
     r = {"id": rid, "state": "queued", "reason": "", "keep": bool(form.get("keep", s["keep_default"])),
          "memory_mb": int(form.get("memory_mb") or s["memory_mb"]), "cpus": int(form.get("cpus") or s["cpus"]),
          "created": time.time(), "started": None, "ended": None, "agent": agent,
-         "topology_id": topology_id, "topology_title": topology["title"],
+         "topology_id": topology_id, "topology_title": topology["title"], "build_mode": build_mode,
          "topology": topology if topology_id is None else None, "task_id": task_id, "labfile": labfile,
          "task_title": (task or {}).get("title"), "custom_prompt": custom_prompt,
          "interactive": interactive, "idle_since": None,
@@ -2019,6 +2034,19 @@ def topo_team_phase(r, topology, node_ports, priv, task, stopped):
     return "; ".join(errors) or None
 
 
+def lab_destroy(r, d, timeout=180):
+    """Tear a lab down: its containers and networks for a container lab, its VMs otherwise."""
+    if r.get("build_mode") == "full":
+        return cm.teardown(r["id"])
+    return vr.vagrant(d, "destroy", "-f", timeout=timeout)
+
+
+def lab_destroy_after_cancel(r, d):
+    if r.get("build_mode") == "full":
+        return cm.teardown(r["id"])
+    return vr.destroy_after_cancel(d, timeout=180)
+
+
 def topo_run_runner(rid):
     r = TOPO_RUNS[rid]
     d = topo_run_dir(rid)
@@ -2063,57 +2091,63 @@ def topo_run_runner(rid):
         for name, port in node_ports.items():
             r["nodes"][name]["ssh_port"] = port
         egress_port = None
-        if r.get("egress"):
+        if r.get("egress") and r.get("build_mode") != "full":
             with TOPO_LOCK:                               # one proxy port per lab, kept for the lab's life (save/resume too)
                 eg_taken = {x["egress"]["port"] for x in TOPO_RUNS.values() if (x.get("egress") or {}).get("port")}
                 r["egress"]["port"] = egress_port = vr.allocate_port(le.PROXY_PORT_RANGE, eg_taken)
             topo_log(r, f"starting the lab's internet proxy on 127.0.0.1:{egress_port} (documentation and package sites only)...")
             egress_up(r)
         save_topo_run(r)
-        vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"],
-                                       egress_port=egress_port)
-        timeout = 900 + 300 * (len(topology["nodes"]) - 1)
-        topo_log(r, f"starting {len(topology['nodes'])} VMs for '{r['topology_title']}' (first run also downloads the {vr.BOX} image)...")
-        # --no-parallel: the VirtualBox provider parallelizes multi-machine `up` by default, which on real
-        # hardware testing made N VMs apt-get/boot simultaneously contend hard enough for host CPU/disk that one
-        # of them routinely missed the (single-VM-sized) SSH-readiness window below, even with ample VM memory -
-        # confirmed by reproducing the same node in isolation, where it came up fine every time. Sequential
-        # provisioning costs wall-clock time, not reliability; this is a correctness fix, not a speed one.
-        def on_vagrant_line(line):
-            # Vagrant's own curated phase markers ("==> h1: Booting VM...", "==> h1: Running provisioner:
-            # shell...") are what make the build-out legible live - everything else on this stream is raw
-            # apt/dpkg output, which is useful for post-failure diagnosis (kept in `out` below) but would drown
-            # out the signal if streamed wholesale. A box-import progress bar can prefix "==>" with leftover
-            # \r-redraw/escape-code junk on the same physical line, so this finds "==>" anywhere, not just at
-            # the start.
-            idx = line.find("==>")
-            if idx != -1:
-                topo_log(r, line[idx:])
-        for attempt in range(vr.PORT_COLLISION_RETRIES + 1):
-            # One lab's `vagrant up` at a time: two labs booting together hit VirtualBox's machine locks ("unexpected
-            # process has tried to lock the machine") and one lab fails. Each lab's own build is still sequential.
-            with VAGRANT_UP_LOCK:
-                rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
-                                                 on_line=on_vagrant_line, cancel=stopped)
-            busy = vr.port_collision(out) if rc != 0 and not stopped() else None
-            node = next((n for n, p in node_ports.items() if p == busy), None)
-            if node is None or attempt == vr.PORT_COLLISION_RETRIES:
-                break
-            with TOPO_LOCK:
-                new = vr.allocate_port(vr.TOPO_SSH_PORT_RANGE, topo_taken_ports(vr.TOPO_SSH_PORT_RANGE) | {busy})
-            topo_log(r, f"host port {busy} ({node}) was taken by something else just before it booted; retrying on port {new}...")
-            node_ports[node] = r["nodes"][node]["ssh_port"] = new
-            save_topo_run(r)
-            # nodes already up stay up; `vagrant up` carries on from the one that failed, with its new port
-            vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"])
+        if r.get("build_mode") == "full":
+            # container nodes: no VirtualBox, no Vagrantfile; the same ssh_wait below reaches them
+            rc, out = cm.up(rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"],
+                            lambda line: topo_log(r, line))
+            err = ""
+        else:
+            vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"],
+                                           egress_port=egress_port)
+            timeout = 900 + 300 * (len(topology["nodes"]) - 1)
+            topo_log(r, f"starting {len(topology['nodes'])} VMs for '{r['topology_title']}' (first run also downloads the {vr.BOX} image)...")
+            # --no-parallel: the VirtualBox provider parallelizes multi-machine `up` by default, which on real
+            # hardware testing made N VMs apt-get/boot simultaneously contend hard enough for host CPU/disk that one
+            # of them routinely missed the (single-VM-sized) SSH-readiness window below, even with ample VM memory -
+            # confirmed by reproducing the same node in isolation, where it came up fine every time. Sequential
+            # provisioning costs wall-clock time, not reliability; this is a correctness fix, not a speed one.
+            def on_vagrant_line(line):
+                # Vagrant's own curated phase markers ("==> h1: Booting VM...", "==> h1: Running provisioner:
+                # shell...") are what make the build-out legible live - everything else on this stream is raw
+                # apt/dpkg output, which is useful for post-failure diagnosis (kept in `out` below) but would drown
+                # out the signal if streamed wholesale. A box-import progress bar can prefix "==>" with leftover
+                # \r-redraw/escape-code junk on the same physical line, so this finds "==>" anywhere, not just at
+                # the start.
+                idx = line.find("==>")
+                if idx != -1:
+                    topo_log(r, line[idx:])
+            for attempt in range(vr.PORT_COLLISION_RETRIES + 1):
+                # One lab's `vagrant up` at a time: two labs booting together hit VirtualBox's machine locks ("unexpected
+                # process has tried to lock the machine") and one lab fails. Each lab's own build is still sequential.
+                with VAGRANT_UP_LOCK:
+                    rc, out, err = vr.vagrant_stream(d, "up", "--provider=virtualbox", "--no-parallel", timeout=timeout,
+                                                     on_line=on_vagrant_line, cancel=stopped)
+                busy = vr.port_collision(out) if rc != 0 and not stopped() else None
+                node = next((n for n, p in node_ports.items() if p == busy), None)
+                if node is None or attempt == vr.PORT_COLLISION_RETRIES:
+                    break
+                with TOPO_LOCK:
+                    new = vr.allocate_port(vr.TOPO_SSH_PORT_RANGE, topo_taken_ports(vr.TOPO_SSH_PORT_RANGE) | {busy})
+                topo_log(r, f"host port {busy} ({node}) was taken by something else just before it booted; retrying on port {new}...")
+                node_ports[node] = r["nodes"][node]["ssh_port"] = new
+                save_topo_run(r)
+                # nodes already up stay up; `vagrant up` carries on from the one that failed, with its new port
+                vr.render_topology_vagrantfile(d, rid, topology, node_ports, pub.read_text().strip(), r["memory_mb"], r["cpus"])
         if stopped():                    # checked first: a Stop mid-build kills `up`, which also makes rc != 0
             topo_log(r, "stopping: tearing down the half-built lab...")
-            vr.destroy_after_cancel(d, timeout=180)
+            lab_destroy_after_cancel(r, d)
             torn_down = True
             return finish("stopped", "stopped during setup")
         if rc != 0:
             topo_log(r, (out or err)[-2000:])
-            vr.vagrant(d, "destroy", "-f", timeout=180)
+            lab_destroy(r, d, timeout=180)
             torn_down = True
             return finish("error", "failed to start the lab (see transcript)")
         topo_log(r, "waiting for every node to accept SSH...")
@@ -2177,7 +2211,7 @@ def topo_run_runner(rid):
         if finished and not r.get("keep"):
             if not torn_down:
                 try:
-                    vr.vagrant(d, "destroy", "-f", timeout=180)
+                    lab_destroy(r, d, timeout=180)
                 except Exception:
                     pass
             try:
@@ -2691,6 +2725,9 @@ def read_agent_log(agent, log_name):
 def snapshot_lab_vms(r, label):
     """A VirtualBox snapshot of every node, so the lab can be rolled back to this point. True only if all of them
     were taken; a partial set can't roll the lab back as a whole, so it's recorded as not usable."""
+    if r.get("build_mode") == "full":
+        topo_log(r, "no rollback point: container labs have no VirtualBox snapshots (see container_lab)")
+        return False
     d = topo_run_dir(r["id"])
     for name in r["nodes"]:
         rc, out, err = vr.vagrant(d, "snapshot", "save", name, label, timeout=900)
@@ -2698,6 +2735,27 @@ def snapshot_lab_vms(r, label):
             topo_log(r, f"rollback point '{label}' not taken for {name}: {(err or out).strip()[-200:]}")
             return False
     return True
+
+
+def set_topo_forwarding(rid, node, on):
+    """Turn IP forwarding on or off in one node of a container lab: how a router node is switched between routing and
+    not. Only for container nodes of a lab that is ready; the change is recorded in the lab's transcript."""
+    r = TOPO_RUNS.get(rid)
+    if not r:
+        raise KeyError("unknown run")
+    if r.get("build_mode") != "full":
+        raise ValueError("forwarding is switched through the helper only for container labs; a VM router is configured by its agent")
+    if node not in r["nodes"]:
+        raise KeyError(f"no node called '{node}'")
+    if r["state"] != "ready":
+        raise ValueError("the lab must be ready before its forwarding can change")
+    rc, out = cm.set_forwarding(cm.container_name(rid, node), on)
+    if rc != 0:
+        raise RuntimeError(f"could not change forwarding on {node}: {out[-300:]}")
+    r["nodes"][node]["forwarding"] = bool(on)
+    topo_log(r, f"{node}: IP forwarding {'on' if on else 'off'} (set from the lab page)")
+    save_topo_run(r)
+    return {"node": node, "forwarding": bool(on)}
 
 
 def topo_rollback(rid, turn):
@@ -2885,7 +2943,7 @@ def stop_topo_run(rid):
         if not r.get("keep"):
             d = topo_run_dir(rid)
             if d.exists():
-                vr.vagrant(d, "destroy", "-f", timeout=180)
+                lab_destroy(r, d, timeout=180)
                 shutil.rmtree(d, ignore_errors=True)
         r.update(state="stopped", reason="stopped by you", ended=time.time())
         save_topo_run(r)
@@ -2914,6 +2972,8 @@ def save_topo_lab(rid):
         raise ValueError("only a lab that's ready, done or stopped can be saved (end any session first)")
     if r["state"] == "ready" and r.get("agent") and agent_holds_lab(r, r["agent"]):
         raise ValueError("an agent is about to start working in this lab")
+    if r.get("build_mode") == "full":
+        raise ValueError("a container lab can't be saved yet (containers aren't suspended); stop it, or keep it running")
     if not (topo_run_dir(rid) / "Vagrantfile").exists():
         raise ValueError("this lab's VMs are gone, so there's nothing to save")
     for name, node in r["nodes"].items():
@@ -3096,7 +3156,7 @@ def delete_topo_run(rid):
     except Exception:  # noqa
         pass
     if d.exists():
-        vr.vagrant(d, "destroy", "-f", timeout=180)
+        lab_destroy(r, d, timeout=180)
         shutil.rmtree(d, ignore_errors=True)
     TOPO_RUNS.pop(rid, None)
     shutil.rmtree(topo_snap_dir(rid), ignore_errors=True)
@@ -4122,6 +4182,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"job": topo_intents_now(parts[3])})
                 if parts[4] == "rollback":
                     return self.send_json({"job": topo_rollback(parts[3], b.get("turn"))})
+                if parts[4] == "forwarding":
+                    return self.send_json(set_topo_forwarding(parts[3], b.get("node"), bool(b.get("on"))))
                 if parts[4] == "approve-plan":
                     topo_approve_plan(parts[3], b)
                     return self.send_json({"ok": True})
