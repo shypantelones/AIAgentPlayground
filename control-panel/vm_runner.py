@@ -874,15 +874,18 @@ def relay_port_for_node(topology, name):
     return 2200 + names.index(name)
 
 
-def relay_command(topology, node_ports):
+def relay_command(topology, node_ports, targets=None):
     """The shell command the single vm-relay-topo container runs: one backgrounded socat listener per node,
     then `wait`. Each term already ends in its own "&", which already plays the separator role "; " would -
     joining with "; " instead of a plain space produces "...&; socat..." ("&;" is a shell syntax error) and
     crashes the whole relay container on every single start, regardless of node count. Found via a real agent
     test: the agent correctly reported "Could not resolve hostname vm-relay-topo", since a crashed,
     non-restarting container's network alias doesn't stay resolvable."""
+    # targets: {node: "host:port"} for nodes that aren't reached through the host (container labs, which the relay joins
+    # on the lab's own network). Default: the node's published ssh port on the host.
     return " ".join(f"socat TCP-LISTEN:{relay_port_for_node(topology, name)},fork,reuseaddr "
-                    f"TCP:host.docker.internal:{port} &" for name, port in node_ports.items()) + " wait"
+                    f"TCP:{(targets or {}).get(name) or f'host.docker.internal:{port}'} &"
+                    for name, port in node_ports.items()) + " wait"
 
 
 # ---------------------------------------------------------------- user-built custom topologies ("structured
