@@ -203,13 +203,30 @@ def set_forwarding(container, on, helper=None):
     return _run_helper(_root_argv([helper or FORWARD_HELPER, container, "1" if on else "0"]), "the forwarding helper")
 
 
+def relay_targets(rid, names):
+    """Where an agent's relay reaches each node of a container lab: the node's container on the lab's management
+    network, port 22. Published ports are for the panel's own ssh; the relay doesn't go through the host."""
+    return {n: f"{container_name(rid, n)}:22" for n in names}
+
+
+def connect_relay(rid, relay_container):
+    """Join an agent's relay container to this lab's management network, so it can reach the nodes. Returns (rc, out)."""
+    rc, out, err = docker("network", "connect", mgmt_network(rid), relay_container, timeout=60)
+    return rc, (out + err).strip()
+
+
 def teardown(rid):
-    """Remove every container and network this lab created. Safe to call twice or on a lab that never started."""
+    """Remove every container and network this lab created. Safe to call twice or on a lab that never started. An agent's
+    relay can still be connected to the lab's network after its containers are gone; it is disconnected first."""
     rc, out, _ = docker("ps", "-aq", "--filter", f"label={LABEL}={rid}", timeout=60)
     ids = out.split()
     if ids:
         docker("rm", "-f", *ids, timeout=120)
     rc, out, _ = docker("network", "ls", "-q", "--filter", f"label={LABEL}={rid}", timeout=60)
     nets = out.split()
+    for net in nets:
+        rc, attached, _ = docker("network", "inspect", "-f", "{{range $k, $v := .Containers}}{{$k}} {{end}}", net, timeout=60)
+        for endpoint in attached.split():
+            docker("network", "disconnect", "-f", net, endpoint, timeout=60)
     if nets:
         docker("network", "rm", *nets, timeout=120)

@@ -2299,13 +2299,23 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         dc(r["agent"], "exec", "-T", "gateway", "sh", "-c",
            "cat > /home/node/.openclaw/workspace/forward && chmod +x /home/node/.openclaw/workspace/forward",
            input=forward_script(list(r["nodes"])), timeout=20)
-    relay_cmd = vr.relay_command(topology, node_ports)
+    # A container lab's nodes are reached on the lab's own network (no published-port hop through the host); see container_lab.
+    container = r.get("build_mode") == "full"
+    targets = cm.relay_targets(r["id"], list(r["nodes"])) if container else None
+    relay_cmd = vr.relay_command(topology, node_ports, targets)
     env = dict(os.environ, VM_RELAY_TOPO_CMD=relay_cmd)
     rc, out, err = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
                        *TOPO_RELAY_FILES, "up", "-d", "--no-deps", "vm-relay-topo"], timeout=60, env=env)
     if rc != 0:
         detach_topo_agent(r["agent"])
         return "could not attach the agent's lab relay (see transcript)"
+    if container:
+        rc, relay_id, _ = run([DOCKER, "compose", "-p", proj(r["agent"]), "--env-file", str(env_file(r["agent"])),
+                               *TOPO_RELAY_FILES, "ps", "-q", "vm-relay-topo"], timeout=30)
+        rc2, msg = cm.connect_relay(r["id"], relay_id.strip()) if rc == 0 and relay_id.strip() else (1, "no relay container")
+        if rc2 != 0:
+            detach_topo_agent(r["agent"])
+            return f"could not connect the agent's relay to the lab network: {msg[-200:]}"
     node_lines = "\n".join(f"- {name} ({r['nodes'][name]['role']}): ./vmrun-{name} '<cmd>'" for name in r["nodes"])
     roles = {n["role"] for n in r["nodes"].values()}
     # Everything below is sent on every agent turn's first message, often to a paid model: keep it terse, and only
@@ -2316,7 +2326,9 @@ def topo_agent_phase(r, topology, node_ports, priv, task, stopped):
         "Switches bridge their lab ports in br0, VLAN filtering off. For VLANs: ip link set br0 type bridge "
         "vlan_filtering 1; access port: bridge vlan add dev <port> vid <id> pvid untagged + bridge vlan del dev "
         "<port> vid 1; trunk: bridge vlan add dev <port> vid <id>." if "switch" in roles else "",
-        "Routers run FRR (ospfd, ospf6d, bgpd; unconfigured): use vtysh -c 'conf t' -c ..., or ip route."
+        ("Routers in this lab are containers without FRR: configure them with ip route and ip addr."
+         if r.get("build_mode") == "full" else
+         "Routers run FRR (ospfd, ospf6d, bgpd; unconfigured): use vtysh -c 'conf t' -c ..., or ip route.")
         if "router" in roles else "",
         "Servers have dnsmasq, not running: add a file in /etc/dnsmasq.d/ (it ignores /etc/hosts: use address= or "
         "host-record=), then systemctl enable --now dnsmasq. Hosts: dhclient <interface>." if "server" in roles else "",
@@ -4334,6 +4346,12 @@ class Handler(BaseHTTPRequestHandler):
                         ensure_shared(log)
                         ensure_image(log)
                         need(dc(name, "up", "-d", timeout=300), "start")
+                        wait_gateway(name, log)
+                        # a fresh gateway starts from its default model; point it at this agent's model again
+                        # (the same patch create applies), or a cloud agent silently runs on the default model
+                        need(dc(name, "exec", "-T", "gateway", "node", "dist/index.js", "config", "patch", "--stdin",
+                                input=model_patch(load_meta(name))), "config patch")
+                        need(dc(name, "restart", "gateway"), "gateway restart")
                         wait_gateway(name, log)
                     return self.send_json({"job": start_job(f"Start {name}", st, agent=name)})
                 if act == "stop":

@@ -391,5 +391,43 @@ class ForwardHelperScriptTests(unittest.TestCase):
         self.assertEqual(self.run_helper(self.NAME, "yes").returncode, 2)
 
 
+class RelayAndTeardownTests(unittest.TestCase):
+    def test_relay_targets_are_the_node_containers_on_port_22(self):
+        self.assertEqual(cm.relay_targets("abc12345", ["h1", "r1"]),
+                         {"h1": "aglab-abc12345-h1:22", "r1": "aglab-abc12345-r1:22"})
+
+    def test_the_relay_command_uses_the_given_targets_and_defaults_to_the_host(self):
+        cmd = vr.relay_command(TOPO, PORTS, cm.relay_targets("abc12345", ["h1", "r1", "h2"]))
+        self.assertIn("TCP:aglab-abc12345-h1:22 &", cmd)
+        self.assertNotIn("host.docker.internal", cmd)
+        self.assertIn("TCP:host.docker.internal:2201 &", vr.relay_command(TOPO, PORTS))
+
+    def test_connect_relay_joins_the_lab_network(self):
+        with mock.patch.object(cm, "docker", return_value=(0, "", "")) as d:
+            rc, _ = cm.connect_relay("abc12345", "relayid")
+        self.assertEqual(rc, 0)
+        d.assert_called_once()
+        self.assertEqual(d.call_args[0], ("network", "connect", "aglab-abc12345-mgmt", "relayid"))
+
+    def test_teardown_disconnects_a_leftover_relay_before_removing_the_network(self):
+        calls = []
+
+        def fake_docker(*args, input=None, timeout=120):
+            calls.append(args)
+            if args[:2] == ("ps", "-aq"):
+                return 0, "", ""
+            if args[:2] == ("network", "ls"):
+                return 0, "net1\n", ""
+            if args[:2] == ("network", "inspect"):
+                return 0, "relayid \n", ""
+            return 0, "", ""
+
+        with mock.patch.object(cm, "docker", side_effect=fake_docker):
+            cm.teardown("abc12345")
+        i_disc = calls.index(("network", "disconnect", "-f", "net1", "relayid"))
+        i_rm = calls.index(("network", "rm", "net1"))
+        self.assertLess(i_disc, i_rm)
+
+
 if __name__ == "__main__":
     unittest.main()
