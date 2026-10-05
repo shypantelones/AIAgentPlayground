@@ -74,6 +74,13 @@ def gen_keypair(run_dir):
     rc, _, err = _run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "aiagentplayground-vmbench", "-f", str(priv), "-q"], timeout=20)
     if rc != 0:
         raise RuntimeError(f"ssh-keygen failed: {err.strip() or rc}")
+    if not sys.platform.startswith("win"):
+        # ssh refuses a key other users can read. Fail here, with the fix, rather than after every SSH attempt is refused.
+        priv.chmod(0o600)
+        if priv.stat().st_mode & 0o077:
+            raise RuntimeError(f"the lab's key file at {priv} is readable by other users, so ssh will refuse it. This "
+                               "folder is on a filesystem that can't store Unix permissions (a Windows drive under WSL); "
+                               "set AG_TOPO_RUN_DIR to a folder on the Linux filesystem and restart the panel.")
     return priv, priv.with_suffix(priv.suffix + ".pub")
 
 

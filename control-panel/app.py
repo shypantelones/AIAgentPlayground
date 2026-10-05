@@ -1433,7 +1433,10 @@ def stop_terminal(rid, quiet=False):
 # "switch" node is a real VM too, not a bare intnet standing in for one (see vm_runner.render_topology_vagrantfile).
 # Agent attach mirrors the single-VM vm-relay pattern but with one relay container multiplexing N node ports
 # instead of one relay per node (templates/vm-relay-topo.compose.yml) - see .claude/skills/vm-lab-dev/SKILL.md.
-TOPOR_DIR = ROOT / "data" / "topo-runs"
+# Lab folders (keys, Vagrantfile, transcripts). AG_TOPO_RUN_DIR moves them: OpenSSH refuses a private key that other
+# users can read, and a Windows-mounted drive (/mnt/c, /mnt/f under WSL) can't store Unix permissions, so a Linux panel
+# running from such a drive needs its lab folders on the Linux filesystem.
+TOPOR_DIR = Path(os.environ["AG_TOPO_RUN_DIR"]).expanduser() if os.environ.get("AG_TOPO_RUN_DIR") else ROOT / "data" / "topo-runs"
 TOPOR_DIR.mkdir(parents=True, exist_ok=True)
 TOPO_RUNS = {}           # run id -> live record (also persisted to data/topo-runs/<id>.json)
 TOPO_LOCK = threading.RLock()
@@ -2747,8 +2750,8 @@ def set_topo_forwarding(rid, node, on):
         raise ValueError("forwarding is switched through the helper only for container labs; a VM router is configured by its agent")
     if node not in r["nodes"]:
         raise KeyError(f"no node called '{node}'")
-    if r["state"] != "ready":
-        raise ValueError("the lab must be ready before its forwarding can change")
+    if r["state"] not in ("ready", "working", "attached", "scoring", "done"):
+        raise ValueError("the lab must be up before its forwarding can change")
     rc, out = cm.set_forwarding(cm.container_name(rid, node), on)
     if rc != 0:
         raise RuntimeError(f"could not change forwarding on {node}: {out[-300:]}")
